@@ -58837,6 +58837,29 @@ static bool window_get_insets_controller(struct dvm *vm, dvm_ref self,
   RETL(controller.l);
 }
 
+/* Window.addContentView(View, LayoutParams): PhoneWindow adds the view to its
+ * content parent (android.R.id.content), installing the decor first if
+ * nothing was set yet; Dialog.addContentView() is this on the dialog's window.
+ * Moonton's account kit builds its login dialog this way around a WebView. */
+static bool window_add_content_view(struct dvm *vm, dvm_ref self,
+                                    const union dvm_value *args, int nargs,
+                                    union dvm_value *out)
+{
+  (void)out;
+  dvm_ref view = nargs > 0 ? ARG(0).l : 0;
+  if (!view) RETV();
+  union dvm_value content = { 0 }, id = { .i = 0x01020002 }, ignored = { 0 };
+  if (!window_find_view(vm, self, &id, 1, &content)) return false;
+  if (!content.l) {
+    dvm__throw(vm, "java/lang/IllegalStateException", "Window has no content parent");
+    return false;
+  }
+  content_install_params(vm, view, args, nargs);
+  union dvm_value child = { .l = view };
+  if (!vg_add_view(vm, content.l, &child, 1, &ignored)) return false;
+  RETV();
+}
+
 static const struct rt_method rt_window[] = {
   M("getLayoutInflater","()Landroid/view/LayoutInflater;",window_get_layout_inflater),
   M("<init>","(Landroid/content/Context;)V",window_context),
@@ -58854,6 +58877,7 @@ static const struct rt_method rt_window[] = {
   M("setContentView", "(I)V", window_set_content),
   M("setContentView", "(Landroid/view/View;)V", window_set_content),
   M("setContentView", "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V", window_set_content),
+  M("addContentView", "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V", window_add_content_view),
   M("findViewById", "(I)Landroid/view/View;", window_find_view),
   /* Every window feature this emulator draws through is "granted": there is
    * no decor to suppress, so refusing would only make callers take an error
@@ -73899,6 +73923,17 @@ static bool dialog_set_content_view(struct dvm *vm, dvm_ref self,
   RETV();
 }
 
+static bool dialog_add_content_view(struct dvm *vm, dvm_ref self,
+                                    const union dvm_value *args, int nargs,
+                                    union dvm_value *out)
+{
+  union dvm_value window = {0};
+  if (!dialog_get_window(vm, self, NULL, 0, &window) || !window.l) return false;
+  return am_vcall(vm, window.l, "addContentView",
+                  "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V",
+                  args, nargs, out);
+}
+
 static bool dialog_find_view_by_id(struct dvm *vm, dvm_ref self,
                                    const union dvm_value *args, int nargs,
                                    union dvm_value *out)
@@ -74149,6 +74184,8 @@ static const struct rt_method rt_dialog[] = {
   M("setContentView", "(Landroid/view/View;)V", dialog_set_content_view),
   M("setContentView", "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V",
   dialog_set_content_view),
+  M("addContentView", "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V",
+    dialog_add_content_view),
   M("findViewById", "(I)Landroid/view/View;", dialog_find_view_by_id),
   M("setCancelable", "(Z)V", dialog_set_cancelable),
   M("setCanceledOnTouchOutside", "(Z)V", dialog_set_canceled_outside),
