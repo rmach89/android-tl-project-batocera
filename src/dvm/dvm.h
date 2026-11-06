@@ -470,6 +470,12 @@ bool dvm_content_providers_wait(struct dvm *);
 void dvm_binder_set_transport(int (*send)(void *,const char *,const void *,size_t),void *user);
 void dvm_binder_set_fd_transport(int (*send)(void *,const char *,const void *,size_t,const int *,size_t),void *user);
 void dvm_binder_set_pump(void (*pump)(void));
+/* The host's main-loop turn (window events, guest frame, swap, input).  The
+ * DVM runs it when the app calls Looper.loop() on the main thread itself,
+ * which on a device *is* the main loop, so that loop does not starve the
+ * host's.  Returns false when there is no pump or one is already running. */
+void dvm_set_main_loop_pump(void (*pump)(void));
+bool dvm_main_loop_host_turn(struct dvm *vm);
 void dvm_binder_set_provider_server(int (*serve)(struct dvm *,uint32_t,uint32_t,const uint8_t *,size_t));
 int dvm_binder_request(struct dvm *,const char *package,const char *magic,const void *body,size_t body_size,
                        int32_t *status,uint8_t **payload,size_t *payload_size);

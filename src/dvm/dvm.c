@@ -6244,6 +6244,41 @@ static void ui_before_platform_wait(struct dvm *vm)
   active = false;
 }
 
+static void (*g_main_loop_pump)(void);
+void dvm_set_main_loop_pump(void (*pump)(void)) { g_main_loop_pump = pump; }
+
+/* Looper.loop() on the main thread, called by the app (not by the host pump,
+ * which is the main Looper already).  On a device that loop is where input,
+ * surface callbacks and vsync arrive; here they arrive in the host's frame, so
+ * run one in place of the wait.  The Java invocation that called loop() stays
+ * parked exactly as in a modal wait: its thread state is set aside, the turn
+ * runs as the main Looper's own identity without GIL or the execution lock
+ * (the frame pump's contract), and everything is restored after. */
+bool dvm_main_loop_host_turn(struct dvm *vm)
+{
+   static _Thread_local bool active;
+   if (!g_main_loop_pump || active || !vm || dvm_is_stopping(vm) ||
+       !dvm_on_main_thread())
+      return false;
+   active = true;
+   struct dvm_tstate saved, main_turn = { 0 };
+   dvm__tstate_save(vm, &saved);
+   main_turn.cur_thread = vm->main_thread;
+   dvm__tstate_load(vm, &main_turn);
+   extern __thread dvm_ref g_current_looper;
+   const dvm_ref saved_looper = g_current_looper;
+   g_current_looper = 0;
+   unsigned d = dvm_gil_unlock_all(vm);
+   unsigned ael = arm_lock_unlock_all();
+   g_main_loop_pump();
+   dvm_gil_relock(vm, d);
+   arm_lock_relock(ael);
+   g_current_looper = saved_looper;
+   dvm__tstate_load(vm, &saved);
+   active = false;
+   return true;
+}
+
 void dvm_gil_wait(struct dvm *vm, unsigned ms)
 {
   if (dvm_is_stopping(vm)) return;

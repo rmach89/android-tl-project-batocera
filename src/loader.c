@@ -2011,6 +2011,92 @@ alloc_attached_activity(struct jvm *jvm)
   return activity;
 }
 
+/* One turn of the dex Activity's main loop: the guest's share of the frame,
+ * the Java half, the swap, window events and input.  Returns nonzero when the
+ * loop is over, with the process's exit status in *status. */
+static struct {
+  void (*run_threads)(void);
+  int is_a64, frame, max_frames;
+} g_dex;
+
+static int dex_pump_turn(int *status)
+{
+  const int frame = g_dex.frame;
+  if (g_dex.max_frames > 0 && frame >= g_dex.max_frames) {
+    fprintf(stderr, "[loader] LUNARIA_MAX_FRAMES=%d reached — exiting dex loop\n", g_dex.max_frames);
+    *status = EXIT_SUCCESS;
+    return 1;
+  }
+  if (arm_exec_guest_abort_count() > 0) {
+    fprintf(stderr, "[loader] guest abort — stopping dex loop (frame %d)\n", frame);
+    *status = EXIT_FAILURE;
+    return 1;
+  }
+  if (process_exit_status(status)) return 1;
+  pump_run_frame(g_dex.run_threads);
+  if (process_exit_status(status)) return 1;
+  if (arm_exec_guest_abort_count()) {
+    *status = EXIT_FAILURE;
+    return 1;
+  }
+  if (g_dex.is_a64) arm64_exec_egl_swap();
+  else arm_exec_egl_swap();
+  arm_exec_glfw_poll();
+  /* LUNARIA_TOUCH_FIFO / LUNARIA_TOUCH_TEST: the other pump loops replay them;
+   * this one drives Unity titles whose entry point is a dex Activity. */
+  touch_test_tick(frame);
+  /* The framework input queue feeds Activity/View dispatch, independently
+   * of the engine's Java-owned renderer. NativeActivity retains its NDK
+   * input queue; Unity's Java path must not bypass its View callbacks. */
+  ArmExecTouchEvent touch;
+  struct dvm *input_vm=dvm_jni_vm();
+  for (int n=0; input_vm && n<64 && arm_exec_touch_next(&touch); ++n)
+    if(!activity_forward_touch(&touch))(void)dvm_ui_dispatch_touch(input_vm,&touch);
+  int key_action,key_code,key_meta,key_repeat;
+  for (int n=0; input_vm && n<16 && arm_exec_java_key_next(&key_action,&key_code,&key_meta,&key_repeat); ++n) {
+    uint32_t focused=atomic_load(&activity_focused);
+    if(focused && focused!=(uint32_t)getpid()) {
+      unsigned char message[20]={'L','A','K','1'};
+      activity_put(message+4,(uint32_t)key_action);activity_put(message+8,(uint32_t)key_code);
+      activity_put(message+12,(uint32_t)key_meta);activity_put(message+16,(uint32_t)key_repeat);
+      (void)activity_send_host(focused,message,sizeof message);
+    } else (void)dvm_ui_dispatch_key(input_vm,key_action,key_code,key_meta,key_repeat);
+  }
+  /* The game controller.  A focused Activity in another process gets
+   * nothing yet: the host message carries keyboard keys only. */
+  luna_pad_event pad;
+  for (int n=0; input_vm && n<32 && arm_exec_pad_next(&pad); ++n) {
+    uint32_t focused=atomic_load(&activity_focused);
+    if(!focused || focused==(uint32_t)getpid()) (void)dvm_ui_dispatch_pad(input_vm,&pad);
+  }
+  stall_watch_tick();
+  watchdog_tick();
+  if (frame < 5 || frame % 50 == 0)
+    fprintf(stderr, "[loader] dex pump frame %d\n", frame);
+  ++g_dex.frame;
+  if (arm_exec_glfw_should_close()) {
+    fprintf(stderr, "[loader] window closed — stopping dex loop (frame %d)\n", frame);
+    *status = EXIT_SUCCESS;
+    return 1;
+  }
+  return 0;
+}
+
+/* The app called Looper.loop() on the main thread itself — on a device that
+ * is the main loop, and some titles do it on purpose (MLBB's ExceptionHandler
+ * re-enters it forever inside try/catch to survive main-thread exceptions).
+ * Such a loop never returns to run_dex_activity's, so the DVM calls this
+ * between its queue checks and the frame goes on from in here.  When the loop
+ * is over there is no caller left to return to: end the process. */
+static void dex_main_loop_pump(void)
+{
+  int status = EXIT_SUCCESS;
+  if (!dex_pump_turn(&status)) return;
+  fprintf(stderr, "[loader] dex loop ended inside the app's main Looper.loop() — exiting (%d)\n", status);
+  fflush(NULL);
+  exit(status);
+}
+
 static int
 run_dex_activity(struct jvm *jvm, int is_a64)
 {
@@ -2145,69 +2231,22 @@ run_dex_activity(struct jvm *jvm, int is_a64)
       dvm_jni_show_activity(&jvm->env, activity);
   }
   dvm_jni_main_transaction(&jvm->env, false);
+  g_dex.run_threads = run_threads;
+  g_dex.is_a64 = is_a64;
+  if (dvm_jni_vm()) dvm_set_main_loop_pump(dex_main_loop_pump);
   run_threads();
   pump_java_frame();
 
-  int max_frames = 0;
   {
     const char *mf = getenv("LUNARIA_MAX_FRAMES");
-    if (mf && *mf) max_frames = atoi(mf);
+    if (mf && *mf) g_dex.max_frames = atoi(mf);
   }
   fprintf(stderr, "[loader] dex startup: entering pump loop (max_frames=%d)\n",
-          max_frames);
+          g_dex.max_frames);
   dvm_media_start_event_thread(dvm_jni_vm());
-  int frame = 0, exit_status = 0;
-  for (; max_frames <= 0 || frame < max_frames; ++frame) {
-    if (arm_exec_guest_abort_count() > 0) {
-      fprintf(stderr, "[loader] guest abort — stopping dex loop (frame %d)\n", frame);
-      return EXIT_FAILURE;
-    }
-    if (process_exit_status(&exit_status)) return exit_status;
-    pump_run_frame(run_threads);
-    if (process_exit_status(&exit_status)) return exit_status;
-    if (arm_exec_guest_abort_count()) return EXIT_FAILURE;
-    if (is_a64) arm64_exec_egl_swap();
-    else arm_exec_egl_swap();
-    arm_exec_glfw_poll();
-    /* LUNARIA_TOUCH_FIFO / LUNARIA_TOUCH_TEST: the other pump loops replay them;
-     * this one drives Unity titles whose entry point is a dex Activity. */
-    touch_test_tick(frame);
-    /* The framework input queue feeds Activity/View dispatch, independently
-     * of the engine's Java-owned renderer. NativeActivity retains its NDK
-     * input queue; Unity's Java path must not bypass its View callbacks. */
-    ArmExecTouchEvent touch;
-    struct dvm *input_vm=dvm_jni_vm();
-    for (int n=0; input_vm && n<64 && arm_exec_touch_next(&touch); ++n)
-      if(!activity_forward_touch(&touch))(void)dvm_ui_dispatch_touch(input_vm,&touch);
-    int key_action,key_code,key_meta,key_repeat;
-    for (int n=0; input_vm && n<16 && arm_exec_java_key_next(&key_action,&key_code,&key_meta,&key_repeat); ++n) {
-      uint32_t focused=atomic_load(&activity_focused);
-      if(focused && focused!=(uint32_t)getpid()) {
-        unsigned char message[20]={'L','A','K','1'};
-        activity_put(message+4,(uint32_t)key_action);activity_put(message+8,(uint32_t)key_code);
-        activity_put(message+12,(uint32_t)key_meta);activity_put(message+16,(uint32_t)key_repeat);
-        (void)activity_send_host(focused,message,sizeof message);
-      } else (void)dvm_ui_dispatch_key(input_vm,key_action,key_code,key_meta,key_repeat);
-    }
-    /* The game controller.  A focused Activity in another process gets
-     * nothing yet: the host message carries keyboard keys only. */
-    luna_pad_event pad;
-    for (int n=0; input_vm && n<32 && arm_exec_pad_next(&pad); ++n) {
-      uint32_t focused=atomic_load(&activity_focused);
-      if(!focused || focused==(uint32_t)getpid()) (void)dvm_ui_dispatch_pad(input_vm,&pad);
-    }
-    stall_watch_tick();
-    watchdog_tick();
-    if (frame < 5 || frame % 50 == 0)
-      fprintf(stderr, "[loader] dex pump frame %d\n", frame);
-    if (arm_exec_glfw_should_close()) {
-      fprintf(stderr, "[loader] window closed — stopping dex loop (frame %d)\n", frame);
-      break;
-    }
-  }
-  if (max_frames > 0 && frame == max_frames)
-    fprintf(stderr, "[loader] LUNARIA_MAX_FRAMES=%d reached — exiting dex loop\n", max_frames);
-  return EXIT_SUCCESS;
+  int exit_status = EXIT_SUCCESS;
+  while (!dex_pump_turn(&exit_status)) {}
+  return exit_status;
 }
 
 /* Independent component VM entry: no launcher Activity or EGL/window setup. */

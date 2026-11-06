@@ -37370,6 +37370,9 @@ static bool looper_loop(struct dvm *vm, dvm_ref self,
       if (ns < wait_ns) wait_ns = ns;
     }
     if (!wait_ns) continue;
+    /* The main Looper looped by the app itself: the host's frame is the
+     * wait (it paces itself), and what it posts is picked up next turn. */
+    if (pending_tag == 0 && dvm_main_loop_host_turn(vm)) continue;
     dvm_gil_wait_for_looper_ns(vm, me, wait_ns);
   }
   g_current_looper = prev;
