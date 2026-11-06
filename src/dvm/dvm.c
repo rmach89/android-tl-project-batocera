@@ -6282,6 +6282,7 @@ bool dvm_main_loop_host_turn(struct dvm *vm)
 void dvm_gil_wait(struct dvm *vm, unsigned ms)
 {
   if (dvm_is_stopping(vm)) return;
+  dvm__start_gate_open_self();
   ui_before_platform_wait(vm);
   /* Snapshot while still owning GIL.  A producer cannot change a VM
    * condition until this thread releases GIL, so any later condition change
@@ -6330,6 +6331,7 @@ void dvm_gil_wait_for(struct dvm *vm, uintptr_t channel, unsigned ms)
 static void gil_wait_channel(struct dvm *vm, uintptr_t channel, uint64_t ns,bool native_looper)
 {
   if (dvm_is_stopping(vm)) return;
+  dvm__start_gate_open_self();
 
   struct dvm_event_waiter w;
   pthread_condattr_t attr;
@@ -6565,6 +6567,101 @@ static void gil_prof_account(struct dvm *vm, unsigned long long held_ns)
     g_gil_prof_last = now;
   }
 }
+
+/* Thread.start() start gate.
+ *
+ * On a device start() returns with the new thread already running beside the
+ * caller, and code relies on that: Unity's UnityPlayer starts its UnityMain
+ * thread and, in the same main-thread turn, sends it RESUME, focus and
+ * SURFACE_ACQUIRED through the Handler that thread creates first thing — a
+ * message sent while that Handler is still null is dropped for good.  Here the
+ * child cannot take a step until the starter gives up the interpreter lock, so
+ * the starter waits, without GIL or the execution lock, until the child first
+ * blocks (a VM wait such as its Looper going idle, or a park) or finishes, or a
+ * short cap passes.  Calls out to native code and GIL hand-offs on the way do
+ * not open it: they are still the thread starting up. */
+struct dvm_start_gate {
+  pthread_mutex_t m;
+  pthread_cond_t cv;
+  bool open;
+  _Atomic int refs;
+};
+static _Thread_local struct dvm_start_gate *t_start_gate;
+static void start_gate_open(void);
+void dvm__start_gate_open_self(void) { start_gate_open(); }
+
+static void start_gate_put(struct dvm_start_gate *g)
+{
+  if (atomic_fetch_sub(&g->refs, 1) != 1) return;
+  pthread_cond_destroy(&g->cv);
+  pthread_mutex_destroy(&g->m);
+  free(g);
+}
+
+struct dvm_start_gate *dvm__start_gate_new(void)
+{
+  struct dvm_start_gate *g = calloc(1, sizeof *g);
+  if (!g) return NULL;
+  pthread_mutex_init(&g->m, NULL);
+  pthread_cond_init(&g->cv, NULL);
+  atomic_store(&g->refs, 2);   /* the starter and the child */
+  return g;
+}
+
+void dvm__start_gate_adopt(struct dvm_start_gate *g) { t_start_gate = g; }
+
+void dvm__start_gate_free(struct dvm_start_gate *g)
+{
+  if (!g) return;
+  start_gate_put(g);
+  start_gate_put(g);
+}
+
+static void start_gate_open(void)
+{
+  struct dvm_start_gate *g = t_start_gate;
+  if (!g) return;
+  t_start_gate = NULL;
+  pthread_mutex_lock(&g->m);
+  g->open = true;
+  pthread_cond_signal(&g->cv);
+  pthread_mutex_unlock(&g->m);
+  start_gate_put(g);
+}
+
+static unsigned start_gate_cap_ms(void)
+{
+  static int cap = -1;
+  if (cap < 0) {
+    const char *e = getenv("LUNARIA_DVM_START_GATE_MS");
+    cap = e && *e ? atoi(e) : 50;
+    if (cap < 0) cap = 0;
+  }
+  return (unsigned)cap;
+}
+
+void dvm__start_gate_wait(struct dvm *vm, struct dvm_start_gate *g)
+{
+  if (!g) return;
+  const unsigned cap = start_gate_cap_ms();
+  if (cap && !dvm_is_stopping(vm)) {
+    unsigned d = dvm_gil_unlock_all(vm);
+    unsigned ael = arm_lock_unlock_all();
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec  += (time_t)(cap / 1000u);
+    ts.tv_nsec += (long)(cap % 1000u) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_nsec -= 1000000000L; ++ts.tv_sec; }
+    pthread_mutex_lock(&g->m);
+    while (!g->open)
+      if (pthread_cond_timedwait(&g->cv, &g->m, &ts) != 0) break;
+    pthread_mutex_unlock(&g->m);
+    dvm_gil_relock(vm, d);
+    arm_lock_relock(ael);
+  }
+  start_gate_put(g);
+}
+
 
 void dvm_gil_release(struct dvm *vm)
 {

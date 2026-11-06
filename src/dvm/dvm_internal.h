@@ -443,6 +443,12 @@ void dvm__tstate_load(struct dvm *vm, const struct dvm_tstate *t);
 void dvm__tstate_reset(struct dvm *vm);
 /* Marks the calling host thread as one started for bytecode. */
 void dvm__mark_bytecode_thread(void);
+struct dvm_start_gate;
+struct dvm_start_gate *dvm__start_gate_new(void);
+void dvm__start_gate_adopt(struct dvm_start_gate *g);
+void dvm__start_gate_wait(struct dvm *vm, struct dvm_start_gate *g);
+void dvm__start_gate_free(struct dvm_start_gate *g); /* the child never started */
+void dvm__start_gate_open_self(void); /* this thread blocked or finished */
 
 bool dvm__runtime_hook(struct dvm *, dvm_ref, const union dvm_value *, int, union dvm_value *);
 bool dvm__runtime_exit(struct dvm *, dvm_ref, const union dvm_value *, int, union dvm_value *);

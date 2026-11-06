@@ -6200,6 +6200,7 @@ struct bytecode_thread {
   struct bytecode_thread *next;
   bool finished; /* under the interpreter lock */
   uint64_t native_token;
+  struct dvm_start_gate *gate; /* opened when this thread first lets go of GIL */
 };
 
 static void thread_native_publish(struct dvm *vm, dvm_ref self, int runnable, bool rename)
@@ -6234,6 +6235,7 @@ static void *bytecode_thread_main(void *p)
   dvm_ref self = a->self;
 
   dvm__mark_bytecode_thread();
+  dvm__start_gate_adopt(a->gate);
   dvm_gil_acquire(vm);
   /* The process-wide order is DVM GIL outside
   if (g_live_bytecode_threads > 20 && dvm__env("LUNARIA_TRACE_THREADS")) {
@@ -6285,11 +6287,13 @@ static void *bytecode_thread_main(void *p)
     }
     dvm_clear_exception(vm);
     if (!parked || dvm_is_stopping(vm)) break;
+    dvm__start_gate_open_self();
     dvm_gil_release(vm);
     usleep(DVM_PARK_RETRY_MS * 1000u);
     dvm_gil_acquire(vm);
   }
 
+  dvm__start_gate_open_self();
   dvm_gil_release(vm);
   arm_exec_dvm_thread_detach();
   dvm_gil_acquire(vm);
@@ -6364,9 +6368,12 @@ static bool spawn_bytecode_thread(struct dvm *vm, dvm_ref self)
   pthread_attr_setstacksize(&attr, 4u << 20);
 
   ++g_live_bytecode_threads;
+  struct dvm_start_gate *gate = dvm__start_gate_new();
+  a->gate = gate;
   int rc = pthread_create(&a->thread, &attr, bytecode_thread_main, a);
   pthread_attr_destroy(&attr);
   if (rc != 0) {
+    dvm__start_gate_free(gate);
     static int warned;
     if (warned++ < 8)
       fprintf(stderr, "[dvm] could not start a host thread for %s.run(): %s"
@@ -6387,6 +6394,8 @@ static bool spawn_bytecode_thread(struct dvm *vm, dvm_ref self)
   if (started++ < 24 || dvm__sched_trace_for(run->cls ? run->cls->name : NULL))
     fprintf(stderr, "[dvm-thread] host thread #%d for %s.run()\n",
             started, run->cls ? run->cls->name : "?");
+  /* Let it get going before start() returns, as on a device (dvm.c). */
+  dvm__start_gate_wait(vm, gate);
   return true;
 }
 
