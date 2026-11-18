@@ -148,7 +148,14 @@ float luna_event_x(const luna_touch_event *, int index);
 float luna_event_y(const luna_touch_event *, int index);
 /* Axes of the virtual touchscreen; pressure is normalized to [0,1]. */
 float luna_event_axis(const luna_touch_event *, int axis, int index);
-#define LUNA_KEYMAP_BUTTONS 8
+#define LUNA_KEYMAP_BUTTONS 20   /* keyboard and gamepad bindings together */
+/* Gamepad buttons share the key space above every keyboard code: 0-14 are
+ * GLFW_GAMEPAD_BUTTON_* (A B X Y LB RB BACK START GUIDE L3 R3 UP RIGHT DOWN
+ * LEFT), 15 and 16 the left and right triggers pulled past halfway.  Names in
+ * keymap files: PAD_A ... PAD_LEFT, PAD_LT, PAD_RT. */
+#define LUNA_PAD_KEY(button) (1000 + (button))
+#define LUNA_PAD_BUTTONS 17
+#define LUNA_LOOK_ID 31        /* touch contact the right stick drags */
 #define LUNA_KEY_POINTS 4      /* contacts one key can press at the same time */
 #define LUNA_KEYMAP_MACROS 8
 #define LUNA_MACRO_STEPS 24
@@ -187,6 +194,12 @@ typedef struct luna_keymap {
   float stick_x, stick_y, radius;
   int walk_key, walk_held;
   float walk_radius;
+  /* Left stick: an analog offset of the joystick, -1..1 after the dead zone.
+   * Right stick: "look X Y SPEED" drags contact LUNA_LOOK_ID from (X,Y). */
+  float pad_x, pad_y;
+  int look, look_down;
+  float look_x, look_y, look_speed, look_ax, look_ay, look_cx, look_cy;
+  long long look_ms;
   luna_key_binding buttons[LUNA_KEYMAP_BUTTONS];
   luna_macro macros[LUNA_KEYMAP_MACROS];
   luna_timed queue[LUNA_TIMED_MAX];
@@ -202,6 +215,11 @@ int luna_keymap_load(luna_keymap *, const char *profile);
 int luna_keymap_key(luna_keymap *, int key, int pressed, float width, float height,
                     luna_keymap_emit, void *);
 void luna_keymap_release(luna_keymap *, float width, float height, luna_keymap_emit, void *);
+/* A gamepad stick, x/y in -1..1 as GLFW reports them (y down).  stick 0 is the
+ * left stick and drives the "stick" joystick; 1 is the right stick and drives
+ * "look".  Returns 0 when the keymap does not use that stick. */
+int luna_keymap_axis(luna_keymap *, int stick, float x, float y, float width, float height,
+                     luna_keymap_emit, void *);
 
 /* Everything that happens on a clock rather than a key event: repeat taps,
  * macro steps and the replay of a recording.  Call it regularly from the

@@ -88,6 +88,13 @@ static int key_code(const char *s)
   if (!strcmp(s, "SPACE")) return 32;
   if (!strcmp(s, "SHIFT")) return 340;
   if (!strcmp(s, "CTRL")) return 341;
+  static const char *const pad[LUNA_PAD_BUTTONS] = {
+    "PAD_A", "PAD_B", "PAD_X", "PAD_Y", "PAD_LB", "PAD_RB", "PAD_BACK", "PAD_START",
+    "PAD_GUIDE", "PAD_L3", "PAD_R3", "PAD_UP", "PAD_RIGHT", "PAD_DOWN", "PAD_LEFT",
+    "PAD_LT", "PAD_RT"
+  };
+  for (int i = 0; i < LUNA_PAD_BUTTONS; ++i) if (!strcmp(s, pad[i])) return LUNA_PAD_KEY(i);
+  if (!strcmp(s, "PAD_SELECT")) return LUNA_PAD_KEY(6);
   if (s[0] && !s[1] && ((s[0] >= 'A' && s[0] <= 'Z') || (s[0] >= '0' && s[0] <= '9'))) return s[0];
   return -1;
 }
@@ -122,7 +129,7 @@ static int claim_ids(luna_keymap *m, int n)
   int next = 2;
   for (int i = 0; i < m->count; ++i) next += m->buttons[i].npoints;
   for (int i = 0; i < m->nmacros; ++i) next += LUNA_KEY_POINTS;
-  return next + n <= 32 ? next : -1;
+  return next + n <= LUNA_LOOK_ID ? next : -1;
 }
 static int key_taken(const luna_keymap *m, int code)
 {
@@ -242,10 +249,21 @@ int luna_keymap_load(luna_keymap *m, const char *path)
       }
       next.walk_key = key_code(key);
       next.walk_radius = radius;
-      if (strchr("WASD", next.walk_key)) {
+      if (next.walk_key == 'W' || next.walk_key == 'A' || next.walk_key == 'S' || next.walk_key == 'D') {
         ok = 0;
         break;
       }
+    } else if (!strcmp(name, "look")) {
+      float speed;
+      if (next.look || sscanf(line, " %*s %f %f %f %c", &x, &y, &speed, &extra) != 3 ||
+          !unit(x) || !unit(y) || !isfinite(speed) || speed <= 0 || speed > 20) {
+        ok = 0;
+        break;
+      }
+      next.look = 1;
+      next.look_x = x;
+      next.look_y = y;
+      next.look_speed = speed;
     } else if (!strcmp(name, "button")) {
       if (next.count == LUNA_KEYMAP_BUTTONS || !parse_button(&next, line)) {
         ok = 0;
@@ -315,10 +333,12 @@ static void macro_start(luna_keymap *m, int index, long long now)
 }
 static void stick_event(luna_keymap *m, float w, float h, luna_keymap_emit emit, void *ctx)
 {
-  float dx = (float)(m->direction[3] - m->direction[1]);
-  float dy = (float)(m->direction[2] - m->direction[0]);
-  int held = 0;
+  /* direction[] holds one bit per source (1 keyboard, 2 d-pad). */
+  float dx = (float)(!!m->direction[3] - !!m->direction[1]);
+  float dy = (float)(!!m->direction[2] - !!m->direction[0]);
+  int held = 0, analog = m->pad_x != 0 || m->pad_y != 0;
   for (int i = 0; i < 4; ++i) held |= m->direction[i];
+  held |= analog;
   float x = m->stick_x * w, y = m->stick_y * h;
   if (!held) {
     if (m->stick_down) emit(ctx, 1, 1, x, y);
@@ -330,7 +350,12 @@ static void stick_event(luna_keymap *m, float w, float h, luna_keymap_emit emit,
     m->stick_down = 1;
   }
   float length = sqrtf(dx * dx + dy * dy);
-  if (length > 0) {
+  if (analog) {
+    /* The stick's own deflection says how far: no walk key needed. */
+    float r = m->radius * fminf(w, h);
+    x += m->pad_x * r;
+    y += m->pad_y * r;
+  } else if (length > 0) {
     float r = (m->walk_held ? m->walk_radius : m->radius) * fminf(w, h);
     x += dx * r / length;
     y += dy * r / length;
@@ -356,10 +381,12 @@ int luna_keymap_key(luna_keymap *m, int key, int pressed, float w, float h, luna
   }
   const char *wasd = "WASD";
   for (int i = 0; i < 4; ++i) if (key == wasd[i]) {
-      if (m->direction[i] != !!pressed) {
-        m->direction[i] = !!pressed;
+      int d = pressed ? m->direction[i] | 1 : m->direction[i] & ~1;
+      if (!!d != !!m->direction[i]) {
+        m->direction[i] = d;
         stick_event(m, w, h, emit, ctx);
       }
+      m->direction[i] = d;
       return 1;
     }
   for (int i = 0; i < m->count; ++i) if (key == m->buttons[i].key) {
@@ -385,13 +412,92 @@ int luna_keymap_key(luna_keymap *m, int key, int pressed, float w, float h, luna
       if (pressed && !mc->pending) macro_start(m, i, clock_ms());
       return 1;
     }
+  /* An unbound d-pad moves the joystick like W/A/S/D. */
+  static const int dpad[4] = { LUNA_PAD_KEY(11), LUNA_PAD_KEY(14), LUNA_PAD_KEY(13), LUNA_PAD_KEY(12) };
+  for (int i = 0; i < 4; ++i) if (key == dpad[i]) {
+      int d = pressed ? m->direction[i] | 2 : m->direction[i] & ~2;
+      if (!!d != !!m->direction[i]) {
+        m->direction[i] = d;
+        stick_event(m, w, h, emit, ctx);
+      }
+      m->direction[i] = d;
+      return 1;
+    }
   return 0;
+}
+
+/* Radial dead zone; the rest of the travel is rescaled to 0..1. */
+#define LUNA_STICK_DEAD 0.2f
+static void dead_zone(float *x, float *y)
+{
+  float len = sqrtf(*x * *x + *y * *y);
+  if (!isfinite(len) || len < LUNA_STICK_DEAD) {
+    *x = *y = 0;
+    return;
+  }
+  float scaled = fminf(1.f, (len - LUNA_STICK_DEAD) / (1.f - LUNA_STICK_DEAD));
+  *x *= scaled / len;
+  *y *= scaled / len;
+}
+static void look_up(luna_keymap *m, luna_keymap_emit emit, void *ctx)
+{
+  if (m->look_down) emit(ctx, LUNA_LOOK_ID, 1, m->look_cx, m->look_cy);
+  m->look_down = 0;
+}
+int luna_keymap_axis(luna_keymap *m, int stick, float x, float y, float w, float h,
+                     luna_keymap_emit emit, void *ctx)
+{
+  if (!m->enabled || w <= 0 || h <= 0) return 0;
+  dead_zone(&x, &y);
+  if (stick == 0) {
+    /* Small wobble is not worth a MotionEvent; crossing zero always is. */
+    int was = m->pad_x != 0 || m->pad_y != 0, is = x != 0 || y != 0;
+    if (was == is && fabsf(x - m->pad_x) < .01f && fabsf(y - m->pad_y) < .01f) return 1;
+    m->pad_x = x;
+    m->pad_y = y;
+    stick_event(m, w, h, emit, ctx);
+    return 1;
+  }
+  if (stick != 1 || !m->look) return 0;
+  m->look_ax = x;
+  m->look_ay = y;
+  if (x == 0 && y == 0) look_up(m, emit, ctx);
+  return 1;
+}
+/* The right stick holds a finger down at the look anchor and slides it at
+ * look_speed screen-heights per second; before it runs out of room the
+ * finger lifts and lands at the anchor again, as a player's thumb would. */
+static void look_tick(luna_keymap *m, long long now, float w, float h, luna_keymap_emit emit, void *ctx)
+{
+  if (!m->look || (m->look_ax == 0 && m->look_ay == 0)) return;
+  float side = fminf(w, h), ax = m->look_x * w, ay = m->look_y * h;
+  if (!m->look_down) {
+    m->look_cx = ax;
+    m->look_cy = ay;
+    m->look_down = 1;
+    m->look_ms = now;
+    emit(ctx, LUNA_LOOK_ID, 0, ax, ay);
+    return;
+  }
+  long long dt = now - m->look_ms;
+  m->look_ms = now;
+  if (dt <= 0) return;
+  if (dt > 50) dt = 50;   /* a stalled frame should not fling the camera */
+  float step = m->look_speed * side * (float)dt / 1000.f;
+  m->look_cx = fminf(fmaxf(m->look_cx + m->look_ax * step, 0), w - 1);
+  m->look_cy = fminf(fmaxf(m->look_cy + m->look_ay * step, 0), h - 1);
+  emit(ctx, LUNA_LOOK_ID, 2, m->look_cx, m->look_cy);
+  float dx = m->look_cx - ax, dy = m->look_cy - ay;
+  if (sqrtf(dx * dx + dy * dy) > .25f * side) look_up(m, emit, ctx);
 }
 void luna_keymap_release(luna_keymap *m, float w, float h, luna_keymap_emit emit, void *ctx)
 {
   memset(m->direction, 0, sizeof m->direction);
   m->walk_held = 0;
+  m->pad_x = m->pad_y = 0;
   stick_event(m, w, h, emit, ctx);
+  look_up(m, emit, ctx);
+  m->look_ax = m->look_ay = 0;
   for (int i = 0; i < m->count; ++i) {
     luna_key_binding *b = &m->buttons[i];
     if (b->held && b->phase)
@@ -608,6 +714,7 @@ void luna_input_tick(luna_keymap *m, float w, float h, luna_keymap_emit emit, vo
     }
     for (int i = 0; i < m->nmacros; ++i)
       if (m->macros[i].loop && m->macros[i].held && !m->macros[i].pending) macro_start(m, i, now);
+    look_tick(m, now, w, h, emit, ctx);
   }
   play_tick(w, h, emit, ctx);
 }

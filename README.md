@@ -511,7 +511,24 @@ macro Z 0.5,0.5|0.6,0.6/40 @100 0.9,0.9 # taps, |simultaneous, /hold ms, @wait m
 macro X 0.1,0.1 loop            # repeat while held
 ```
 
-Coordinates are 0–1 of screen width/height (radius against the shorter side). Up to eight buttons and eight macros; keys are `A–Z`, `0–9`, `SPACE`, `SHIFT`, `CTRL`. `repeat` is 10–60,000 ms. Timing follows the frame clock (about 16 ms at 60 fps). The bundled maps assume a landscape HUD.
+Coordinates are 0–1 of screen width/height (radius against the shorter side). Up to twenty buttons and eight macros; keys are `A–Z`, `0–9`, `SPACE`, `SHIFT`, `CTRL`. `repeat` is 10–60,000 ms. Timing follows the frame clock (about 16 ms at 60 fps). The bundled maps assume a landscape HUD.
+
+## Game controllers
+
+Plug in or pair a controller (Xbox, PlayStation, Switch Pro and others GLFW recognises) and it works through the same keymap files. The log prints `[input] gamepad: <name>` when one is found.
+
+- **With a keymap loaded**, controller buttons tap touch points like keys do, the left stick drives the `stick` joystick with analog strength, and the right stick turns the camera by dragging from the `look` point. An unbound d-pad also moves the joystick. The bundled Genshin and Cross Worlds maps include controller layouts.
+- **With the keymap off** (or for buttons it does not bind), buttons reach the game as Android controller keys (`KEYCODE_BUTTON_A`, `DPAD_UP`, …).
+- **In Android dialogs**, the d-pad moves focus, **A** chooses and **B** goes back.
+- `LUNARIA_GAMEPAD=off` ignores controllers.
+
+```text
+look 0.62 0.38 1.2              # right stick: drag from (x y) at 1.2 screen-heights/s
+button PAD_A 0.922 0.665        # controller button -> touch position
+macro PAD_RT 0.5,0.5 @80 0.6,0.6
+```
+
+Button names: `PAD_A PAD_B PAD_X PAD_Y PAD_LB PAD_RB PAD_LT PAD_RT PAD_BACK PAD_START PAD_GUIDE PAD_L3 PAD_R3 PAD_UP PAD_DOWN PAD_LEFT PAD_RIGHT` (Xbox layout names; on PlayStation, A = Cross, B = Circle, X = Square, Y = Triangle). A map can hold up to 20 buttons in total. Analog sticks are not yet passed to games as Android joystick motion, so games that only read native controller input see the buttons but not the sticks.
 
 **Record and replay:** **F9** (Record Input) saves touch input to `~/Documents/Lunaria <date>.rec`; **F10** (Play Recording) replays the latest, or set `LUNARIA_PLAY` (and `LUNARIA_PLAY_LOOP=1`). Positions are relative, so recordings work at any window size.
 
@@ -580,6 +597,7 @@ Everyday and diagnostic options; development-only switches are in the source and
 | `LUNARIA_CACHE_DIR` / `LUNARIA_NO_CACHE` | `cache/packages/` / off | Package cache location / force fresh unpack |
 | `LUNARIA_WEB_ENGINE` | `auto` | `auto`, `chrome`, `luna`, `off` (host menu overrides per session) |
 | `LUNARIA_KEYMAP` | off | `genshin`, `crossworlds`, `off`, or a keymap path |
+| `LUNARIA_GAMEPAD` | on | `off` ignores game controllers |
 | `LUNARIA_NET` | on | `0` denies all guest sockets |
 | `LUNARIA_JIT_UI` | `1` | Boot card; `0` stays blank until the guest draws |
 | `LUNARIA_DVM` | `1` | Dalvik emulator: `0` off, `1` only where no host stub exists, `2` prefer dex over stubs |

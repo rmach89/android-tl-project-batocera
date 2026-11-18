@@ -17398,6 +17398,129 @@ static void glfw_key_cb(GLFWwindow *, int key, int scancode, int action, int mod
   ndk_input_push_key(action == GLFW_PRESS ? 0 : 1, kc, glfw_to_android_meta(mods));
 }
 
+/* Game controllers, read once per pump through GLFW's gamepad mappings
+ * (Xbox, PlayStation, Switch Pro and the rest of SDL's controller database).
+ * With a keymap loaded, buttons and sticks become touches exactly as keys do;
+ * anything the keymap does not bind reaches the game as Android's own
+ * KEYCODE_BUTTON_* / DPAD_* keys, and an Android window that has the keyboard
+ * (a dialog) is driven with the d-pad, A to choose and B to go back.
+ * LUNARIA_GAMEPAD=off ignores controllers. */
+static bool on_glfw_thread();
+enum { PAD_ROUTE_NONE, PAD_ROUTE_KEYMAP, PAD_ROUTE_NDK, PAD_ROUTE_JAVA };
+static int g_pad_jid = -1;
+static unsigned char g_pad_down[LUNA_PAD_BUTTONS];
+static unsigned char g_pad_route[LUNA_PAD_BUTTONS];
+static int g_pad_code[LUNA_PAD_BUTTONS];
+
+static int pad_android_keycode(int b) {
+  static const int codes[LUNA_PAD_BUTTONS] = {
+    96 /* BUTTON_A */, 97 /* B */, 99 /* X */, 100 /* Y */, 102 /* L1 */, 103 /* R1 */,
+    109 /* SELECT */, 108 /* START */, 110 /* MODE */, 106 /* THUMBL */, 107 /* THUMBR */,
+    19 /* DPAD_UP */, 22 /* DPAD_RIGHT */, 20 /* DPAD_DOWN */, 21 /* DPAD_LEFT */,
+    104 /* L2 */, 105 /* R2 */
+  };
+  return b >= 0 && b < LUNA_PAD_BUTTONS ? codes[b] : 0;
+}
+/* What a focused Android view understands: arrows, choose and back. */
+static int pad_ui_keycode(int b) {
+  switch (b) {
+  case GLFW_GAMEPAD_BUTTON_A: return 23;      /* DPAD_CENTER */
+  case GLFW_GAMEPAD_BUTTON_B: return 4;       /* BACK */
+  case GLFW_GAMEPAD_BUTTON_START: return 66;  /* ENTER */
+  case GLFW_GAMEPAD_BUTTON_DPAD_UP: return 19;
+  case GLFW_GAMEPAD_BUTTON_DPAD_RIGHT: return 22;
+  case GLFW_GAMEPAD_BUTTON_DPAD_DOWN: return 20;
+  case GLFW_GAMEPAD_BUTTON_DPAD_LEFT: return 21;
+  default: return 0;
+  }
+}
+
+static void gamepad_poll(void) {
+  if (!g_glfw || !on_glfw_thread()) return;
+  static int disabled = -1;
+  if (disabled < 0) {
+    const char *v = getenv("LUNARIA_GAMEPAD");
+    disabled = v && (!strcmp(v, "off") || !strcmp(v, "0"));
+    if (disabled) fprintf(stderr, "[input] gamepad: off\n");
+  }
+  if (disabled) return;
+
+  /* First connected controller GLFW has a mapping for. */
+  GLFWgamepadstate st;
+  int jid = -1;
+  for (int j = GLFW_JOYSTICK_1; j <= GLFW_JOYSTICK_LAST; ++j)
+    if (glfwJoystickIsGamepad(j) && glfwGetGamepadState(j, &st)) {
+      jid = j;
+      break;
+    }
+  if (jid != g_pad_jid) {
+    if (jid >= 0) fprintf(stderr, "[input] gamepad: %s\n", glfwGetGamepadName(jid));
+    else fprintf(stderr, "[input] gamepad disconnected\n");
+    g_pad_jid = jid;
+  }
+
+  unsigned char now[LUNA_PAD_BUTTONS] = {};
+  float lx = 0, ly = 0, rx = 0, ry = 0;
+  /* Unfocused, every button reads as released so nothing stays held. */
+  if (jid >= 0 && glfwGetWindowAttrib(g_glfw, GLFW_FOCUSED)) {
+    for (int b = 0; b <= GLFW_GAMEPAD_BUTTON_LAST; ++b) now[b] = st.buttons[b] == GLFW_PRESS;
+    now[15] = st.axes[GLFW_GAMEPAD_AXIS_LEFT_TRIGGER] > 0.f;   /* -1 released, 1 pulled */
+    now[16] = st.axes[GLFW_GAMEPAD_AXIS_RIGHT_TRIGGER] > 0.f;
+    lx = st.axes[GLFW_GAMEPAD_AXIS_LEFT_X];
+    ly = st.axes[GLFW_GAMEPAD_AXIS_LEFT_Y];
+    rx = st.axes[GLFW_GAMEPAD_AXIS_RIGHT_X];
+    ry = st.axes[GLFW_GAMEPAD_AXIS_RIGHT_Y];
+  }
+
+  const bool blocked = luna_ime_active() || luna_overlay_menu_showing();
+  const bool captured = luna_overlay_guest_keys_captured();
+  keymap_apply_pending();
+  float w, h;
+  keymap_size(w, h);
+  for (int b = 0; b < LUNA_PAD_BUTTONS; ++b) {
+    if (now[b] == g_pad_down[b]) continue;
+    g_pad_down[b] = now[b];
+    if (!now[b]) {
+      /* A release goes wherever its press went, so nothing sticks down. */
+      switch (g_pad_route[b]) {
+      case PAD_ROUTE_KEYMAP:
+        luna_keymap_key(&g_keymap, LUNA_PAD_KEY(b), 0, w, h, keymap_emit, nullptr);
+        break;
+      case PAD_ROUTE_NDK: ndk_input_push_key(1, g_pad_code[b], 0); break;
+      case PAD_ROUTE_JAVA: java_key_push(1, g_pad_code[b], 0, 0); break;
+      }
+      g_pad_route[b] = PAD_ROUTE_NONE;
+      continue;
+    }
+    if (blocked) continue;
+    if (captured) {
+      const int kc = pad_ui_keycode(b);
+      if (kc) {
+        java_key_push(0, kc, 0, 0);
+        g_pad_route[b] = PAD_ROUTE_JAVA;
+        g_pad_code[b] = kc;
+      }
+      continue;
+    }
+    if (luna_keymap_key(&g_keymap, LUNA_PAD_KEY(b), 1, w, h, keymap_emit, nullptr)) {
+      g_pad_route[b] = PAD_ROUTE_KEYMAP;
+      continue;
+    }
+    const int kc = pad_android_keycode(b);
+    if (kc) {
+      ndk_input_push_key(0, kc, 0);
+      g_pad_route[b] = PAD_ROUTE_NDK;
+      g_pad_code[b] = kc;
+    }
+  }
+  /* The pump already released the keymap while a menu, the input method or
+   * an Android window has the keyboard; the sticks stay out of it then. */
+  if (!blocked && !captured) {
+    luna_keymap_axis(&g_keymap, 0, lx, ly, w, h, keymap_emit, nullptr);
+    luna_keymap_axis(&g_keymap, 1, rx, ry, w, h, keymap_emit, nullptr);
+  }
+}
+
 static void glfw_char_cb(GLFWwindow *, unsigned int codepoint) {
   if (luna_overlay_host_char(codepoint)) return;
   if (luna_overlay_web_char(codepoint)) return;
@@ -66245,6 +66368,7 @@ extern "C" void arm_exec_glfw_poll(void) {
     }
   }
   luna_menu_tick();
+  gamepad_poll();
   keymap_tick();
   // F12 / touch-file even when the guest is not swapping yet
   if (g_egl_dpy != EGL_NO_DISPLAY && g_egl_surf != EGL_NO_SURFACE)

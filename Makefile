@@ -3832,3 +3832,6 @@ exec-stack-test: lunaria $(BUILD_DIR)/exec-stack-root64/data/local/tmp/stack-pro
 	    grep -q '^exec-stack-image RESULT PASS' $(BUILD_DIR)/exec-stack-driver$$abi.out; \
 	    grep -q 'system returned 5888; RESULT PASS' $(BUILD_DIR)/exec-stack-driver$$abi.out; \
 	done
+
+test/test_gamepad: test/gamepad_test.c src/luna_input.c src/luna_boot.h
+	$(CC) -std=c11 -g -Wall -Wextra -Werror -Isrc test/gamepad_test.c src/luna_input.c -pthread -lm -o $@
