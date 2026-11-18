@@ -1651,12 +1651,16 @@ static bool hook_call_external_inner(void *user, struct dvm *vm, const char *cla
   /* InputDevice.getDeviceIds() is never null on Android — it is an int[] of
    * the currently attached devices.  Returning null made
    * AndroidThunkJava_IsGamepadAttached NPE on the array length once per frame.
-   * Lunaria models no InputDevice at all (touch is injected directly), so the
-   * truthful answer is an empty list rather than a fabricated device. */
+   * The runtime models InputDevice itself now; this answers the same list
+   * (the controller, while one is connected) for a call that still lands
+   * here. */
   if (!strcmp(class_name, "android/view/InputDevice") &&
       !strcmp(method, "getDeviceIds")) {
+    int ids[4];
+    const int n = luna_input_device_ids(ids, 4);
     memset(out, 0, sizeof *out);
-    out->l = dvm_new_array(vm, 'I', "I", 0);
+    out->l = dvm_new_array(vm, 'I', "I", (uint32_t)n);
+    if (out->l && n) memcpy(dvm_array_data(vm, out->l), ids, (size_t)n * sizeof ids[0]);
     return true;
   }
 

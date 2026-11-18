@@ -923,6 +923,9 @@ struct luna_touch_event;
 bool dvm_ui_dispatch_touch(struct dvm *vm, const struct luna_touch_event *sample);
 /* A key from the window system to the focused window's dispatchKeyEvent(). */
 bool dvm_ui_dispatch_key(struct dvm *vm, int action, int keycode, int meta, int repeat);
+/* A game controller event (luna_pad_event) to the focused window. */
+struct luna_pad_event;
+bool dvm_ui_dispatch_pad(struct dvm *vm, const struct luna_pad_event *pad);
 void dvm_jni_show_activity(JNIEnv *env, jobject activity);
 struct lm_sink;
 jobject dvm_jni_surface_from_sink(JNIEnv *env, struct lm_sink *sink);

@@ -16817,6 +16817,10 @@ struct NdkInputEvent {
   float    y_precision = 1.f;
   int32_t  edge_flags = 0;
   luna_touch_event touch = {};
+  /* 0: the touchscreen (motion) or the keyboard (key).  A controller's
+   * events carry their own source and LUNA_PAD_DEVICE_ID. */
+  int32_t  source = 0;
+  int32_t  device_id = 0;
 };
 static std::deque<NdkInputEvent> g_ndk_input_q;
 static NdkInputEvent g_ndk_input_cur = {};
@@ -16913,7 +16917,39 @@ static void touch_contact(int id, int action, float x, float y) {
   ndk_input_push(ev);
 }
 
+static void ndk_input_push_key_from(int action, int keycode, int metastate,
+                                    int32_t source, int32_t device_id);
 static void ndk_input_push_key(int action, int keycode, int metastate) {
+  ndk_input_push_key_from(action, keycode, metastate, 0, 0);
+}
+/* A controller's stick, trigger and hat state as one joystick MotionEvent. */
+static void ndk_input_push_pad_motion(const luna_touch_event &m) {
+  if (g_ndk_input_pipe[0] < 0) return;
+  if (g_ndk_input_q.size() >= 256) {
+    ndk_input_queue_full();
+    return;
+  }
+  /* Consecutive stick samples the guest has not read yet: keep the newest,
+   * as Android batches joystick motion. */
+  if (!g_ndk_input_q.empty() && g_ndk_input_q.back().source == LUNA_SOURCE_JOYSTICK) {
+    g_ndk_input_q.back().touch = m;
+    g_ndk_input_q.back().event_ns = m.event_ms * 1000000ll;
+    return;
+  }
+  NdkInputEvent n = {};
+  n.action = 2;   /* AMOTION_EVENT_ACTION_MOVE */
+  n.x = m.x;
+  n.y = m.y;
+  n.event_ns = n.down_ns = m.event_ms * 1000000ll;
+  n.touch = m;
+  n.source = LUNA_SOURCE_JOYSTICK;
+  n.device_id = LUNA_PAD_DEVICE_ID;
+  g_ndk_input_q.push_back(n);
+  const char b = 1;
+  if (luna_fd_write(g_ndk_input_pipe[1], &b, 1) != 1) { }
+}
+static void ndk_input_push_key_from(int action, int keycode, int metastate,
+                                    int32_t source, int32_t device_id) {
   if (g_ndk_input_pipe[0] < 0) return;
   if (g_ndk_input_q.size() >= 256) {
     ndk_input_queue_full();
@@ -16922,8 +16958,15 @@ static void ndk_input_push_key(int action, int keycode, int metastate) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   const int64_t now = (int64_t)ts.tv_sec * 1'000'000'000ll + ts.tv_nsec;
-  g_ndk_input_q.push_back({NDK_INPUT_TYPE_KEY, action, 0.f, 0.f,
-                           keycode, metastate, 0, now, now});
+  NdkInputEvent n = {};
+  n.type = NDK_INPUT_TYPE_KEY;
+  n.action = action;
+  n.keycode = keycode;
+  n.metastate = metastate;
+  n.event_ns = n.down_ns = now;
+  n.source = source;
+  n.device_id = device_id;
+  g_ndk_input_q.push_back(n);
   const char b = 1;
   if (luna_fd_write(g_ndk_input_pipe[1], &b, 1) != 1) { /* pipe full */ }
 }
@@ -17117,12 +17160,74 @@ static void glfw_mouse_button_cb(GLFWwindow *w, int button, int action, int) {
     arm_exec_pointer_button(pointer_button, action == GLFW_PRESS, (float)x, (float)y);
 }
 
-static void glfw_cursor_pos_cb(GLFWwindow *, double cx, double cy) {
-  window_to_surface(&cx, &cy);
+/* The mouse, or the first finger on a touchscreen, moved (surface pixels). */
+static void pointer_move(double cx, double cy) {
   if (g_touch_down && edge_back_pointer(-1, (float)cx, (float)cy)) return;
   if (luna_overlay_pointer(cx, cy, -1)) return;
   if (!g_touch_down) return;   /* touchscreen semantics: no hover events */
   touch_contact(0, 2, (float)cx, (float)cy);
+}
+
+static void glfw_cursor_pos_cb(GLFWwindow *, double cx, double cy) {
+  window_to_surface(&cx, &cy);
+  pointer_move(cx, cy);
+}
+
+/* A real touchscreen (luna_os_touch_attach).  The first finger is the
+ * mouse's contact 0, so dialogs, the emulator's menu and the back swipe take
+ * it exactly as they take a click.  Further fingers reach the guest as
+ * contacts LUNA_HOST_TOUCH_ID.. while the first finger's touch is the
+ * guest's; a gesture the overlay took stays the overlay's. */
+enum { FINGER_NONE = -1, FINGER_SWALLOWED = -2 };
+static int g_finger_contact[LUNA_HOST_FINGERS] = {
+  FINGER_NONE, FINGER_NONE, FINGER_NONE, FINGER_NONE, FINGER_NONE,
+  FINGER_NONE, FINGER_NONE, FINGER_NONE, FINGER_NONE, FINGER_NONE
+};
+static void fingers_reset(void) {
+  for (int &c : g_finger_contact) c = FINGER_NONE;
+}
+static bool guest_has_contact(int id) {
+  for (int i = 0; i < g_touch_state.count; ++i)
+    if (g_touch_state.points[i].id == id) return true;
+  return false;
+}
+static void host_touch(int finger, int action, double wx, double wy) {
+  if (action == 3) {   /* the system took the gesture */
+    if (g_touch_state.count) touch_contact(0, 3, 0, 0);
+    g_touch_down = false;
+    fingers_reset();
+    return;
+  }
+  if (finger < 0 || finger >= LUNA_HOST_FINGERS) return;
+  double x = wx, y = wy;
+  window_to_surface(&x, &y);
+  int &contact = g_finger_contact[finger];
+  if (action == 0) {
+    bool primary_taken = g_touch_down;
+    for (int c : g_finger_contact) primary_taken |= c == 0;
+    if (!primary_taken) {
+      contact = 0;
+      arm_exec_pointer_button(0, 1, (float)x, (float)y);
+      return;
+    }
+    contact = FINGER_SWALLOWED;
+    if (!guest_has_contact(0)) return;   /* the overlay owns this gesture */
+    for (int id = LUNA_HOST_TOUCH_ID; id < LUNA_HOST_TOUCH_ID + LUNA_HOST_FINGERS - 1; ++id)
+      if (!guest_has_contact(id)) {
+        contact = id;
+        touch_contact(id, 0, (float)x, (float)y);
+        break;
+      }
+    return;
+  }
+  if (action == 2) {
+    if (contact == 0) pointer_move(x, y);
+    else if (contact >= LUNA_HOST_TOUCH_ID) touch_contact(contact, 2, (float)x, (float)y);
+    return;
+  }
+  if (contact == 0) arm_exec_pointer_button(0, 0, (float)x, (float)y);
+  else if (contact >= LUNA_HOST_TOUCH_ID) touch_contact(contact, 1, (float)x, (float)y);
+  contact = FINGER_NONE;
 }
 
 /* Keep contacts alive across frames and consecutive wheel ticks, so a guest
@@ -17326,6 +17431,7 @@ static void glfw_focus_cb(GLFWwindow *, int focused) {
   keymap_release();
   if (g_touch_state.count) touch_contact(0, 3, 0, 0);
   g_touch_down = false;
+  fingers_reset();
 }
 
 /* Keys for the Java UI (see arm_exec_java_key_next). */
@@ -17400,17 +17506,49 @@ static void glfw_key_cb(GLFWwindow *, int key, int scancode, int action, int mod
 
 /* Game controllers, read once per pump through GLFW's gamepad mappings
  * (Xbox, PlayStation, Switch Pro and the rest of SDL's controller database).
- * With a keymap loaded, buttons and sticks become touches exactly as keys do;
- * anything the keymap does not bind reaches the game as Android's own
- * KEYCODE_BUTTON_* / DPAD_* keys, and an Android window that has the keyboard
- * (a dialog) is driven with the d-pad, A to choose and B to go back.
+ *
+ * With no keymap loaded the controller is an Android controller: one
+ * InputDevice (LUNA_PAD_DEVICE_ID, SOURCE_GAMEPAD|DPAD|JOYSTICK), its buttons
+ * KeyEvents with KEYCODE_BUTTON_*, and its sticks, triggers and d-pad one
+ * joystick MotionEvent (AXIS_X/Y, Z/RZ, LTRIGGER/RTRIGGER with BRAKE/GAS,
+ * HAT_X/Y).  A NativeActivity reads them from its AInputQueue; a Java
+ * Activity gets dispatchKeyEvent / dispatchGenericMotionEvent, plus the
+ * DPAD_* keys Android's view system synthesizes from the hat.
+ *
+ * With a keymap loaded, the buttons it binds and the sticks become touches;
+ * the rest stay controller keys.  An Android window that has the keyboard (a
+ * dialog) is driven with the d-pad, A to choose and B to go back.
  * LUNARIA_GAMEPAD=off ignores controllers. */
 static bool on_glfw_thread();
-enum { PAD_ROUTE_NONE, PAD_ROUTE_KEYMAP, PAD_ROUTE_NDK, PAD_ROUTE_JAVA };
+enum { PAD_ROUTE_NONE, PAD_ROUTE_KEYMAP, PAD_ROUTE_NDK, PAD_ROUTE_JAVA, PAD_ROUTE_JAVA_UI };
 static int g_pad_jid = -1;
 static unsigned char g_pad_down[LUNA_PAD_BUTTONS];
 static unsigned char g_pad_route[LUNA_PAD_BUTTONS];
 static int g_pad_code[LUNA_PAD_BUTTONS];
+static float g_pad_axes_sent[LUNA_PAD_AXES];
+static bool g_pad_motion_live = false;   /* a non-centred state was sent */
+
+/* Events for a Java Activity, drained by the dex pump (arm_exec_pad_next). */
+static std::mutex g_pad_q_lock;
+static std::deque<luna_pad_event> g_pad_q;
+static void pad_java_push(const luna_pad_event &e) {
+  std::lock_guard<std::mutex> lk(g_pad_q_lock);
+  if (e.type == 2 && !g_pad_q.empty() && g_pad_q.back().type == 2) {
+    g_pad_q.back() = e;   /* newest stick state wins */
+    return;
+  }
+  if (g_pad_q.size() < 128) g_pad_q.push_back(e);
+}
+extern "C" int arm_exec_pad_next(luna_pad_event *out) {
+  std::lock_guard<std::mutex> lk(g_pad_q_lock);
+  if (g_pad_q.empty() || !out) return 0;
+  *out = g_pad_q.front();
+  g_pad_q.pop_front();
+  return 1;
+}
+/* A NativeActivity reads its AInputQueue and nothing else; everything else
+ * is a Java Activity.  Android never delivers one event to both. */
+static bool pad_to_ndk(void) { return g_ndk_input_pipe[0] >= 0; }
 
 static int pad_android_keycode(int b) {
   static const int codes[LUNA_PAD_BUTTONS] = {
@@ -17421,6 +17559,8 @@ static int pad_android_keycode(int b) {
   };
   return b >= 0 && b < LUNA_PAD_BUTTONS ? codes[b] : 0;
 }
+static bool pad_is_dpad(int b) { return b >= GLFW_GAMEPAD_BUTTON_DPAD_UP && b <= GLFW_GAMEPAD_BUTTON_DPAD_LEFT; }
+static bool pad_is_trigger(int b) { return b == 15 || b == 16; }
 /* What a focused Android view understands: arrows, choose and back. */
 static int pad_ui_keycode(int b) {
   switch (b) {
@@ -17433,6 +17573,53 @@ static int pad_ui_keycode(int b) {
   case GLFW_GAMEPAD_BUTTON_DPAD_LEFT: return 21;
   default: return 0;
   }
+}
+static void pad_send_key(int route, int action, int keycode) {
+  if (route == PAD_ROUTE_NDK) {
+    ndk_input_push_key_from(action, keycode, 0, LUNA_SOURCE_GAMEPAD, LUNA_PAD_DEVICE_ID);
+  } else if (route == PAD_ROUTE_JAVA) {
+    luna_pad_event e = {};
+    e.type = 1;
+    e.action = action;
+    e.keycode = keycode;
+    pad_java_push(e);
+  } else if (route == PAD_ROUTE_JAVA_UI) {
+    java_key_push(action, keycode, 0, 0);
+  }
+}
+static void pad_send_motion(const float axes[LUNA_PAD_AXES]) {
+  luna_touch_event m;
+  luna_pad_motion(&m, axes, touch_now_ms());
+  if (pad_to_ndk()) {
+    ndk_input_push_pad_motion(m);
+  } else {
+    luna_pad_event e = {};
+    e.type = 2;
+    e.motion = m;
+    pad_java_push(e);
+  }
+}
+
+/* SDL's GUID layout, which GLFW uses: bus, CRC, vendor, 0, product, 0 ... as
+ * little-endian 16-bit words.  Other layouts have no USB ids to report. */
+static void pad_describe(int jid, luna_gamepad_info *info) {
+  memset(info, 0, sizeof *info);
+  info->connected = 1;
+  const char *name = glfwGetGamepadName(jid);
+  snprintf(info->name, sizeof info->name, "%s", name && *name ? name : "Gamepad");
+  const char *guid = glfwGetJoystickGUID(jid);
+  unsigned char g[16] = {};
+  bool hex = guid && strlen(guid) >= 32;
+  for (int i = 0; hex && i < 16; ++i) {
+    unsigned v;
+    if (sscanf(guid + 2 * i, "%2x", &v) != 1) hex = false;
+    g[i] = (unsigned char)v;
+  }
+  if (hex && !g[6] && !g[7] && !g[10] && !g[11]) {
+    info->vendor = g[4] | g[5] << 8;
+    info->product = g[8] | g[9] << 8;
+  }
+  snprintf(info->descriptor, sizeof info->descriptor, "lunaria-gamepad-%.24s", guid ? guid : "0");
 }
 
 static void gamepad_poll(void) {
@@ -17453,19 +17640,25 @@ static void gamepad_poll(void) {
       jid = j;
       break;
     }
-  if (jid != g_pad_jid) {
-    if (jid >= 0) fprintf(stderr, "[input] gamepad: %s\n", glfwGetGamepadName(jid));
-    else fprintf(stderr, "[input] gamepad disconnected\n");
+  if (jid >= 0 && jid != g_pad_jid) {
+    luna_gamepad_info info;
+    pad_describe(jid, &info);
+    luna_gamepad_set(&info);
+    fprintf(stderr, "[input] gamepad: %s (%04x:%04x) as input device %d\n",
+            info.name, info.vendor, info.product, LUNA_PAD_DEVICE_ID);
     g_pad_jid = jid;
   }
 
   unsigned char now[LUNA_PAD_BUTTONS] = {};
-  float lx = 0, ly = 0, rx = 0, ry = 0;
-  /* Unfocused, every button reads as released so nothing stays held. */
+  float lx = 0, ly = 0, rx = 0, ry = 0, lt = 0, rt = 0;
+  /* Unfocused or unplugged, everything reads as released and centred so
+   * nothing stays held in the guest. */
   if (jid >= 0 && glfwGetWindowAttrib(g_glfw, GLFW_FOCUSED)) {
     for (int b = 0; b <= GLFW_GAMEPAD_BUTTON_LAST; ++b) now[b] = st.buttons[b] == GLFW_PRESS;
-    now[15] = st.axes[GLFW_GAMEPAD_AXIS_LEFT_TRIGGER] > 0.f;   /* -1 released, 1 pulled */
-    now[16] = st.axes[GLFW_GAMEPAD_AXIS_RIGHT_TRIGGER] > 0.f;
+    lt = (st.axes[GLFW_GAMEPAD_AXIS_LEFT_TRIGGER] + 1.f) * .5f;   /* -1..1 -> 0..1 */
+    rt = (st.axes[GLFW_GAMEPAD_AXIS_RIGHT_TRIGGER] + 1.f) * .5f;
+    now[15] = lt > .5f;
+    now[16] = rt > .5f;
     lx = st.axes[GLFW_GAMEPAD_AXIS_LEFT_X];
     ly = st.axes[GLFW_GAMEPAD_AXIS_LEFT_Y];
     rx = st.axes[GLFW_GAMEPAD_AXIS_RIGHT_X];
@@ -17475,6 +17668,8 @@ static void gamepad_poll(void) {
   const bool blocked = luna_ime_active() || luna_overlay_menu_showing();
   const bool captured = luna_overlay_guest_keys_captured();
   keymap_apply_pending();
+  /* No keymap: the game gets the controller itself. */
+  const bool native = !g_keymap.enabled;
   float w, h;
   keymap_size(w, h);
   for (int b = 0; b < LUNA_PAD_BUTTONS; ++b) {
@@ -17482,42 +17677,70 @@ static void gamepad_poll(void) {
     g_pad_down[b] = now[b];
     if (!now[b]) {
       /* A release goes wherever its press went, so nothing sticks down. */
-      switch (g_pad_route[b]) {
-      case PAD_ROUTE_KEYMAP:
+      if (g_pad_route[b] == PAD_ROUTE_KEYMAP)
         luna_keymap_key(&g_keymap, LUNA_PAD_KEY(b), 0, w, h, keymap_emit, nullptr);
-        break;
-      case PAD_ROUTE_NDK: ndk_input_push_key(1, g_pad_code[b], 0); break;
-      case PAD_ROUTE_JAVA: java_key_push(1, g_pad_code[b], 0, 0); break;
-      }
+      else pad_send_key(g_pad_route[b], 1, g_pad_code[b]);
       g_pad_route[b] = PAD_ROUTE_NONE;
       continue;
     }
     if (blocked) continue;
+    int route = PAD_ROUTE_NONE, kc = 0;
     if (captured) {
-      const int kc = pad_ui_keycode(b);
-      if (kc) {
-        java_key_push(0, kc, 0, 0);
-        g_pad_route[b] = PAD_ROUTE_JAVA;
-        g_pad_code[b] = kc;
-      }
-      continue;
-    }
-    if (luna_keymap_key(&g_keymap, LUNA_PAD_KEY(b), 1, w, h, keymap_emit, nullptr)) {
+      kc = pad_ui_keycode(b);
+      route = kc ? PAD_ROUTE_JAVA_UI : PAD_ROUTE_NONE;
+    } else if (luna_keymap_key(&g_keymap, LUNA_PAD_KEY(b), 1, w, h, keymap_emit, nullptr)) {
       g_pad_route[b] = PAD_ROUTE_KEYMAP;
       continue;
+    } else {
+      kc = pad_android_keycode(b);
+      route = pad_to_ndk() ? PAD_ROUTE_NDK : PAD_ROUTE_JAVA;
+      if (native && pad_is_trigger(b)) route = PAD_ROUTE_NONE;   /* an axis, not a key */
+      /* The hat is motion; only Java's view system also turns it into keys. */
+      if (native && pad_is_dpad(b) && route == PAD_ROUTE_NDK) route = PAD_ROUTE_NONE;
     }
-    const int kc = pad_android_keycode(b);
-    if (kc) {
-      ndk_input_push_key(0, kc, 0);
-      g_pad_route[b] = PAD_ROUTE_NDK;
-      g_pad_code[b] = kc;
-    }
+    if (route == PAD_ROUTE_NONE || !kc) continue;
+    pad_send_key(route, 0, kc);
+    g_pad_route[b] = (unsigned char)route;
+    g_pad_code[b] = kc;
   }
-  /* The pump already released the keymap while a menu, the input method or
-   * an Android window has the keyboard; the sticks stay out of it then. */
-  if (!blocked && !captured) {
+
+  if (blocked || captured) {
+    /* The pump has released the keymap; a menu or dialog owns input now. */
+  } else if (native) {
+    float axes[LUNA_PAD_AXES] = {
+      lx, ly, rx, ry,
+      (float)(now[GLFW_GAMEPAD_BUTTON_DPAD_RIGHT] - now[GLFW_GAMEPAD_BUTTON_DPAD_LEFT]),
+      (float)(now[GLFW_GAMEPAD_BUTTON_DPAD_DOWN] - now[GLFW_GAMEPAD_BUTTON_DPAD_UP]),
+      lt, rt, rt /* GAS */, lt /* BRAKE */
+    };
+    bool changed = false, live = false;
+    for (int i = 0; i < LUNA_PAD_AXES; ++i) {
+      if (fabsf(axes[i]) < .004f) axes[i] = 0;
+      if (fabsf(axes[i] - g_pad_axes_sent[i]) >= .004f || (axes[i] == 0) != (g_pad_axes_sent[i] == 0))
+        changed = true;
+      live |= axes[i] != 0;
+    }
+    if (changed && (live || g_pad_motion_live)) {
+      pad_send_motion(axes);
+      memcpy(g_pad_axes_sent, axes, sizeof axes);
+      g_pad_motion_live = live;
+    }
+  } else {
     luna_keymap_axis(&g_keymap, 0, lx, ly, w, h, keymap_emit, nullptr);
     luna_keymap_axis(&g_keymap, 1, rx, ry, w, h, keymap_emit, nullptr);
+  }
+  /* Switching from native to keymap mode, or a menu opening, recentres. */
+  if ((!native || blocked || captured) && g_pad_motion_live) {
+    const float zero[LUNA_PAD_AXES] = {};
+    pad_send_motion(zero);
+    memset(g_pad_axes_sent, 0, sizeof g_pad_axes_sent);
+    g_pad_motion_live = false;
+  }
+
+  if (jid < 0 && g_pad_jid >= 0) {
+    fprintf(stderr, "[input] gamepad disconnected\n");
+    luna_gamepad_set(nullptr);
+    g_pad_jid = -1;
   }
 }
 
@@ -17568,6 +17791,7 @@ static void poll_glfw_events() {
 extern "C" void arm_exec_pause_poll(void) {
   if (on_glfw_thread()) {
     poll_glfw_events();
+    luna_os_touch_pump();
     luna_menu_tick();
     if (glfwWindowShouldClose(g_glfw)) arm_exec_request_quit();
   }
@@ -17681,6 +17905,8 @@ static bool ensure_glfw_window() {
     glfwSetWindowFocusCallback(g_glfw, glfw_focus_cb);
     glfwSetWindowCloseCallback(g_glfw, glfw_window_close_cb);
     glfwSetCharCallback(g_glfw, glfw_char_cb);
+    if (luna_os_touch_attach(g_glfw, host_touch))
+      fprintf(stderr, "[touch] touchscreen input on (LUNARIA_TOUCHSCREEN=off disables)\n");
   }
   return g_glfw != nullptr;
 }
@@ -59096,11 +59322,12 @@ mbsrtowcs_done:
     ret32((uint32_t)g_ndk_input_cur.type);
     break;
   case SVC_AINPUTEV_SOURCE:
-    ret32(g_ndk_input_cur.type == NDK_INPUT_TYPE_KEY ? 0x101u /* KEYBOARD */
+    ret32(g_ndk_input_cur.source ? (uint32_t)g_ndk_input_cur.source
+          : g_ndk_input_cur.type == NDK_INPUT_TYPE_KEY ? 0x101u /* KEYBOARD */
           : 0x1002u /* TOUCHSCREEN */);
     break;
   case SVC_AINPUTEV_DEVICEID:
-    ret32(0u);
+    ret32((uint32_t)g_ndk_input_cur.device_id);
     break;
   case SVC_AMOTION_ACTION:
     if (g_ndk_input_cur.type != NDK_INPUT_TYPE_MOTION) {
@@ -59151,7 +59378,7 @@ mbsrtowcs_done:
       break;
     }
     /* A finger that is down presses; one that has lifted does not. */
-    const float v = (svc_no == SVC_AMOTION_PRESSURE &&
+    const float v = (svc_no == SVC_AMOTION_PRESSURE && !g_ndk_input_cur.source &&
                      g_ndk_input_cur.action != 1 /* UP */) ? 1.0f
                     : (svc_no == SVC_AMOTION_SIZE ? g_ndk_input_cur.size : 0.0f);
     uint32_t bits;
@@ -59161,7 +59388,9 @@ mbsrtowcs_done:
     break;
   }
   case SVC_AMOTION_TOOLTYPE:
-    ret32(g_ndk_input_cur.type == NDK_INPUT_TYPE_MOTION ? luna_event_count(&g_ndk_input_cur.touch) : 0u);
+    /* A joystick has no tool (TOOL_TYPE_UNKNOWN). */
+    ret32(g_ndk_input_cur.source == LUNA_SOURCE_JOYSTICK ? 0u
+          : g_ndk_input_cur.type == NDK_INPUT_TYPE_MOTION ? luna_event_count(&g_ndk_input_cur.touch) : 0u);
     break;
   /* int32_t AMotionEvent_getButtonState(event). The buttons held down during
    * the event. A touchscreen has none (the finger is the whole gesture), so a
@@ -59189,7 +59418,10 @@ mbsrtowcs_done:
     const int32_t axis = (int32_t)arg32(1);
     const size_t pointer = (size_t)arg32(2);
     float v = 0.0f;
-    if (pointer < (size_t)luna_event_count(&g_ndk_input_cur.touch)) {
+    if (g_ndk_input_cur.source == LUNA_SOURCE_JOYSTICK) {
+      /* Sticks, triggers and the hat, from the event's own axis values. */
+      v = luna_event_axis(&g_ndk_input_cur.touch, axis, (int)pointer);
+    } else if (pointer < (size_t)luna_event_count(&g_ndk_input_cur.touch)) {
       if (axis == 0 /* AXIS_X */)      v = luna_event_x(&g_ndk_input_cur.touch, (int)pointer);
       else if (axis == 1 /* AXIS_Y */) v = luna_event_y(&g_ndk_input_cur.touch, (int)pointer);
       else if (axis == 2 /* AXIS_PRESSURE */)
@@ -66347,6 +66579,7 @@ extern "C" void arm_exec_glfw_poll(void) {
       glfw_fb_size_cb(g_glfw, fw, fh);
     }
     poll_glfw_events();
+    if (on_glfw_thread()) luna_os_touch_pump();
   }
   if (luna_ime_active() || luna_overlay_guest_keys_captured() || luna_overlay_menu_showing())
     keymap_release();

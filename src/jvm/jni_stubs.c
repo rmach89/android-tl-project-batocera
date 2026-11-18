@@ -1597,36 +1597,86 @@ android_os_Bundle_getString(JNIEnv *env, jobject object, va_list args)
   return NULL;
 }
 
+/* android.view.InputDevice for native callers, over luna_input's device
+ * model: the touchscreen (id 0), the virtual keyboard (-1) and, while one is
+ * plugged in, the game controller (LUNA_PAD_DEVICE_ID).  Each device and
+ * each of the controller's axis ranges is one cached object, so a getter
+ * knows which it was asked about by identity.  An InputDevice the Java side
+ * made (and handed to native code) is asked for its own id. */
+static jobject g_input_device_obj[3];             /* touchscreen, keyboard, controller */
+static jobject g_motion_range_obj[LUNA_PAD_AXES];
+static int input_device_slot(int id)
+{
+  return id == LUNA_TOUCH_DEVICE_ID ? 0 : id == -1 ? 1 : id == LUNA_PAD_DEVICE_ID ? 2 : -1;
+}
+static int input_device_of(JNIEnv *env, jobject object)
+{
+  static const int ids[3] = { LUNA_TOUCH_DEVICE_ID, -1, LUNA_PAD_DEVICE_ID };
+  for (int i = 0; i < 3; ++i)
+    if (g_input_device_obj[i] && (*env)->IsSameObject(env, object, g_input_device_obj[i])) return ids[i];
+  jvalue id = { 0 };
+  if (dvm_jni_invoke(env, "android/view/InputDevice", "getId", "()I", object, false, NULL, NULL, &id))
+    return id.i;
+  return LUNA_TOUCH_DEVICE_ID;
+}
+static int motion_range_axis_of(JNIEnv *env, jobject object)
+{
+  for (int i = 0; i < LUNA_PAD_AXES; ++i)
+    if (g_motion_range_obj[i] && (*env)->IsSameObject(env, object, g_motion_range_obj[i]))
+      return luna_pad_axis_at(i);
+  jvalue axis = { 0 };
+  if (dvm_jni_invoke(env, "android/view/InputDevice$MotionRange", "getAxis", "()I", object, false, NULL, NULL, &axis))
+    return axis.i;
+  return -1;
+}
+
+/* The touchscreen keeps the slot it always had; the controller follows it
+ * while connected. */
 jintArray
 android_view_InputDevice_getDeviceIds(JNIEnv *env, jobject object, va_list args)
 {
   assert(env && object);
-  return (*env)->NewIntArray(env, 1);
+  int ids[4] = { LUNA_TOUCH_DEVICE_ID };
+  const int n = 1 + luna_input_device_ids(ids + 1, 3);
+  jintArray array = (*env)->NewIntArray(env, n);
+  if (array) (*env)->SetIntArrayRegion(env, array, 0, n, ids);
+  return array;
 }
 
 /* InputDevice.getDevice(int id) — static.  Unity probes the source device of
  * every injected MotionEvent to classify it (touchscreen/keyboard/…); a NULL
- * here makes it drop the event, so return a singleton InputDevice stub. */
+ * here makes it drop the event.  An id that names no device is null, as on
+ * Android, except that an unknown id still reads as the touchscreen: events
+ * this layer made before device ids existed all said 0. */
 jobject
 android_view_InputDevice_getDevice(JNIEnv *env, jobject object, va_list args)
 {
   assert(env && object);
-  static jobject sv;
-  return jvm_cached_object(env, &sv, "android/view/InputDevice");
+  int id = JVM_VA_HAS_ARGS(args) ? va_arg(args, int) : LUNA_TOUCH_DEVICE_ID;
+  if (!luna_input_device_sources(id)) id = LUNA_TOUCH_DEVICE_ID;
+  return jvm_cached_object(env, &g_input_device_obj[input_device_slot(id)], "android/view/InputDevice");
 }
 
 jint
 android_view_InputDevice_getSources(JNIEnv *env, jobject object, va_list args)
 {
   assert(env && object);
-  return 0x00001002; // SOURCE_TOUCHSCREEN
+  const int sources = luna_input_device_sources(input_device_of(env, object));
+  return sources ? sources : LUNA_SOURCE_TOUCHSCREEN;
 }
 
 jint
 android_view_InputDevice_getSource(JNIEnv *env, jobject object, va_list args)
 {
+  return android_view_InputDevice_getSources(env, object, args);
+}
+
+jboolean
+android_view_InputDevice_supportsSource(JNIEnv *env, jobject object, va_list args)
+{
   assert(env && object);
-  return 0x00001002; // SOURCE_TOUCHSCREEN
+  const int want = JVM_VA_HAS_ARGS(args) ? va_arg(args, int) : 0;
+  return (luna_input_device_sources(input_device_of(env, object)) & want) == want;
 }
 
 jint
@@ -1634,16 +1684,111 @@ android_view_InputDevice_getId(JNIEnv *env, jobject object, va_list args)
 {
   assert(env && object);
   motion_trace("getId");
-  return 0;
+  return input_device_of(env, object);
 }
 
+static jstring input_device_text(JNIEnv *env, jobject object, bool descriptor)
+{
+  luna_gamepad_info pad;
+  const int id = input_device_of(env, object);
+  if (id == LUNA_PAD_DEVICE_ID && luna_gamepad_get(&pad))
+    return (*env)->NewStringUTF(env, descriptor ? pad.descriptor : pad.name);
+  if (id == -1) return (*env)->NewStringUTF(env, descriptor ? "lunaria-virtual-keyboard" : "Virtual");
+  return (*env)->NewStringUTF(env, "lunaria-touchscreen");
+}
 jstring
 android_view_InputDevice_getName(JNIEnv *env, jobject object, va_list args)
 {
   assert(env && object);
   motion_trace("getName");
-  return (*env)->NewStringUTF(env, "lunaria-touchscreen");
+  return input_device_text(env, object, false);
 }
+jstring
+android_view_InputDevice_getDescriptor(JNIEnv *env, jobject object, va_list args)
+{
+  assert(env && object);
+  return input_device_text(env, object, true);
+}
+
+static int input_device_pad(JNIEnv *env, jobject object, luna_gamepad_info *pad)
+{
+  return input_device_of(env, object) == LUNA_PAD_DEVICE_ID && luna_gamepad_get(pad);
+}
+jint
+android_view_InputDevice_getVendorId(JNIEnv *env, jobject object, va_list args)
+{
+  luna_gamepad_info pad;
+  return input_device_pad(env, object, &pad) ? pad.vendor : 0;
+}
+jint
+android_view_InputDevice_getProductId(JNIEnv *env, jobject object, va_list args)
+{
+  luna_gamepad_info pad;
+  return input_device_pad(env, object, &pad) ? pad.product : 0;
+}
+jint
+android_view_InputDevice_getControllerNumber(JNIEnv *env, jobject object, va_list args)
+{
+  return input_device_pad(env, object, NULL) ? 1 : 0;
+}
+jboolean
+android_view_InputDevice_isExternal(JNIEnv *env, jobject object, va_list args)
+{
+  return (jboolean)input_device_pad(env, object, NULL);
+}
+jboolean
+android_view_InputDevice_isVirtual(JNIEnv *env, jobject object, va_list args)
+{
+  return input_device_of(env, object) == -1;
+}
+jint
+android_view_InputDevice_getKeyboardType(JNIEnv *env, jobject object, va_list args)
+{
+  const int id = input_device_of(env, object);
+  return id == -1 ? 2 /* ALPHABETIC */ : id == LUNA_PAD_DEVICE_ID ? 1 /* NON_ALPHABETIC */ : 0;
+}
+
+/* getMotionRange(axis[, source]): the controller's sticks, triggers and hat. */
+static jobject input_device_range(JNIEnv *env, jobject object, int axis, int source)
+{
+  const int slot = luna_pad_axis_slot(axis);
+  if (slot < 0 || !input_device_pad(env, object, NULL)) return NULL;
+  if (source && source != LUNA_SOURCE_JOYSTICK) return NULL;
+  return jvm_cached_object(env, &g_motion_range_obj[slot], "android/view/InputDevice$MotionRange");
+}
+jobject
+android_view_InputDevice_getMotionRange__I(JNIEnv *env, jobject object, va_list args)
+{
+  return input_device_range(env, object, va_arg(args, int), 0);
+}
+jobject
+android_view_InputDevice_getMotionRange__II(JNIEnv *env, jobject object, va_list args)
+{
+  const int axis = va_arg(args, int), source = va_arg(args, int);
+  return input_device_range(env, object, axis, source);
+}
+jint
+android_view_InputDevice_MotionRange_getAxis(JNIEnv *env, jobject object, va_list args)
+{
+  return motion_range_axis_of(env, object);
+}
+jint
+android_view_InputDevice_MotionRange_getSource(JNIEnv *env, jobject object, va_list args)
+{
+  return LUNA_SOURCE_JOYSTICK;
+}
+static jfloat motion_range_value(JNIEnv *env, jobject object, int which)
+{
+  float v[4];
+  luna_pad_axis_range(motion_range_axis_of(env, object), &v[0], &v[1], &v[2], &v[3]);
+  return which == 4 ? v[1] - v[0] : v[which];
+}
+jfloat android_view_InputDevice_MotionRange_getMin(JNIEnv *e, jobject o, va_list a) { return motion_range_value(e, o, 0); }
+jfloat android_view_InputDevice_MotionRange_getMax(JNIEnv *e, jobject o, va_list a) { return motion_range_value(e, o, 1); }
+jfloat android_view_InputDevice_MotionRange_getFlat(JNIEnv *e, jobject o, va_list a) { return motion_range_value(e, o, 2); }
+jfloat android_view_InputDevice_MotionRange_getFuzz(JNIEnv *e, jobject o, va_list a) { return motion_range_value(e, o, 3); }
+jfloat android_view_InputDevice_MotionRange_getRange(JNIEnv *e, jobject o, va_list a) { return motion_range_value(e, o, 4); }
+jfloat android_view_InputDevice_MotionRange_getResolution(JNIEnv *e, jobject o, va_list a) { return 0.f; }
 
 /* KeyCharacterMap.load(int deviceId) — static; Unity loads it for key events.
  * Return a stub object so the probe succeeds. */
@@ -1656,11 +1801,25 @@ android_view_KeyCharacterMap_load(JNIEnv *env, jobject object, va_list args)
   return jvm_cached_object(env, &sv, "android/view/KeyCharacterMap");
 }
 
+/* A MotionEvent says where it came from in its payload (0: the touchscreen);
+ * any other InputEvent — a KeyEvent the Java side made — is asked itself. */
+static const lunaria_touch_event *motion_payload(JNIEnv *env, jobject object);
+static int input_event_int(JNIEnv *env, jobject object, bool source)
+{
+  const lunaria_touch_event *ev = motion_payload(env, object);
+  if (ev) return source ? (ev->source ? ev->source : LUNA_SOURCE_TOUCHSCREEN) : ev->device_id;
+  jvalue v = { 0 };
+  if (dvm_jni_invoke(env, "android/view/InputEvent", source ? "getSource" : "getDeviceId", "()I",
+                     object, false, NULL, NULL, &v))
+    return v.i;
+  return source ? LUNA_SOURCE_TOUCHSCREEN : 0;
+}
+
 jint
 android_view_InputEvent_getSource(JNIEnv *env, jobject object, va_list args)
 {
   assert(env && object);
-  return 0x00001002; // SOURCE_TOUCHSCREEN
+  return input_event_int(env, object, true);
 }
 
 jint
@@ -1668,7 +1827,7 @@ android_view_InputEvent_getDeviceId(JNIEnv *env, jobject object, va_list args)
 {
   assert(env && object);
   motion_trace("getDeviceId");
-  return 0;
+  return input_event_int(env, object, false);
 }
 
 /* Unity 2023 resolves the InputEvent getters against the MotionEvent class
@@ -1680,7 +1839,7 @@ android_view_MotionEvent_getSource(JNIEnv *env, jobject object, va_list args)
 {
   assert(env && object);
   motion_trace("getSource");
-  return 0x00001002; // SOURCE_TOUCHSCREEN
+  return input_event_int(env, object, true);
 }
 
 /* MotionEvent is a value object: each sample is its own JVM_OBJECT_MOTION with
@@ -1832,7 +1991,7 @@ android_view_MotionEvent_getDeviceId(JNIEnv *env, jobject object, va_list args)
 {
   assert(env && object);
   motion_trace("getDeviceId");
-  return 0;
+  return input_event_int(env, object, false);
 }
 
 jfloat
@@ -1849,7 +2008,8 @@ android_view_MotionEvent_getToolType(JNIEnv *env, jobject object, va_list args)
 {
   assert(env && object);
   motion_trace("getToolType");
-  return 1; /* TOOL_TYPE_FINGER */
+  const lunaria_touch_event *ev = motion_payload(env, object);
+  return ev && ev->source == LUNA_SOURCE_JOYSTICK ? 0 /* UNKNOWN */ : 1; /* TOOL_TYPE_FINGER */
 }
 
 jint

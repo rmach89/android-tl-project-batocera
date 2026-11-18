@@ -2189,6 +2189,13 @@ run_dex_activity(struct jvm *jvm, int is_a64)
         (void)activity_send_host(focused,message,sizeof message);
       } else (void)dvm_ui_dispatch_key(input_vm,key_action,key_code,key_meta,key_repeat);
     }
+    /* The game controller.  A focused Activity in another process gets
+     * nothing yet: the host message carries keyboard keys only. */
+    luna_pad_event pad;
+    for (int n=0; input_vm && n<32 && arm_exec_pad_next(&pad); ++n) {
+      uint32_t focused=atomic_load(&activity_focused);
+      if(!focused || focused==(uint32_t)getpid()) (void)dvm_ui_dispatch_pad(input_vm,&pad);
+    }
     stall_watch_tick();
     watchdog_tick();
     if (frame < 5 || frame % 50 == 0)
@@ -2414,6 +2421,8 @@ static int run_service_process(struct jvm *jvm,int is_a64,int control_fd)
       int action,key,meta,repeat;
       for(int n=0;n<16 && arm_exec_java_key_next(&action,&key,&meta,&repeat);++n)
         (void)dvm_ui_dispatch_key(process.vm,action,key,meta,repeat);
+      luna_pad_event pad;
+      for(int n=0;n<32 && arm_exec_pad_next(&pad);++n)(void)dvm_ui_dispatch_pad(process.vm,&pad);
       if(arm_exec_glfw_should_close()) {
         if(!arm_exec_host_window_close_requested())break;
         arm_exec_host_window_visible(1);

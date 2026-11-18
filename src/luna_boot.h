@@ -120,7 +120,18 @@ int luna_apk_activity_manifest(const char *apk, const char *package,
                                char **activities, char **filters);
 
 /* Touch input, keymaps and recording */
+/* Android input sources, device ids and gamepad axes (MotionEvent.AXIS_*). */
+#define LUNA_SOURCE_KEYBOARD    0x00000101
+#define LUNA_SOURCE_DPAD        0x00000201
+#define LUNA_SOURCE_GAMEPAD     0x00000401
+#define LUNA_SOURCE_TOUCHSCREEN 0x00001002
+#define LUNA_SOURCE_JOYSTICK    0x01000010
+#define LUNA_TOUCH_DEVICE_ID 0
+#define LUNA_PAD_DEVICE_ID   16
+#define LUNA_PAD_AXES 10   /* X Y Z RZ HAT_X HAT_Y LTRIGGER RTRIGGER GAS BRAKE */
 #define LUNA_TOUCH_MAX 10
+#define LUNA_HOST_TOUCH_ID 20
+#define LUNA_HOST_FINGERS 10   /* the first finger, then ids 20-28 */
 typedef struct luna_touch_point {
   int id;
   float x, y;
@@ -131,6 +142,11 @@ typedef struct luna_touch_event {
   long long event_ms, down_ms;
   int pointer_count;
   luna_touch_point pointers[LUNA_TOUCH_MAX];
+  /* 0 for the touchscreen.  A joystick event (source LUNA_SOURCE_JOYSTICK)
+   * has one pointer at (AXIS_X, AXIS_Y) and its axes in pad[], indexed by
+   * luna_pad_axis_slot(); luna_event_axis() reads them. */
+  int source, device_id;
+  float pad[LUNA_PAD_AXES];
 } luna_touch_event;
 typedef struct luna_touch_state {
   int count;
@@ -140,12 +156,63 @@ typedef struct luna_touch_state {
 /* action: DOWN=0, UP=1, MOVE=2, CANCEL=3; id identifies a stable contact.
  * Returns a complete immutable Android event, including the lifting pointer
  * on POINTER_UP.  Pointer indices can change; pointer IDs do not. */
+/* A touchscreen's own contact identifiers (X11 touch ids, Wayland ids,
+ * Windows dwIDs) to slots 0..LUNA_HOST_FINGERS-1.  action 0 claims a slot,
+ * 1 releases it, 2 finds it; -1 when there is none (an eleventh finger, or
+ * one the map never saw go down). */
+typedef struct luna_finger_map {
+  long long key[LUNA_HOST_FINGERS];
+  unsigned char used[LUNA_HOST_FINGERS];
+} luna_finger_map;
+static inline int luna_finger_slot(luna_finger_map *m, long long key, int action)
+{
+  if (!m) return -1;
+  for (int i = 0; i < LUNA_HOST_FINGERS; ++i)
+    if (m->used[i] && m->key[i] == key) {
+      if (action == 1) m->used[i] = 0;
+      return action == 0 ? -1 : i;   /* a second "down" for a live finger */
+    }
+  if (action != 0) return -1;
+  for (int i = 0; i < LUNA_HOST_FINGERS; ++i)
+    if (!m->used[i]) {
+      m->used[i] = 1;
+      m->key[i] = key;
+      return i;
+    }
+  return -1;
+}
 int luna_touch_update(luna_touch_state *, int id, int action, float x, float y,
                       long long now_ms, luna_touch_event *out);
 int luna_event_count(const luna_touch_event *);
 int luna_event_id(const luna_touch_event *, int index);
 float luna_event_x(const luna_touch_event *, int index);
 float luna_event_y(const luna_touch_event *, int index);
+
+/* The host's game controller as Android sees it: one InputDevice with id
+ * LUNA_PAD_DEVICE_ID while a controller is connected.  The window thread
+ * publishes it; the Java runtime and the JNI stubs read it from any thread. */
+typedef struct luna_gamepad_info {
+  int connected, vendor, product;
+  char name[128], descriptor[48];
+} luna_gamepad_info;
+void luna_gamepad_set(const luna_gamepad_info *);   /* NULL: disconnected */
+int luna_gamepad_get(luna_gamepad_info *);          /* 1 while connected */
+/* Ids InputDevice.getDeviceIds() lists; returns how many. */
+int luna_input_device_ids(int *out, int capacity);
+/* SOURCE_* bits of a device, 0 when there is no such device. */
+int luna_input_device_sources(int id);
+/* The AXIS_* a pad reports, in slot order, and each one's range. */
+int luna_pad_axis_slot(int axis);                    /* -1 if not reported */
+int luna_pad_axis_at(int slot);
+void luna_pad_axis_range(int axis, float *min, float *max, float *flat, float *fuzz);
+/* A joystick MotionEvent carrying axes[] (one value per slot). */
+void luna_pad_motion(luna_touch_event *out, const float axes[LUNA_PAD_AXES], long long now_ms);
+/* What the window thread queues for the Java side. */
+typedef struct luna_pad_event {
+  int type;              /* 1 key, 2 motion */
+  int action, keycode;   /* key: KeyEvent.ACTION_* and KEYCODE_* */
+  luna_touch_event motion;
+} luna_pad_event;
 /* Axes of the virtual touchscreen; pressure is normalized to [0,1]. */
 float luna_event_axis(const luna_touch_event *, int axis, int index);
 #define LUNA_KEYMAP_BUTTONS 20   /* keyboard and gamepad bindings together */
@@ -155,7 +222,11 @@ float luna_event_axis(const luna_touch_event *, int axis, int index);
  * keymap files: PAD_A ... PAD_LEFT, PAD_LT, PAD_RT. */
 #define LUNA_PAD_KEY(button) (1000 + (button))
 #define LUNA_PAD_BUTTONS 17
-#define LUNA_LOOK_ID 31        /* touch contact the right stick drags */
+/* Touch contact ids (Android pointer ids, 0-31): 0 the mouse or the first
+ * finger on a real touchscreen, 1 the keymap joystick, 2-18 keymap buttons
+ * and macros, 19 the right stick's camera drag, 20-28 further fingers on a
+ * touchscreen, 29 the wheel slide, 30-31 the Ctrl+wheel pinch. */
+#define LUNA_LOOK_ID 19
 #define LUNA_KEY_POINTS 4      /* contacts one key can press at the same time */
 #define LUNA_KEYMAP_MACROS 8
 #define LUNA_MACRO_STEPS 24

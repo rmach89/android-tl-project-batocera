@@ -2010,6 +2010,21 @@ void *luna_os_offscreen_window(void *glfw_window, int w, int h);
 /* Resize an existing native offscreen drawable, on the window pump thread. */
 void luna_os_offscreen_resize(void *native_window, int w, int h);
 
+/* A touchscreen over the window.  GLFW reports none, so each port reads the
+ * platform's own touch events: XInput 2.2 on X11, wl_touch on Wayland,
+ * WM_TOUCH on Windows (macOS has no touchscreens).  `report` gets one call
+ * per change of one finger: `finger` a slot 0..LUNA_HOST_FINGERS-1, `action`
+ * 0 down, 1 up, 2 move, 3 cancel (every finger; `finger` is -1), and x/y in
+ * the same window coordinates GLFW gives the cursor.  While attached, the
+ * pointer events a platform synthesizes from touches are not seen by GLFW,
+ * so a finger is not also a mouse click.  luna_os_touch_pump() delivers
+ * what has arrived; call it on the window thread after polling GLFW (on
+ * Windows the calls happen inside the poll).  attach returns 1 when the
+ * platform can report touches at all. */
+typedef void (*luna_os_touch_fn)(int finger, int action, double x, double y);
+int luna_os_touch_attach(void *glfw_window, luna_os_touch_fn report);
+void luna_os_touch_pump(void);
+
 /* ---- audio out ----------------------------------------------------------
  *
  * One PCM playback stream, which is what the guest's OpenSL ES / AAudio

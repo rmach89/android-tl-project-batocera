@@ -14,6 +14,7 @@
 #define _GNU_SOURCE
 #define LUNARIA_SYMLINK_NATIVE
 #include "lunaria_os.h"
+#include "luna_boot.h"
 
 #include <locale.h>
 #include <errno.h>
@@ -813,6 +814,256 @@ void luna_os_offscreen_resize(void *native_window, int w, int h)
     sync(dpy, False);
   }
   dlclose(x11);
+}
+
+/* ---- touchscreen ----------------------------------------------------------
+ *
+ * GLFW has no touch input on either backend.  On X11 the touches are XInput
+ * 2.2 events selected on the GLFW window from a connection of this layer's
+ * own (window ids are server-wide, and only one client may select touch on
+ * a window — GLFW does not).  Selecting them also stops the server from
+ * turning the first finger into pointer events for GLFW.  libX11 and libXi
+ * are loaded at run time, like Xlib above, so neither is a link dependency.
+ * On Wayland they are wl_touch events for the GLFW surface, read through an
+ * event queue of this layer's own on GLFW's display; GLFW reads the socket in
+ * its poll and the pump dispatches what landed in that queue. */
+static luna_os_touch_fn g_touch_report;
+static luna_finger_map g_touch_fingers;
+
+/* XInput 2.2, as <X11/extensions/XInput2.h> lays it out (that header is not
+ * needed to build: the ABI is fixed). */
+typedef struct { int deviceid; int mask_len; unsigned char *mask; } luna_XIEventMask;
+typedef struct { int mask_len; unsigned char *mask; } luna_XIButtonState;
+typedef struct { int mask_len; unsigned char *mask; double *values; } luna_XIValuatorState;
+typedef struct { int base, latched, locked, effective; } luna_XIModifierState;
+typedef struct {
+  int type;
+  unsigned long serial;
+  Bool send_event;
+  Display *display;
+  int extension;
+  int evtype;
+  Time time;
+  int deviceid, sourceid, detail;
+  Window root, event, child;
+  double root_x, root_y, event_x, event_y;
+  int flags;
+  luna_XIButtonState buttons;
+  luna_XIValuatorState valuators;
+  luna_XIModifierState mods, group;
+} luna_XIDeviceEvent;
+enum { LUNA_XI_TOUCH_BEGIN = 18, LUNA_XI_TOUCH_UPDATE = 19, LUNA_XI_TOUCH_END = 20,
+       LUNA_XI_ALL_MASTER_DEVICES = 1 };
+
+static struct {
+  Display *dpy;
+  int opcode;
+  int (*pending)(Display *);
+  int (*next_event)(Display *, XEvent *);
+  Bool (*get_data)(Display *, XGenericEventCookie *);
+  void (*free_data)(Display *, XGenericEventCookie *);
+} g_xtouch;
+
+static int touch_attach_x11(GLFWwindow *window)
+{
+  void *x11 = dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL);
+  void *xi = dlopen("libXi.so.6", RTLD_NOW | RTLD_LOCAL);
+  if (!x11 || !xi) {
+    fprintf(stderr, "[touch] libXi not available: no touchscreen input\n");
+    return 0;
+  }
+  Display *(*open_display)(const char *);
+  Bool (*query_extension)(Display *, const char *, int *, int *, int *);
+  int (*query_version)(Display *, int *, int *);
+  int (*select_events)(Display *, Window, luna_XIEventMask *, int);
+  int (*flush)(Display *);
+  void *sym;
+#define LUNA_X_SYM(lib, var, name) (sym = dlsym(lib, name), memcpy(&var, &sym, sizeof var), sym)
+  if (!LUNA_X_SYM(x11, open_display, "XOpenDisplay") ||
+      !LUNA_X_SYM(x11, query_extension, "XQueryExtension") ||
+      !LUNA_X_SYM(x11, flush, "XFlush") ||
+      !LUNA_X_SYM(x11, g_xtouch.pending, "XPending") ||
+      !LUNA_X_SYM(x11, g_xtouch.next_event, "XNextEvent") ||
+      !LUNA_X_SYM(x11, g_xtouch.get_data, "XGetEventData") ||
+      !LUNA_X_SYM(x11, g_xtouch.free_data, "XFreeEventData") ||
+      !LUNA_X_SYM(xi, query_version, "XIQueryVersion") ||
+      !LUNA_X_SYM(xi, select_events, "XISelectEvents"))
+    return 0;
+#undef LUNA_X_SYM
+  Display *dpy = open_display(NULL);
+  if (!dpy) return 0;
+  int event, error, major = 2, minor = 2;
+  if (!query_extension(dpy, "XInputExtension", &g_xtouch.opcode, &event, &error) ||
+      query_version(dpy, &major, &minor) != Success || major < 2 || (major == 2 && minor < 2)) {
+    fprintf(stderr, "[touch] X server has no XInput 2.2: no touchscreen input\n");
+    return 0;
+  }
+  unsigned char bits[(LUNA_XI_TOUCH_END >> 3) + 1] = { 0 };
+  bits[LUNA_XI_TOUCH_BEGIN >> 3] |= 1 << (LUNA_XI_TOUCH_BEGIN & 7);
+  bits[LUNA_XI_TOUCH_UPDATE >> 3] |= 1 << (LUNA_XI_TOUCH_UPDATE & 7);
+  bits[LUNA_XI_TOUCH_END >> 3] |= 1 << (LUNA_XI_TOUCH_END & 7);
+  luna_XIEventMask mask = { LUNA_XI_ALL_MASTER_DEVICES, (int)sizeof bits, bits };
+  if (select_events(dpy, glfwGetX11Window(window), &mask, 1) != Success) return 0;
+  flush(dpy);
+  g_xtouch.dpy = dpy;
+  return 1;
+}
+
+static void touch_pump_x11(void)
+{
+  while (g_xtouch.dpy && g_xtouch.pending(g_xtouch.dpy)) {
+    XEvent ev;
+    g_xtouch.next_event(g_xtouch.dpy, &ev);
+    XGenericEventCookie *cookie = &ev.xcookie;
+    if (cookie->type != GenericEvent || cookie->extension != g_xtouch.opcode ||
+        !g_xtouch.get_data(g_xtouch.dpy, cookie))
+      continue;
+    const luna_XIDeviceEvent *t = cookie->data;
+    const int action = cookie->evtype == LUNA_XI_TOUCH_BEGIN ? 0
+                     : cookie->evtype == LUNA_XI_TOUCH_END ? 1
+                     : cookie->evtype == LUNA_XI_TOUCH_UPDATE ? 2 : -1;
+    if (action >= 0) {
+      const int finger = luna_finger_slot(&g_touch_fingers, (unsigned)t->detail, action);
+      if (finger >= 0) g_touch_report(finger, action, t->event_x, t->event_y);
+    }
+    g_xtouch.free_data(g_xtouch.dpy, cookie);
+  }
+}
+
+static struct {
+  struct wl_display *display;
+  struct wl_event_queue *queue;
+  struct wl_surface *surface;
+  struct wl_seat *seat;
+  struct wl_touch *touch;
+  int on_surface;                   /* fingers that went down on our window */
+  int32_t id[LUNA_HOST_FINGERS];
+  double x[LUNA_HOST_FINGERS], y[LUNA_HOST_FINGERS];
+} g_wltouch;
+
+static void wl_touch_down(void *data, struct wl_touch *touch, uint32_t serial, uint32_t time,
+                          struct wl_surface *surface, int32_t id, wl_fixed_t x, wl_fixed_t y)
+{
+  (void)data; (void)touch; (void)serial; (void)time;
+  if (surface != g_wltouch.surface) return;   /* decorations and other windows */
+  const int finger = luna_finger_slot(&g_touch_fingers, id, 0);
+  if (finger < 0) return;
+  g_wltouch.x[finger] = wl_fixed_to_double(x);
+  g_wltouch.y[finger] = wl_fixed_to_double(y);
+  g_touch_report(finger, 0, g_wltouch.x[finger], g_wltouch.y[finger]);
+}
+static void wl_touch_up(void *data, struct wl_touch *touch, uint32_t serial, uint32_t time, int32_t id)
+{
+  (void)data; (void)touch; (void)serial; (void)time;
+  const int finger = luna_finger_slot(&g_touch_fingers, id, 1);
+  if (finger >= 0) g_touch_report(finger, 1, g_wltouch.x[finger], g_wltouch.y[finger]);
+}
+static void wl_touch_motion(void *data, struct wl_touch *touch, uint32_t time, int32_t id,
+                            wl_fixed_t x, wl_fixed_t y)
+{
+  (void)data; (void)touch; (void)time;
+  const int finger = luna_finger_slot(&g_touch_fingers, id, 2);
+  if (finger < 0) return;
+  g_wltouch.x[finger] = wl_fixed_to_double(x);
+  g_wltouch.y[finger] = wl_fixed_to_double(y);
+  g_touch_report(finger, 2, g_wltouch.x[finger], g_wltouch.y[finger]);
+}
+static void wl_touch_frame(void *data, struct wl_touch *touch) { (void)data; (void)touch; }
+/* The compositor took the gesture (a system swipe): every finger is gone. */
+static void wl_touch_cancel(void *data, struct wl_touch *touch)
+{
+  (void)data; (void)touch;
+  memset(&g_touch_fingers, 0, sizeof g_touch_fingers);
+  g_touch_report(-1, 3, 0, 0);
+}
+static void wl_touch_shape(void *data, struct wl_touch *touch, int32_t id, wl_fixed_t major, wl_fixed_t minor)
+{
+  (void)data; (void)touch; (void)id; (void)major; (void)minor;
+}
+static void wl_touch_orientation(void *data, struct wl_touch *touch, int32_t id, wl_fixed_t orientation)
+{
+  (void)data; (void)touch; (void)id; (void)orientation;
+}
+static const struct wl_touch_listener g_wl_touch_listener = {
+  .down = wl_touch_down, .up = wl_touch_up, .motion = wl_touch_motion,
+  .frame = wl_touch_frame, .cancel = wl_touch_cancel,
+  .shape = wl_touch_shape, .orientation = wl_touch_orientation,
+};
+static void wl_seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps)
+{
+  (void)data;
+  if ((caps & WL_SEAT_CAPABILITY_TOUCH) && !g_wltouch.touch) {
+    g_wltouch.touch = wl_seat_get_touch(seat);
+    wl_touch_add_listener(g_wltouch.touch, &g_wl_touch_listener, NULL);
+    fprintf(stderr, "[touch] Wayland touchscreen attached\n");
+  } else if (!(caps & WL_SEAT_CAPABILITY_TOUCH) && g_wltouch.touch) {
+    wl_touch_destroy(g_wltouch.touch);
+    g_wltouch.touch = NULL;
+  }
+}
+static void wl_seat_name(void *data, struct wl_seat *seat, const char *name)
+{
+  (void)data; (void)seat; (void)name;
+}
+static const struct wl_seat_listener g_wl_seat_listener = {
+  .capabilities = wl_seat_capabilities, .name = wl_seat_name,
+};
+static void wl_registry_global(void *data, struct wl_registry *registry, uint32_t name,
+                               const char *interface, uint32_t version)
+{
+  (void)data;
+  if (g_wltouch.seat || strcmp(interface, wl_seat_interface.name)) return;
+  g_wltouch.seat = wl_registry_bind(registry, name, &wl_seat_interface, version < 5 ? version : 5);
+  wl_seat_add_listener(g_wltouch.seat, &g_wl_seat_listener, NULL);
+}
+static void wl_registry_global_remove(void *data, struct wl_registry *registry, uint32_t name)
+{
+  (void)data; (void)registry; (void)name;
+}
+static const struct wl_registry_listener g_wl_registry_listener = {
+  .global = wl_registry_global, .global_remove = wl_registry_global_remove,
+};
+
+static int touch_attach_wayland(GLFWwindow *window)
+{
+  struct wl_display *(*get_display)(void);
+  struct wl_surface *(*get_surface)(GLFWwindow *);
+  void *sym = dlsym(RTLD_DEFAULT, "glfwGetWaylandDisplay");
+  memcpy(&get_display, &sym, sizeof get_display);
+  sym = dlsym(RTLD_DEFAULT, "glfwGetWaylandWindow");
+  memcpy(&get_surface, &sym, sizeof get_surface);
+  if (!get_display || !get_surface) return 0;
+  g_wltouch.display = get_display();
+  g_wltouch.surface = get_surface(window);
+  if (!g_wltouch.display || !g_wltouch.surface) return 0;
+  g_wltouch.queue = wl_display_create_queue(g_wltouch.display);
+  struct wl_display *wrapped = wl_proxy_create_wrapper(g_wltouch.display);
+  if (!g_wltouch.queue || !wrapped) return 0;
+  wl_proxy_set_queue((struct wl_proxy *)wrapped, g_wltouch.queue);
+  struct wl_registry *registry = wl_display_get_registry(wrapped);
+  wl_proxy_wrapper_destroy(wrapped);
+  wl_registry_add_listener(registry, &g_wl_registry_listener, NULL);
+  /* Once for the seat global, once for the seat's capabilities. */
+  wl_display_roundtrip_queue(g_wltouch.display, g_wltouch.queue);
+  wl_display_roundtrip_queue(g_wltouch.display, g_wltouch.queue);
+  return g_wltouch.seat != NULL;
+}
+
+int luna_os_touch_attach(void *glfw_window, luna_os_touch_fn report)
+{
+  if (!glfw_window || !report) return 0;
+  const char *off = getenv("LUNARIA_TOUCHSCREEN");
+  if (off && (!strcmp(off, "off") || !strcmp(off, "0"))) return 0;
+  g_touch_report = report;
+  return luna_wayland_backend() ? touch_attach_wayland((GLFWwindow *)glfw_window)
+                                : touch_attach_x11((GLFWwindow *)glfw_window);
+}
+
+void luna_os_touch_pump(void)
+{
+  if (!g_touch_report) return;
+  if (g_xtouch.dpy) touch_pump_x11();
+  if (g_wltouch.queue) wl_display_dispatch_queue_pending(g_wltouch.display, g_wltouch.queue);
 }
 
 /* ---- audio out ----------------------------------------------------------

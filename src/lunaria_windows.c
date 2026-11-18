@@ -27,6 +27,7 @@
 
 #define LUNARIA_SYMLINK_NATIVE
 #include "lunaria_os.h"
+#include "luna_boot.h"
 #include <locale.h>
 #include <direct.h>
 #include <ntsecapi.h>
@@ -1235,6 +1236,63 @@ void luna_os_offscreen_resize(void *native_window, int w, int h)
   (void)native_window;
   (void)w;
   (void)h;
+}
+
+/* ---- touchscreen ----------------------------------------------------------
+ *
+ * WM_TOUCH, read by a window procedure placed in front of GLFW's (GLFW has
+ * no touch input).  Windows also turns every touch into mouse messages for
+ * applications that do not know about touch, and a long press into a right
+ * click; those carry the pen/touch signature in GetMessageExtraInfo() and
+ * are dropped here, so GLFW never sees a finger as a mouse. */
+static luna_os_touch_fn g_touch_report;
+static luna_finger_map g_touch_fingers;
+static WNDPROC g_touch_prev_proc;
+
+static LRESULT CALLBACK touch_window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+  if (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST && msg != WM_MOUSEWHEEL && msg != WM_MOUSEHWHEEL &&
+      (GetMessageExtraInfo() & 0xFFFFFF80) == 0xFF515780 /* MI_WP_SIGNATURE | touch */)
+    return 0;
+  if (msg == WM_TOUCH) {
+    TOUCHINPUT in[16];
+    UINT n = LOWORD(wp);
+    if (n > 16) n = 16;
+    if (n && GetTouchInputInfo((HTOUCHINPUT)lp, n, in, (int)sizeof in[0])) {
+      for (UINT i = 0; i < n; ++i) {
+        const int action = (in[i].dwFlags & TOUCHEVENTF_DOWN) ? 0
+                         : (in[i].dwFlags & TOUCHEVENTF_UP) ? 1
+                         : (in[i].dwFlags & TOUCHEVENTF_MOVE) ? 2 : -1;
+        if (action < 0) continue;
+        POINT p = { TOUCH_COORD_TO_PIXEL(in[i].x), TOUCH_COORD_TO_PIXEL(in[i].y) };
+        ScreenToClient(hwnd, &p);
+        const int finger = luna_finger_slot(&g_touch_fingers, (long long)in[i].dwID, action);
+        if (finger >= 0) g_touch_report(finger, action, p.x, p.y);
+      }
+      CloseTouchInputHandle((HTOUCHINPUT)lp);
+      return 0;
+    }
+  }
+  return CallWindowProcW(g_touch_prev_proc, hwnd, msg, wp, lp);
+}
+
+int luna_os_touch_attach(void *glfw_window, luna_os_touch_fn report)
+{
+  if (!glfw_window || !report || g_touch_prev_proc) return 0;
+  const char *off = getenv("LUNARIA_TOUCHSCREEN");
+  if (off && (!strcmp(off, "off") || !strcmp(off, "0"))) return 0;
+  HWND hwnd = glfwGetWin32Window((GLFWwindow *)glfw_window);
+  if (!hwnd || !RegisterTouchWindow(hwnd, 0)) return 0;
+  g_touch_report = report;
+  g_touch_prev_proc = (WNDPROC)SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)touch_window_proc);
+  if (GetSystemMetrics(SM_MAXIMUMTOUCHES) > 0)
+    fprintf(stderr, "[touch] touchscreen with %d contacts\n", GetSystemMetrics(SM_MAXIMUMTOUCHES));
+  return g_touch_prev_proc != NULL;
+}
+
+/* WM_TOUCH is delivered inside glfwPollEvents(); nothing is left to pump. */
+void luna_os_touch_pump(void)
+{
 }
 
 /* ---- audio output -------------------------------------------------------

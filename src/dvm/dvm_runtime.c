@@ -66143,6 +66143,19 @@ static bool view_hardware_accelerated(struct dvm *vm,dvm_ref self,
   const char *mode=dvm__env("LUNARIA_HWACC");
   RETI(rt_get_int(vm,self,"attachedToWindow") && !(mode && !strcmp(mode,"0")));
 }
+/* dispatchGenericMotionEvent(): a joystick event goes to the receiver's own
+ * onGenericMotionEvent(), which a game's Activity or view overrides.  Like
+ * this runtime's key dispatch, it does not walk the view tree first. */
+static bool generic_motion_dispatch(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)nargs;
+  if (!ARG(0).l) {
+    dvm__throw(vm,"java/lang/NullPointerException","event");
+    return false;
+  }
+  union dvm_value arg = { .l = ARG(0).l };
+  return am_vcall(vm,self,"onGenericMotionEvent","(Landroid/view/MotionEvent;)Z",&arg,1,out);
+}
 static const struct rt_method rt_view[] = {
   M("dispatchConfigurationChanged","(Landroid/content/res/Configuration;)V",view_dispatch_configuration),
   M("onConfigurationChanged","(Landroid/content/res/Configuration;)V",empty_void),
@@ -66159,6 +66172,8 @@ static const struct rt_method rt_view[] = {
   SM("inflate", "(Landroid/content/Context;ILandroid/view/ViewGroup;)Landroid/view/View;", view_inflate),
   M("dispatchTouchEvent","(Landroid/view/MotionEvent;)Z",view_dispatch_touch),
   M("onTouchEvent","(Landroid/view/MotionEvent;)Z",view_on_touch),
+  M("dispatchGenericMotionEvent","(Landroid/view/MotionEvent;)Z",generic_motion_dispatch),
+  M("onGenericMotionEvent","(Landroid/view/MotionEvent;)Z",ret_false),
   M("requestDisallowInterceptTouchEvent","(Z)V",view_disallow_intercept),
   M("setStateDescription", "(Ljava/lang/CharSequence;)V", view_set_state_description),
   M("getStateDescription", "()Ljava/lang/CharSequence;", view_get_state_description),
@@ -72327,6 +72342,54 @@ bool dvm_ui_dispatch_key(struct dvm *vm, int action, int keycode, int meta, int 
   return handled;
 }
 
+/* The controller to the focused window: its buttons as KeyEvents through
+ * dispatchKeyEvent(), its sticks, triggers and hat as a joystick MotionEvent
+ * through dispatchGenericMotionEvent().  On Android a Java view also gets
+ * the DPAD_* keys the framework makes from the hat; the producer sends those
+ * as keys already. */
+bool dvm_ui_dispatch_pad(struct dvm *vm, const struct luna_pad_event *pad)
+{
+  if (!vm || !pad) return false;
+  dvm_gil_acquire(vm);
+  dvm_ref window = g_ui_vm == vm ? g_ui_focused_window : 0;
+  bool handled = false;
+  dvm_ref event = 0;
+  const char *method = NULL, *sig = NULL;
+  if (window && pad->type == 1) {
+    struct dvm_class *kc = dvm_find_class(vm, "android/view/KeyEvent");
+    event = kc ? dvm_new_object(vm, kc) : 0;
+    if (event) {
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      const int64_t now = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+      (void)dvm_set_field(vm, event, "action", "I", (union dvm_value){ .i = pad->action });
+      (void)dvm_set_field(vm, event, "keyCode", "I", (union dvm_value){ .i = pad->keycode });
+      (void)dvm_set_field(vm, event, "source", "I", (union dvm_value){ .i = LUNA_SOURCE_GAMEPAD });
+      (void)dvm_set_field(vm, event, "deviceId", "I", (union dvm_value){ .i = LUNA_PAD_DEVICE_ID });
+      (void)dvm_set_field(vm, event, "eventTime", "J", (union dvm_value){ .j = now });
+      (void)dvm_set_field(vm, event, "downTime", "J", (union dvm_value){ .j = now });
+      method = "dispatchKeyEvent";
+      sig = "(Landroid/view/KeyEvent;)Z";
+    }
+  } else if (window && pad->type == 2) {
+    event = dvm_motion_event_new(vm, &pad->motion);
+    method = "dispatchGenericMotionEvent";
+    sig = "(Landroid/view/MotionEvent;)Z";
+  }
+  struct dvm_class *wc = event ? dvm_object_class(vm, window) : NULL;
+  if (wc && dvm_find_method(vm, wc, method, sig)) {
+    dvm_pin(vm, event);
+    dvm_pin(vm, window);
+    union dvm_value arg = { .l = event }, out = { 0 };
+    handled = am_vcall(vm, window, method, sig, &arg, 1, &out) && out.i;
+    if (dvm_exception(vm)) ui_report_exception(vm, method);
+    dvm_unpin(vm, window);
+    dvm_unpin(vm, event);
+  }
+  dvm_gil_release(vm);
+  return handled;
+}
+
 bool dvm_ui_dispatch_touch(struct dvm *vm,const struct luna_touch_event *sample)
 {
   if (!vm || !sample) return false;
@@ -75983,23 +76046,196 @@ static const struct rt_method rt_orientation_sensor[]= {
   M("onAccuracyChanged","(Landroid/hardware/Sensor;I)V",nop_void),M_END
 };
 
+/* android.view.InputDevice and its MotionRange, over luna_input's device
+ * model: the touchscreen (id 0), the virtual keyboard (-1) and, while one is
+ * plugged in, the host's game controller (LUNA_PAD_DEVICE_ID).  An object
+ * carries only its id; every getter asks the model, so a device that has
+ * been unplugged reads as one with no sources. */
+static dvm_ref input_device_new(struct dvm *vm, int id)
+{
+  if (!luna_input_device_sources(id)) return 0;
+  struct dvm_class *c = dvm_find_class(vm, "android/view/InputDevice");
+  dvm_ref d = c ? dvm_new_object(vm, c) : 0;
+  if (d) (void)dvm_set_field(vm, d, "id", "I", (union dvm_value){ .i = id });
+  return d;
+}
+static int input_device_id(struct dvm *vm, dvm_ref self)
+{
+  union dvm_value v = { 0 };
+  (void)dvm_get_field(vm, self, "id", "I", &v);
+  return v.i;
+}
+static bool input_device_get(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                             int nargs, union dvm_value *out)
+{
+  (void)self;
+  RETL(input_device_new(vm, nargs ? ARG(0).i : 0));
+}
+static bool input_device_ids(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                             int nargs, union dvm_value *out)
+{
+  (void)self; (void)args; (void)nargs;
+  int ids[4];
+  const int n = luna_input_device_ids(ids, 4);
+  dvm_ref array = dvm_new_array(vm, 'I', "I", (uint32_t)n);
+  if (!array) return false;
+  if (n) memcpy(dvm_array_data(vm, array), ids, (size_t)n * sizeof ids[0]);
+  RETL(array);
+}
+static bool input_device_int(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                             int nargs, union dvm_value *out)
+{
+  const char *name = builtin_name();
+  const int id = input_device_id(vm, self);
+  const int sources = luna_input_device_sources(id);
+  luna_gamepad_info pad;
+  const bool is_pad = id == LUNA_PAD_DEVICE_ID && luna_gamepad_get(&pad);
+  if (!strcmp(name, "getId")) RETI(id);
+  if (!strcmp(name, "getSources")) RETI(sources);
+  if (!strcmp(name, "supportsSource")) RETI(nargs && (sources & ARG(0).i) == ARG(0).i);
+  if (!strcmp(name, "getVendorId")) RETI(is_pad ? pad.vendor : 0);
+  if (!strcmp(name, "getProductId")) RETI(is_pad ? pad.product : 0);
+  if (!strcmp(name, "getControllerNumber")) RETI(is_pad ? 1 : 0);
+  if (!strcmp(name, "isVirtual")) RETI(id == -1);
+  if (!strcmp(name, "isExternal")) RETI(is_pad);
+  if (!strcmp(name, "isEnabled")) RETI(sources != 0);
+  if (!strcmp(name, "isFullKeyboard")) RETI(id == -1);
+  /* KEYBOARD_TYPE_ALPHABETIC for the virtual keyboard, NON_ALPHABETIC for
+   * a controller's buttons, NONE for a touchscreen. */
+  if (!strcmp(name, "getKeyboardType")) RETI(id == -1 ? 2 : is_pad ? 1 : 0);
+  RETI(0);
+}
+static bool input_device_string(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                                int nargs, union dvm_value *out)
+{
+  (void)args; (void)nargs;
+  const int id = input_device_id(vm, self);
+  const bool descriptor = !strcmp(builtin_name(), "getDescriptor");
+  luna_gamepad_info pad;
+  if (id == LUNA_PAD_DEVICE_ID && luna_gamepad_get(&pad))
+    RETL(dvm_new_string(vm, descriptor ? pad.descriptor : pad.name));
+  if (id == -1) RETL(dvm_new_string(vm, descriptor ? "lunaria-virtual-keyboard" : "Virtual"));
+  RETL(dvm_new_string(vm, descriptor ? "lunaria-touchscreen" : "lunaria-touchscreen"));
+}
+/* hasKeys(int...): the keys a controller has are the ones it sends. */
+static bool input_device_has_keys(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                                  int nargs, union dvm_value *out)
+{
+  dvm_ref codes = nargs ? ARG(0).l : 0;
+  const uint32_t n = codes ? dvm_array_length(vm, codes) : 0;
+  dvm_ref result = dvm_new_array(vm, 'Z', "Z", n);
+  if (!result) return false;
+  const bool pad = input_device_id(vm, self) == LUNA_PAD_DEVICE_ID && luna_gamepad_get(NULL);
+  const int32_t *in = n ? dvm_array_data(vm, codes) : NULL;
+  uint8_t *has = n ? dvm_array_data(vm, result) : NULL;
+  for (uint32_t i = 0; i < n; ++i) {
+    const int k = in[i];
+    has[i] = pad && ((k >= 96 && k <= 110 && k != 98 && k != 101) || (k >= 19 && k <= 22));
+  }
+  RETL(result);
+}
+static dvm_ref motion_range_new(struct dvm *vm, int axis, int source)
+{
+  struct dvm_class *c = dvm_find_class(vm, "android/view/InputDevice$MotionRange");
+  dvm_ref r = c ? dvm_new_object(vm, c) : 0;
+  if (!r) return 0;
+  (void)dvm_set_field(vm, r, "axis", "I", (union dvm_value){ .i = axis });
+  (void)dvm_set_field(vm, r, "source", "I", (union dvm_value){ .i = source });
+  return r;
+}
+/* getMotionRange(axis[, source]): the controller's sticks, triggers and hat. */
+static bool input_device_range(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                               int nargs, union dvm_value *out)
+{
+  const int id = input_device_id(vm, self);
+  const int axis = nargs ? ARG(0).i : -1;
+  if (id != LUNA_PAD_DEVICE_ID || !luna_gamepad_get(NULL) || luna_pad_axis_slot(axis) < 0) RETL(0);
+  if (nargs > 1 && ARG(1).i != LUNA_SOURCE_JOYSTICK) RETL(0);
+  RETL(motion_range_new(vm, axis, LUNA_SOURCE_JOYSTICK));
+}
+static bool input_device_ranges(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                                int nargs, union dvm_value *out)
+{
+  (void)args; (void)nargs;
+  dvm_ref list = coll_new_list(vm, "Ljava/util/ArrayList;");
+  if (!list) return false;
+  dvm_pin(vm, list);
+  if (input_device_id(vm, self) == LUNA_PAD_DEVICE_ID && luna_gamepad_get(NULL))
+    for (int slot = 0; slot < LUNA_PAD_AXES; ++slot) {
+      union dvm_value item = { .l = motion_range_new(vm, luna_pad_axis_at(slot), LUNA_SOURCE_JOYSTICK) },
+                      ignored = { 0 };
+      if (item.l && !list_add(vm, list, &item, 1, &ignored)) {
+        dvm_unpin(vm, list);
+        return false;
+      }
+    }
+  dvm_unpin(vm, list);
+  RETL(list);
+}
+static bool motion_range_get(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                             int nargs, union dvm_value *out)
+{
+  const char *name = builtin_name();
+  union dvm_value axis = { 0 }, source = { 0 };
+  (void)dvm_get_field(vm, self, "axis", "I", &axis);
+  (void)dvm_get_field(vm, self, "source", "I", &source);
+  if (!strcmp(name, "getAxis")) RETI(axis.i);
+  if (!strcmp(name, "getSource")) RETI(source.i);
+  if (!strcmp(name, "isFromSource")) RETI(nargs && (source.i & ARG(0).i) == ARG(0).i);
+  float min, max, flat, fuzz;
+  luna_pad_axis_range(axis.i, &min, &max, &flat, &fuzz);
+  if (!strcmp(name, "getMin")) RETF(min);
+  if (!strcmp(name, "getMax")) RETF(max);
+  if (!strcmp(name, "getRange")) RETF(max - min);
+  if (!strcmp(name, "getFlat")) RETF(flat);
+  if (!strcmp(name, "getFuzz")) RETF(fuzz);
+  RETF(0.f);   /* getResolution: unknown */
+}
+static const struct rt_field rt_input_device_fields[] = { { "id", "I" }, F_END };
+static const struct rt_method rt_input_device[] = {
+  SM("getDevice", "(I)Landroid/view/InputDevice;", input_device_get),
+  SM("getDeviceIds", "()[I", input_device_ids),
+  M("getId", "()I", input_device_int), M("getSources", "()I", input_device_int),
+  M("supportsSource", "(I)Z", input_device_int),
+  M("getVendorId", "()I", input_device_int), M("getProductId", "()I", input_device_int),
+  M("getControllerNumber", "()I", input_device_int),
+  M("isVirtual", "()Z", input_device_int), M("isExternal", "()Z", input_device_int),
+  M("isEnabled", "()Z", input_device_int), M("isFullKeyboard", "()Z", input_device_int),
+  M("getKeyboardType", "()I", input_device_int),
+  M("hasMicrophone", "()Z", ret_false),
+  M("getName", "()Ljava/lang/String;", input_device_string),
+  M("getDescriptor", "()Ljava/lang/String;", input_device_string),
+  M("hasKeys", "([I)[Z", input_device_has_keys),
+  M("getMotionRange", "(I)Landroid/view/InputDevice$MotionRange;", input_device_range),
+  M("getMotionRange", "(II)Landroid/view/InputDevice$MotionRange;", input_device_range),
+  M("getMotionRanges", "()Ljava/util/List;", input_device_ranges),
+  M_END
+};
+static const struct rt_field rt_motion_range_fields[] = { { "axis", "I" }, { "source", "I" }, F_END };
+static const struct rt_method rt_motion_range[] = {
+  M("getAxis", "()I", motion_range_get), M("getSource", "()I", motion_range_get),
+  M("isFromSource", "(I)Z", motion_range_get),
+  M("getMin", "()F", motion_range_get), M("getMax", "()F", motion_range_get),
+  M("getRange", "()F", motion_range_get), M("getFlat", "()F", motion_range_get),
+  M("getFuzz", "()F", motion_range_get), M("getResolution", "()F", motion_range_get),
+  M_END
+};
+
+/* The devices InputDevice.getDeviceIds() lists: none, or the controller.
+ * Android's InputManager returns an empty int[] then, never null. */
 static bool input_getInputDeviceIds(struct dvm *vm, dvm_ref self,
                                     const union dvm_value *args, int nargs,
                                     union dvm_value *out)
 {
-  (void)self;
-  (void)args;
-  (void)nargs;
-  /* A headless Lunaria instance has no Android input devices.  Android's
-   * InputManager contract returns an empty int[] in that state, never null. */
-  RETL(dvm_new_array(vm, 'I', "I", 0));
+  return input_device_ids(vm, self, args, nargs, out);
 }
 
 static const struct rt_method rt_input_manager[] = {
   M("getInputDeviceIds", "()[I", input_getInputDeviceIds),
-  /* The device set here is fixed for the life of the process — nothing is
-     plugged in or removed — so a listener would never have anything to be
-     told, and registering one is nothing to do. */
+  M("getInputDevice", "(I)Landroid/view/InputDevice;", input_device_get),
+  /* Listeners are accepted but not called: a controller plugged in later is
+     found by the next getInputDeviceIds() / InputDevice.getDevice(), which
+     is how games that check per event already find it. */
   M("registerInputDeviceListener",
   "(Landroid/hardware/input/InputManager$InputDeviceListener;"
   "Landroid/os/Handler;)V",
@@ -95249,13 +95485,29 @@ static bool motion_find_pointer(struct dvm *vm,dvm_ref self,const union dvm_valu
   if (dvm_motion_event_read(vm,self,&e)) for (int i=0; i<luna_event_count(&e); ++i) if (luna_event_id(&e,i)==ARG(0).i) RETI(i);
   RETI(-1);
 }
+/* The touchscreen's, unless the event came from the controller. */
 static bool motion_source(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
-  (void)vm;
-  (void)self;
+  luna_touch_event e;
+  const int source = dvm_motion_event_read(vm,self,&e) && e.source ? e.source : LUNA_SOURCE_TOUCHSCREEN;
+  RETI(nargs ? (source & ARG(0).i) == ARG(0).i : source);
+}
+static bool motion_device(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
   (void)args;
   (void)nargs;
-  RETI(nargs ? (0x1002 & ARG(0).i) == ARG(0).i : 0x1002);
+  luna_touch_event e;
+  const int id = dvm_motion_event_read(vm,self,&e) ? e.device_id : 0;
+  if (!strcmp(builtin_name(),"getDevice")) RETL(input_device_new(vm,id));
+  RETI(id);
+}
+/* TOOL_TYPE_FINGER for touches, TOOL_TYPE_UNKNOWN for a joystick. */
+static bool motion_tool_type(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)args;
+  (void)nargs;
+  luna_touch_event e;
+  RETI(dvm_motion_event_read(vm,self,&e) && e.source == LUNA_SOURCE_JOYSTICK ? 0 : 1);
 }
 static bool motion_set_action(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
@@ -95332,6 +95584,8 @@ static const struct rt_method rt_motion[]= {
   M("findPointerIndex","(I)I",motion_find_pointer),
   M("getEventTime","()J",motion_time),M("getDownTime","()J",motion_down_time),
   M("getSource","()I",motion_source),M("isFromSource","(I)Z",motion_source),
+  M("getDeviceId","()I",motion_device),M("getDevice","()Landroid/view/InputDevice;",motion_device),
+  M("getToolType","(I)I",motion_tool_type),M("getHistorySize","()I",ret_false),
   M("setAction","(I)V",motion_set_action),
   M("offsetLocation","(FF)V",motion_offset_location),M("recycle","()V",nop_void),M_END
 };
@@ -99446,6 +99700,12 @@ static const struct rt_class rt_classes[] = {
   },
   { "Landroid/location/LocationManager;", "Ljava/lang/Object;", rt_location_manager, NULL, NULL },
   { "Landroid/location/Criteria;", "Ljava/lang/Object;", rt_location_criteria, rt_location_criteria_fields, NULL },
+  { "Landroid/view/InputDevice;", "Ljava/lang/Object;", rt_input_device,
+    rt_input_device_fields, NULL
+  },
+  { "Landroid/view/InputDevice$MotionRange;", "Ljava/lang/Object;", rt_motion_range,
+    rt_motion_range_fields, NULL
+  },
   { "Landroid/hardware/input/InputManager;", "Ljava/lang/Object;",
     rt_input_manager, NULL, NULL
   },

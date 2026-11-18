@@ -1302,6 +1302,17 @@ void *luna_os_native_window(void *glfw_window)
   return (void *)((id (*)(id, SEL))objc_msgSend)(view, layer_sel);
 }
 
+/* Macs have no touchscreen; a trackpad is a pointer and reaches GLFW as one. */
+int luna_os_touch_attach(void *glfw_window, luna_os_touch_fn report)
+{
+  (void)glfw_window;
+  (void)report;
+  return 0;
+}
+void luna_os_touch_pump(void)
+{
+}
+
 /* GLFW's Cocoa backend ignores glfwSetWindowIcon: the icon is the
  * application's, set through NSApplication.  Build an NSImage from the pixels
  * with the Objective-C runtime, as luna_os_native_window does, to stay C. */

@@ -783,6 +783,10 @@ int       arm_exec_touch_next(ArmExecTouchEvent *out);
  * the NDK input queue; the frame pump pops them into the focused window's
  * dispatchKeyEvent().  *action is 0 (down) or 1 (up).  Returns 0 when empty. */
 int       arm_exec_java_key_next(int *action, int *keycode, int *meta, int *repeat);
+/* Game controller events for a Java Activity (see gamepad_poll): buttons as
+ * keys and the sticks as joystick motion, for dvm_ui_dispatch_pad().  A
+ * NativeActivity reads them from its AInputQueue instead.  0 when empty. */
+int       arm_exec_pad_next(luna_pad_event *out);
 int       arm_exec_touch_action(void);
 float     arm_exec_touch_x(void);
 float     arm_exec_touch_y(void);

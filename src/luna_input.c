@@ -36,6 +36,10 @@ float luna_event_y(const luna_touch_event *e, int i)
 float luna_event_axis(const luna_touch_event *e,int axis,int index)
 {
   if (index<0 || index>=luna_event_count(e)) return 0;
+  if (e->source==LUNA_SOURCE_JOYSTICK) {
+    const int slot=luna_pad_axis_slot(axis);
+    return slot>=0 ? e->pad[slot] : 0.f;
+  }
   if (axis==0) return luna_event_x(e,index);
   if (axis==1) return luna_event_y(e,index);
   if (axis==2) {
@@ -770,3 +774,83 @@ int luna_keymap_take(luna_keymap *out)
   pthread_mutex_unlock(&selection_lock);
   return pending;
 }
+
+
+/* ---- the game controller as an Android InputDevice ---------------------- */
+/* Slot order of luna_touch_event.pad[]: the axes Android's evdev mapping
+ * gives an Xbox-layout controller.  Triggers report on both the trigger and
+ * the GAS/BRAKE axes, as Android does, because games read either. */
+static const int pad_axes[LUNA_PAD_AXES] = {
+  0 /* X */, 1 /* Y */, 11 /* Z */, 14 /* RZ */, 15 /* HAT_X */, 16 /* HAT_Y */,
+  17 /* LTRIGGER */, 18 /* RTRIGGER */, 22 /* GAS */, 23 /* BRAKE */
+};
+int luna_pad_axis_slot(int axis)
+{
+  for (int i = 0; i < LUNA_PAD_AXES; ++i) if (pad_axes[i] == axis) return i;
+  return -1;
+}
+int luna_pad_axis_at(int slot)
+{
+  return slot >= 0 && slot < LUNA_PAD_AXES ? pad_axes[slot] : -1;
+}
+void luna_pad_axis_range(int axis, float *min, float *max, float *flat, float *fuzz)
+{
+  const int slot = luna_pad_axis_slot(axis);
+  const int trigger = slot >= 6, hat = slot == 4 || slot == 5;
+  if (min) *min = trigger ? 0.f : -1.f;
+  if (max) *max = 1.f;
+  /* GLFW has already applied the controller's own calibration; a small flat
+   * region is what Android reports for a typical stick. */
+  if (flat) *flat = trigger || hat ? 0.f : 0.0157f;
+  if (fuzz) *fuzz = 0.f;
+}
+void luna_pad_motion(luna_touch_event *out, const float axes[LUNA_PAD_AXES], long long now_ms)
+{
+  memset(out, 0, sizeof *out);
+  out->action = 2;   /* ACTION_MOVE */
+  out->source = LUNA_SOURCE_JOYSTICK;
+  out->device_id = LUNA_PAD_DEVICE_ID;
+  memcpy(out->pad, axes, sizeof out->pad);
+  out->x = axes[0];
+  out->y = axes[1];
+  out->event_ms = out->down_ms = now_ms;
+  out->pointer_count = 1;
+  out->pointers[0] = (luna_touch_point) { 0, axes[0], axes[1] };
+}
+
+static pthread_mutex_t pad_lock = PTHREAD_MUTEX_INITIALIZER;
+static luna_gamepad_info pad_info;
+void luna_gamepad_set(const luna_gamepad_info *info)
+{
+  pthread_mutex_lock(&pad_lock);
+  if (info && info->connected) pad_info = *info;
+  else memset(&pad_info, 0, sizeof pad_info);
+  pthread_mutex_unlock(&pad_lock);
+}
+int luna_gamepad_get(luna_gamepad_info *out)
+{
+  pthread_mutex_lock(&pad_lock);
+  const int connected = pad_info.connected;
+  if (out) *out = pad_info;
+  pthread_mutex_unlock(&pad_lock);
+  return connected;
+}
+/* Only the controller is listed.  The touchscreen and the virtual keyboard
+ * still answer InputDevice.getDevice() (events name them), but the list
+ * stays what it was before controllers existed, so titles that walk it to
+ * decide "is a gamepad attached" see exactly the controller. */
+int luna_input_device_ids(int *out, int capacity)
+{
+  if (!luna_gamepad_get(NULL)) return 0;
+  if (out && capacity > 0) out[0] = LUNA_PAD_DEVICE_ID;
+  return 1;
+}
+int luna_input_device_sources(int id)
+{
+  if (id == LUNA_TOUCH_DEVICE_ID) return LUNA_SOURCE_TOUCHSCREEN;
+  if (id == -1) return LUNA_SOURCE_KEYBOARD;  /* KeyCharacterMap.VIRTUAL_KEYBOARD */
+  if (id == LUNA_PAD_DEVICE_ID && luna_gamepad_get(NULL))
+    return LUNA_SOURCE_GAMEPAD | LUNA_SOURCE_DPAD | LUNA_SOURCE_JOYSTICK;
+  return 0;
+}
+

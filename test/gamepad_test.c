@@ -100,6 +100,65 @@ int main(int argc, char **argv) {
   /* With the map off, nothing is consumed (the host forwards Android keys). */
   assert(luna_keymap_load(&m, "off") && !luna_keymap_key(&m, LUNA_PAD_KEY(0), 1, W, H, emit, 0) &&
          !luna_keymap_axis(&m, 0, 1, 0, W, H, emit, 0));
+
+  /* A joystick MotionEvent carries its axes; touches are unchanged. */
+  {
+    const float axes[LUNA_PAD_AXES] = { .5f, -.25f, .75f, -1, 1, -1, .3f, .9f, .9f, .3f };
+    luna_touch_event j;
+    luna_pad_motion(&j, axes, 1234);
+    assert(j.source == LUNA_SOURCE_JOYSTICK && j.device_id == LUNA_PAD_DEVICE_ID && j.action == 2);
+    assert(luna_event_count(&j) == 1);
+    assert(luna_event_axis(&j, 0, 0) == .5f && luna_event_axis(&j, 1, 0) == -.25f);    /* X, Y */
+    assert(luna_event_axis(&j, 11, 0) == .75f && luna_event_axis(&j, 14, 0) == -1);    /* Z, RZ */
+    assert(luna_event_axis(&j, 15, 0) == 1 && luna_event_axis(&j, 16, 0) == -1);       /* HAT */
+    assert(luna_event_axis(&j, 17, 0) == .3f && luna_event_axis(&j, 18, 0) == .9f);    /* triggers */
+    assert(luna_event_axis(&j, 22, 0) == .9f && luna_event_axis(&j, 23, 0) == .3f);    /* GAS, BRAKE */
+    assert(luna_event_axis(&j, 2, 0) == 0 && luna_event_axis(&j, 0, 1) == 0);          /* no pressure, one pointer */
+    assert(luna_event_x(&j, 0) == .5f);
+    luna_touch_state ts = {0};
+    luna_touch_event t;
+    assert(luna_touch_update(&ts, 0, 0, 10, 20, 1, &t) && t.source == 0 && luna_event_axis(&t, 2, 0) == 1);
+    float mn, mx, flat;
+    luna_pad_axis_range(17, &mn, &mx, &flat, NULL);
+    assert(mn == 0 && mx == 1 && flat == 0);
+    luna_pad_axis_range(0, &mn, &mx, NULL, NULL);
+    assert(mn == -1 && mx == 1);
+    for (int i = 0; i < LUNA_PAD_AXES; ++i) assert(luna_pad_axis_slot(luna_pad_axis_at(i)) == i);
+    assert(luna_pad_axis_slot(2) < 0 && luna_pad_axis_at(LUNA_PAD_AXES) < 0);
+  }
+  /* The device model: the controller is listed only while connected. */
+  {
+    int ids[4];
+    assert(luna_input_device_ids(ids, 4) == 0);
+    assert(luna_input_device_sources(LUNA_PAD_DEVICE_ID) == 0);
+    assert(luna_input_device_sources(LUNA_TOUCH_DEVICE_ID) == LUNA_SOURCE_TOUCHSCREEN);
+    assert(luna_input_device_sources(-1) == LUNA_SOURCE_KEYBOARD);
+    luna_gamepad_info info = { .connected = 1, .vendor = 0x045e, .product = 0x0b12 };
+    strcpy(info.name, "Xbox Wireless Controller");
+    luna_gamepad_set(&info);
+    assert(luna_input_device_ids(ids, 4) == 1 && ids[0] == LUNA_PAD_DEVICE_ID);
+    const int src = luna_input_device_sources(LUNA_PAD_DEVICE_ID);
+    assert((src & LUNA_SOURCE_GAMEPAD) == LUNA_SOURCE_GAMEPAD && (src & LUNA_SOURCE_JOYSTICK) == LUNA_SOURCE_JOYSTICK);
+    luna_gamepad_info got;
+    assert(luna_gamepad_get(&got) && got.vendor == 0x045e && !strcmp(got.name, "Xbox Wireless Controller"));
+    luna_gamepad_set(NULL);
+    assert(!luna_gamepad_get(&got) && luna_input_device_ids(ids, 4) == 0);
+  }
+  /* Touchscreen contacts to finger slots. */
+  {
+    luna_finger_map fm = {0};
+    assert(luna_finger_slot(&fm, 77, 2) == -1);            /* never went down */
+    assert(luna_finger_slot(&fm, 77, 0) == 0);
+    assert(luna_finger_slot(&fm, 78, 0) == 1);
+    assert(luna_finger_slot(&fm, 77, 0) == -1);            /* already down */
+    assert(luna_finger_slot(&fm, 78, 2) == 1);
+    assert(luna_finger_slot(&fm, 77, 1) == 0);             /* lifts and frees */
+    assert(luna_finger_slot(&fm, 79, 0) == 0);             /* reused */
+    for (long long k = 100; k < 100 + LUNA_HOST_FINGERS - 2; ++k) assert(luna_finger_slot(&fm, k, 0) >= 0);
+    assert(luna_finger_slot(&fm, 999, 0) == -1);           /* an eleventh finger */
+    /* Contact ids stay inside Android's 0..31 and clear of each other. */
+    assert(LUNA_LOOK_ID < LUNA_HOST_TOUCH_ID && LUNA_HOST_TOUCH_ID + LUNA_HOST_FINGERS - 1 <= 29);
+  }
   puts("gamepad keymap tests passed");
   return 0;
 }

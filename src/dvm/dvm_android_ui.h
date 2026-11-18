@@ -11347,6 +11347,8 @@ static const struct rt_method rt_activity[] = {
   M("onKeyUp", "(ILandroid/view/KeyEvent;)Z", act_on_key_up),
   M("onKeyLongPress", "(ILandroid/view/KeyEvent;)Z", act_key_false),
   M("onKeyMultiple", "(IILandroid/view/KeyEvent;)Z", act_key_false),
+  M("dispatchGenericMotionEvent", "(Landroid/view/MotionEvent;)Z", generic_motion_dispatch),
+  M("onGenericMotionEvent", "(Landroid/view/MotionEvent;)Z", act_key_false),
   M("onCreateView", "(Ljava/lang/String;Landroid/content/Context;Landroid/util/AttributeSet;)Landroid/view/View;", ret_null),
   M("onCreateView", "(Landroid/view/View;Ljava/lang/String;Landroid/content/Context;Landroid/util/AttributeSet;)Landroid/view/View;", ret_null),
   M("setTitle", "(Ljava/lang/CharSequence;)V", act_setTitle),
