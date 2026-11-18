@@ -894,6 +894,8 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
 
   {"open",                  SVC_LIBC_OPEN},
   {"open64",                SVC_LIBC_OPEN},
+  {"creat",                 SVC_LIBC_CREAT},
+  {"creat64",               SVC_LIBC_CREAT},
   {"openat",                SVC_OPENAT},
   {"close",                 SVC_LIBC_CLOSE},
   {"read",                  SVC_LIBC_READ},
@@ -43245,6 +43247,25 @@ aaudio_write_retry:
     }
     if (lunaria_env("LUNARIA_TRACE_OPEN"))
       fprintf(stderr, "[open] %s -> fd=%d\n", path ? path : "(null)", fd);
+    ret32((uint32_t)fd);
+    break;
+  }
+  case SVC_LIBC_CREAT: {
+    /* creat(path, mode) == open(path, O_CREAT|O_WRONLY|O_TRUNC, mode),
+       in the guest's (bionic) flag numbers; guest_open_path maps them. */
+    const char *path = ctx.mem.cstr(argp_n(0));
+    const mode_t mode = (mode_t)arg32(1);
+    const int fd = guest_open_path(path, 0x40 /* O_CREAT */ | 0x1 /* O_WRONLY */ |
+                                         0x200 /* O_TRUNC */, mode);
+    if (fd < 0) {
+      int e = errno;
+      if (uint32_t eva = errno_va(ctx, g_current_tid))
+        ctx.mem.write32(eva, guest_errno_word(e));
+      errno = e;
+    }
+    if (lunaria_env("LUNARIA_TRACE_OPEN"))
+      fprintf(stderr, "[creat] %s mode=%#o -> fd=%d\n",
+              path ? path : "(null)", (unsigned)mode, fd);
     ret32((uint32_t)fd);
     break;
   }
