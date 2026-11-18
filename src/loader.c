@@ -34,6 +34,8 @@
 #include "lunaria_os.h"
 #ifdef _WIN32
 #include <pthread.h>
+#include <io.h>
+#include <wchar.h>
 #endif
 /* The bionic-compatible dlfcn entry points (src/linker/dlfcn.c). */
 void dl_parse_library_path(const char *path, char *delim);
@@ -689,6 +691,191 @@ static uint64_t frame_now_ns(void)
   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* Where a pump frame's wall clock goes.
+ *
+ * "20 frames a second" is the symptom; it says nothing about whether the
+ * emulator was running guest code, presenting, or waiting.  Each stage of the
+ * frame adds its own time here and the totals are reported next to [perf], so
+ * a frame that costs 50 ms can be read as "16 ms of guest, 30 ms of swap"
+ * rather than guessed at. */
+enum frame_stage {
+   FRAME_STAGE_SCHED,      /* run_threads(): guest code and its SVCs */
+   FRAME_STAGE_IDLE,       /* every guest thread parked: the frame's own sleep */
+   FRAME_STAGE_MEDIA,      /* the media clock and the pending-preferences write */
+   FRAME_STAGE_SWAP,       /* eglSwapBuffers on the host */
+   FRAME_STAGE_INPUT,      /* window system events */
+   FRAME_STAGE_LAST
+};
+static uint64_t g_frame_stage_ns[FRAME_STAGE_LAST];
+static const char *const g_frame_stage_name[FRAME_STAGE_LAST] = {
+   "sched", "idle", "media", "swap", "input"
+};
+
+static void frame_stage_add(enum frame_stage st, uint64_t t0)
+{
+   g_frame_stage_ns[st] += frame_now_ns() - t0;
+}
+
+static void frame_stage_report(double window, unsigned long long frames)
+{
+   uint64_t tot = 0;
+   for (int i = 0; i < FRAME_STAGE_LAST; ++i) tot += g_frame_stage_ns[i];
+   if (!tot || !frames) return;
+   fprintf(stderr, "[frame]   %.1f ms each, of which", window * 1e3 / (double)frames);
+   for (int i = 0; i < FRAME_STAGE_LAST; ++i)
+      fprintf(stderr, " %s=%.1f", g_frame_stage_name[i],
+              (double)g_frame_stage_ns[i] / 1e6 / (double)frames);
+   fprintf(stderr, " ms (%.0f%% of the frame accounted for)\n",
+           100.0 * (double)tot / (window * 1e9));
+   for (int i = 0; i < FRAME_STAGE_LAST; ++i) g_frame_stage_ns[i] = 0;
+}
+
+/* Pump frames so far, for the memory watch thread (which must not depend on
+ * the pump: a player's window froze at the game's 42% while RAM climbed, and
+ * the perf report - run from the pump - went silent for exactly that part). */
+static volatile uint64_t g_pump_frames;
+
+/* [memwatch]: every LUNARIA_MEMWATCH_S seconds (default 5, 0 = off), from its
+ * own thread: where the RAM is, GPU memory, PC free RAM, and whether the main
+ * loop is stuck.  Started as soon as the log is up, so it covers APK prep. */
+static void *memwatch_thread(void *arg)
+{
+   const double every = *(const double *)arg;
+   struct timespec t0;
+   clock_gettime(CLOCK_MONOTONIC, &t0);
+   uint64_t last_frames = 0;
+   double stuck = 0;
+   for (;;) {
+      struct timespec nap = { (time_t)every, (long)((every - (double)(time_t)every) * 1e9) };
+      nanosleep(&nap, NULL);
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      const double t = (double)(ts.tv_sec - t0.tv_sec) + (double)(ts.tv_nsec - t0.tv_nsec) * 1e-9;
+      const uint64_t frames = g_pump_frames;
+      if (frames && frames == last_frames) stuck += every; else stuck = 0;
+      last_frames = frames;
+      char where[320];
+      if (luna_os_mem_breakdown(where, sizeof where) != 0) where[0] = 0;
+      uint64_t vram = 0, shared = 0, budget = 0, total = 0, avail = 0;
+      char gpu[96] = "";
+      if (luna_os_gpu_mem_mb(&vram, &shared, &budget) == 0)
+         snprintf(gpu, sizeof gpu, " | gpu vram %llu of %llu MB, shared %llu MB",
+                  (unsigned long long)vram, (unsigned long long)budget, (unsigned long long)shared);
+      char pc[64] = "";
+      if (luna_os_mem_info(&total, &avail) == 0 && total)
+         snprintf(pc, sizeof pc, " | PC free %llu of %llu MB",
+                  (unsigned long long)(avail >> 20), (unsigned long long)(total >> 20));
+      char loop[64];
+      if (!frames) snprintf(loop, sizeof loop, "starting up");
+      else if (stuck > 0) snprintf(loop, sizeof loop, "frame %llu, MAIN LOOP STUCK %.0fs",
+                                   (unsigned long long)frames, stuck);
+      else snprintf(loop, sizeof loop, "frame %llu", (unsigned long long)frames);
+      fprintf(stderr, "[memwatch] t=%.0fs %s | %s%s%s\n", t, loop, where, gpu, pc);
+      /* The stall dump runs from the frame loop, so a loop that is itself
+       * stuck never writes one.  This thread still runs: dump from here,
+       * at 20 s and then every 60 s while it stays stuck. */
+      static double dumped_at = -1.0;
+      if (stuck < every) dumped_at = -1.0;
+      else if (stuck >= 20.0 && (dumped_at < 0.0 || stuck - dumped_at >= 60.0)) {
+         dumped_at = stuck;
+         fprintf(stderr, "[memwatch] main loop stuck %.0fs: dumping guest threads\n", stuck);
+         arm64_exec_svc_ring_dump();
+      }
+   }
+   return NULL;
+}
+
+static void memwatch_start(void)
+{
+   static double every = -1.0;
+   if (every >= 0.0) return;
+   const char *e = getenv("LUNARIA_MEMWATCH_S");
+   every = e && *e ? atof(e) : 5.0;
+   if (!(every >= 0.5)) { every = 0.0; return; }
+   pthread_t th;
+   if (pthread_create(&th, NULL, memwatch_thread, &every) == 0) pthread_detach(th);
+}
+
+static void perf_tick(void)
+{
+   static double every = -1.0;      /* -1: not configured, 0: disabled */
+   static double t0, last;
+   static uint64_t last_frames, last_presents, last_composites, last_ticks, last_xlat;
+   static uint64_t frames;
+
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   const double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+
+   ++frames;
+   g_pump_frames = frames;
+   memwatch_start();
+   if (every < 0.0) {
+      const char *e = getenv("LUNARIA_PERF_S");
+      every = e && *e ? atof(e) : 10.0;
+      if (every < 0.0) every = 0.0;
+      t0 = last = now;
+   }
+   if (!(every > 0.0) || now - last < every) return;
+
+   const uint64_t presents = arm_exec_guest_swap_count();
+   const uint64_t composites = luna_comp_frames();
+   const uint64_t gticks   = arm_exec_sched_ticks();
+   const uint64_t xlat     = arm_exec_translated_insn();
+   const double   dt       = now - last;
+
+   fprintf(stderr,
+           "[perf] t=%.0fs pump=%llu (%.1f/s) present=%llu (%.1f/s) composite=%llu (%.1f/s) "
+           "guest=%.0fM insn (%.1f Mips) xlat=%.1fM (%.1f M/s)\n",
+           now - t0,
+           (unsigned long long)frames, (double)(frames - last_frames) / dt,
+           (unsigned long long)presents, (double)(presents - last_presents) / dt,
+           (unsigned long long)composites, (double)(composites - last_composites) / dt,
+           (double)gticks / 1e6, (double)(gticks - last_ticks) / dt / 1e6,
+           (double)xlat / 1e6, (double)(xlat - last_xlat) / dt / 1e6);
+   {
+      double p50, p99, worst;
+      int over33, over50;
+      const int n = arm_exec_frame_times(&p50, &p99, &worst, &over33, &over50);
+      if (n)
+         fprintf(stderr, "[perf]   frames: %d, median %.1f ms, 99%% %.1f ms, worst %.1f ms, "
+                 "over 33 ms: %d, over 50 ms: %d\n", n, p50, p99, worst, over33, over50);
+   }
+   {
+      /* A player's log is often the only view of their machine: when the
+       * game fills RAM, the host swaps and every guest thread stalls for
+       * seconds, which reads like an emulator hang unless RAM is in the log. */
+      uint64_t total = 0, avail = 0;
+      const uint64_t peak_kb = luna_os_peak_rss_kb();
+      if (luna_os_mem_info(&total, &avail) == 0 && total)
+         fprintf(stderr, "[perf]   ram: lunaria peak %llu MB, this PC %llu MB free of %llu MB%s\n",
+                 (unsigned long long)(peak_kb / 1024),
+                 (unsigned long long)(avail >> 20), (unsigned long long)(total >> 20),
+                 avail < total / 10 ? " (LOW - the PC is likely swapping)" : "");
+      char where[320];
+      if (luna_os_mem_breakdown(where, sizeof where) == 0 && where[0])
+         fprintf(stderr, "[perf]   ram %s\n", where);
+   }
+   {
+      uint64_t a32[3];
+      arm_exec_translated_insn_a32(a32);
+      if (a32[0] | a32[1] | a32[2])
+         fprintf(stderr, "[perf]   a32 xlat by engine: threads=%.1fM main=%.1fM "
+                 "callbacks=%.1fM\n", (double)a32[0] / 1e6, (double)a32[1] / 1e6,
+                 (double)a32[2] / 1e6);
+   }
+
+   arm_exec_ticks_report();
+   frame_stage_report(dt, frames - last_frames);
+
+   last = now;
+   last_frames = frames;
+   last_presents = presents;
+   last_composites = composites;
+   last_ticks = gticks;
+   last_xlat = xlat;
+}
+
 /* Scheduler watchdog, every 10 seconds: a guest thread or heap lock that was
  * lost shows up here by name. */
 static void watchdog_tick(void)
@@ -1317,7 +1504,7 @@ static int activity_route(const char *package,const unsigned char *message,size_
   if(!lunaria_android_package_find(package,&record))return -ENOENT;
   const char *self=getenv("ANDROID_PACKAGE_NAME"),*table=NULL;
   char host[4096],*rows=NULL,*filters=NULL;
-  if(self && !strcmp(self,package))table=getenv("ANDROID_ACTIVITIES");
+  if(self && !strcmp(self,package))table=luna_env_long("ANDROID_ACTIVITIES");
   else {
     const char *path=record.source_dir ? arm_exec_map_guest_path(record.source_dir,host,sizeof host) : NULL;
     if(!path || luna_apk_activity_manifest(path,package,&rows,&filters))return -ENOENT;
@@ -1555,8 +1742,8 @@ static int binder_transport_send_fds(void *user,const char *peer,const void *byt
   const bool provider=size>=4 && !memcmp(bytes,"LBQ1",4);
   if(own && (bind || provider)) {
     char process[512];
-    int rc=bind ? binder_service_process(peer,getenv("ANDROID_SERVICES"),bytes,size,process,sizeof process) :
-           binder_provider_process(peer,getenv("ANDROID_CONTENT_PROVIDERS"),bytes,size,process,sizeof process);
+    int rc=bind ? binder_service_process(peer,luna_env_long("ANDROID_SERVICES"),bytes,size,process,sizeof process) :
+           binder_provider_process(peer,luna_env_long("ANDROID_CONTENT_PROVIDERS"),bytes,size,process,sizeof process);
     if(rc)return rc;
     const char *current=getenv("ANDROID_PROCESS_NAME");
     if(current && !strcmp(current,process))
@@ -1697,6 +1884,26 @@ static void component_pool_install(struct dvm *vm,int is_a64)
   dvm_binder_set_transport(binder_transport_send,NULL);
   dvm_binder_set_fd_transport(binder_transport_send_fds,NULL);
   dvm_binder_set_pump(component_pool_tick);
+}
+
+/* Start Play services' main process as the game starts (15-11, Aloa's log:
+ * started on the game's first call at 70 s, ready at 116 s; three calls gave
+ * up after 15 s each and one held the main thread for 8 s).  Its Application
+ * starts the moment the host is spawned, so it boots alongside the game.
+ * LUNARIA_GMS_PREWARM=0 goes back to starting it on first use. */
+static void gms_prewarm(void)
+{
+   const char *gms="com.google.android.gms";
+   const char *off=getenv("LUNARIA_GMS_PREWARM");
+   if(off && !strcmp(off,"0"))return;
+   const char *self=getenv("ANDROID_PACKAGE_NAME");
+   if(self && !strcmp(self,gms))return;
+   struct lunaria_android_package record;
+   if(!lunaria_android_package_find(gms,&record) || !record.source_dir)return;
+   struct luna_process_pool *pool=package_pool(gms);
+   if(!pool)return;
+   int rc=luna_process_pool_warm(pool,gms);
+   fprintf(stderr,"[service-broker] prewarm %s: %s\n",gms,rc ? strerror(-rc) : "started");
 }
 
 static bool process_exit_status(int *status)
@@ -1843,7 +2050,7 @@ dex_call_lifecycle(struct jvm *jvm, jobject self, const char *cls,
 static int
 start_manifest_providers(struct jvm *jvm, jobject context)
 {
-  const char *encoded = getenv("ANDROID_CONTENT_PROVIDERS");
+  const char *encoded = luna_env_long("ANDROID_CONTENT_PROVIDERS");
   if (!encoded || !*encoded) {
     dvm_content_providers_startup(dvm_jni_vm(),false);
     return 0;
@@ -2071,6 +2278,7 @@ static int dex_pump_turn(int *status)
   }
   stall_watch_tick();
   watchdog_tick();
+  perf_tick();
   if (frame < 5 || frame % 50 == 0)
     fprintf(stderr, "[loader] dex pump frame %d\n", frame);
   ++g_dex.frame;
@@ -2895,6 +3103,14 @@ main(int argc, const char *argv[])
    * "loading module" and dependency messages at the end of the file. */
   setvbuf(stdout, NULL, _IOLBF, 0);
   luna_os_tune_allocator();
+#ifdef _WIN32
+   /* The Windows CRT has no line buffering (_IOLBF means full), so a crash can
+    * lose the tail of the log mid-line.  The crash handler writes its own lines
+    * straight to the handle, so that is covered; unbuffered stderr for every
+    * other line is opt-in, because on by default it kept the sample game on
+    * its loading screen for 150 s on a 2-core runner (one write per line). */
+   if (getenv("LUNARIA_STDERR_UNBUFFERED")) setvbuf(stderr, NULL, _IONBF, 0);
+#endif
 #ifndef _WIN32
   signal(SIGABRT, host_abort_report);
   /* Register before selecting a launch path, including DEX/NativeActivity. */
@@ -3002,6 +3218,7 @@ main(int argc, const char *argv[])
       a64_preload_platform_libs();
 
     if(!service_process)component_pool_install(dvm_jni_vm(),is_a64);
+      if(!service_process)gms_prewarm();
     int ret = service_process ? run_service_process(&jvm,is_a64,3) : run_dex_activity(&jvm, is_a64);
     if(g_component_pool)dvm_service_set_submit(dvm_jni_vm(),NULL,NULL);
     (void)process_exit_status(&ret);
@@ -3302,9 +3519,408 @@ main(int argc, const char *argv[])
 }
 
 #ifdef _WIN32
+/* A host crash on Windows otherwise ends the process with no word at all:
+ * there is no SIGSEGV report here and stderr is the only log a person has.
+ * This is the last-chance filter, so faults the JIT or the OS handle first
+ * never reach it.  It names the faulting module+offset (resolvable against a
+ * map file or an unstripped build), the guest pc/lr of the crashing thread,
+ * and walks a few host frames. */
+const char *arm_exec_guest_state(void);
+
+/* Log file.  Started by double-click or by dropping an APK on the exe, the
+ * console closes with the process, so a crash took its log with it and players
+ * had no way to send one.  stdout and stderr now go through a pipe; a thread
+ * copies everything to the console as before AND to lunaria-last-run.log next
+ * to the exe (or %TEMP% when that folder is read-only).  The run before is kept
+ * as lunaria-previous-run.log.  LUNARIA_NO_LOG_FILE=1 turns it off. */
+static HANDLE g_log_pipe_read;
+static int g_log_console_fd = -1;
+static FILE *g_log_file;
+static char g_log_path[MAX_PATH * 3];
+
+/* Bumped by the tee thread each time it has written a chunk out and is about
+ * to block in ReadFile again; read by log_tee_drain(). */
+static volatile LONG g_log_chunks;
+
+/* The console gets its own thread, fed from a ring that drops when full.
+ *
+ * A console write can block indefinitely: clicking in the console window
+ * starts a QuickEdit selection, which pauses all output to it until Esc or
+ * Enter (and a busy conhost does the same for shorter spells).  When the tee
+ * thread wrote to the console itself it stopped reading the pipe, the 64 KiB
+ * pipe filled, and every thread that logs (System.out under the VM lock,
+ * [memwatch], prefs) blocked in WriteFile: the whole game froze on the logo
+ * while ram and the window looked fine.  Caught by stack sampling 14-11, the
+ * tee thread itself in ZwWriteFile.  Now the file is written first and never
+ * waits on the console; the console just misses what did not fit. */
+#define LOG_CON_RING (1u << 20)
+static char *g_con_ring;
+static size_t g_con_head, g_con_tail;   /* bytes produced / consumed, monotonic */
+static size_t g_con_dropped;
+static CRITICAL_SECTION g_con_lock;
+static HANDLE g_con_event;
+
+static void log_console_push(const char *buf, size_t n)
+{
+   EnterCriticalSection(&g_con_lock);
+   const size_t space = LOG_CON_RING - (g_con_head - g_con_tail);
+   const size_t take = n < space ? n : space;
+   for (size_t done = 0; done < take; ) {
+      const size_t at = (g_con_head + done) % LOG_CON_RING;
+      size_t len = LOG_CON_RING - at;
+      if (len > take - done) len = take - done;
+      memcpy(g_con_ring + at, buf + done, len);
+      done += len;
+   }
+   g_con_head += take;
+   g_con_dropped += n - take;
+   LeaveCriticalSection(&g_con_lock);
+   SetEvent(g_con_event);
+}
+
+static DWORD WINAPI log_console_thread(LPVOID unused)
+{
+   (void)unused;
+   for (;;) {
+      WaitForSingleObject(g_con_event, INFINITE);
+      for (;;) {
+         EnterCriticalSection(&g_con_lock);
+         const size_t pending = g_con_head - g_con_tail;
+         const size_t at = g_con_tail % LOG_CON_RING;
+         size_t dropped = 0;
+         if (!pending) { dropped = g_con_dropped; g_con_dropped = 0; }
+         LeaveCriticalSection(&g_con_lock);
+         if (!pending) {
+            if (dropped) {
+               char note[160];
+               const int k = snprintf(note, sizeof note, "[log] %zu bytes not shown here while the console was paused; "
+                                      "lunaria-last-run.log has all of it\n", dropped);
+               if (k > 0) (void)_write(g_log_console_fd, note, (unsigned)k);
+            }
+            break;
+         }
+         /* The unread region is never overwritten by the producer, so it is
+          * read without the lock. */
+         size_t len = LOG_CON_RING - at;
+         if (len > pending) len = pending;
+         (void)_write(g_log_console_fd, g_con_ring + at, (unsigned)len);
+         EnterCriticalSection(&g_con_lock);
+         g_con_tail += len;
+         LeaveCriticalSection(&g_con_lock);
+      }
+   }
+   return 0;
+}
+
+static DWORD WINAPI log_tee_thread(LPVOID unused)
+{
+   (void)unused;
+   char buf[8192];
+   DWORD n;
+   while (ReadFile(g_log_pipe_read, buf, sizeof buf, &n, NULL) && n) {
+      if (g_log_file) { fwrite(buf, 1, n, g_log_file); fflush(g_log_file); }
+      if (g_con_ring) log_console_push(buf, n);
+      InterlockedIncrement(&g_log_chunks);
+   }
+   return 0;
+}
+
+/* Waits (up to ~1 s) until the thread has copied everything written so far.
+ * Called on exit and from the crash report, so the last lines reach the file.
+ *
+ * It must not touch the pipe itself.  The read end is a synchronous handle
+ * with the tee thread parked in ReadFile on it, and Windows serialises
+ * synchronous I/O per handle: PeekNamedPipe waited for that ReadFile, which
+ * returns only when someone logs again ([memwatch], every 5 s), up to 100
+ * times.  Closing LDoE's window sat "Not Responding" in here for minutes.
+ * So it watches the thread instead: the chunk counter goes quiet for 50 ms
+ * once the pipe is empty and the thread is back in ReadFile. */
+static void log_tee_drain(void)
+{
+   if (!g_log_pipe_read) return;
+   fflush(stdout); fflush(stderr);
+   LONG seen = g_log_chunks;
+   for (int quiet = 0, i = 0; quiet < 5 && i < 100; i++) {
+      Sleep(10);
+      const LONG now = g_log_chunks;
+      quiet = now == seen ? quiet + 1 : 0;
+      seen = now;
+   }
+}
+
+static bool log_open_in(const wchar_t *dir)
+{
+   wchar_t cur[MAX_PATH + 64], prev[MAX_PATH + 64];
+   if (_snwprintf(cur, MAX_PATH + 63, L"%ls\\lunaria-last-run.log", dir) < 0) return false;
+   if (_snwprintf(prev, MAX_PATH + 63, L"%ls\\lunaria-previous-run.log", dir) < 0) return false;
+   cur[MAX_PATH + 63] = prev[MAX_PATH + 63] = 0;
+   (void)MoveFileExW(cur, prev, MOVEFILE_REPLACE_EXISTING);
+   g_log_file = _wfopen(cur, L"wb");
+   if (!g_log_file) return false;
+   WideCharToMultiByte(CP_UTF8, 0, cur, -1, g_log_path, sizeof g_log_path, NULL, NULL);
+   return true;
+}
+
+static void log_tee_start(int argc, wchar_t **argv)
+{
+   const char *off = getenv("LUNARIA_NO_LOG_FILE");
+   if (off && off[0] && off[0] != '0') return;
+   /* Helper runs (a return link handed over by the browser, pool hosts) must
+    * not rotate or truncate the log of the game that is still running. */
+   if (argc > 1 && (!wcscmp(argv[1], L"--deliver-url") || wcsstr(argv[1], L"-process-")))
+      return;
+   wchar_t dir[MAX_PATH];
+   DWORD n = GetModuleFileNameW(NULL, dir, MAX_PATH);
+   wchar_t *slash = (n && n < MAX_PATH) ? wcsrchr(dir, L'\\') : NULL;
+   if (slash) *slash = 0;
+   if (!slash || !log_open_in(dir)) {
+      n = GetTempPathW(MAX_PATH, dir);
+      if (!n || n >= MAX_PATH) return;
+      if (dir[n - 1] == L'\\') dir[n - 1] = 0;
+      if (!log_open_in(dir)) return;
+   }
+   HANDLE rd, wr;
+   SECURITY_ATTRIBUTES sa = { sizeof sa, NULL, TRUE };
+   if (!CreatePipe(&rd, &wr, &sa, 1 << 16)) { fclose(g_log_file); g_log_file = NULL; return; }
+   SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+   fflush(stdout); fflush(stderr);
+   /* After a restart (exec), stderr is the old run's pipe and nobody reads it
+    * any more: write to the console directly instead. */
+   if (getenv("LUNARIA_LOG_TEE_ON"))
+      g_log_console_fd = _wopen(L"CONOUT$", _O_WRONLY | _O_BINARY);
+   else
+      g_log_console_fd = _dup(_fileno(stderr));   /* -1 with no console: file only */
+   _putenv("LUNARIA_LOG_TEE_ON=1");
+   int fd = _open_osfhandle((intptr_t)wr, _O_WRONLY | _O_BINARY);
+   if (fd < 0 || _dup2(fd, _fileno(stderr)) || _dup2(fd, _fileno(stdout))) {
+      CloseHandle(rd); fclose(g_log_file); g_log_file = NULL;
+      if (g_log_console_fd >= 0) { _dup2(g_log_console_fd, _fileno(stderr)); _close(g_log_console_fd); }
+      g_log_console_fd = -1;
+      return;
+   }
+   _close(fd);
+   SetStdHandle(STD_ERROR_HANDLE, (HANDLE)_get_osfhandle(_fileno(stderr)));
+   SetStdHandle(STD_OUTPUT_HANDLE, (HANDLE)_get_osfhandle(_fileno(stdout)));
+   setvbuf(stdout, NULL, _IONBF, 0);
+   setvbuf(stderr, NULL, _IONBF, 0);
+   g_log_pipe_read = rd;
+   if (g_log_console_fd >= 0) {
+      InitializeCriticalSection(&g_con_lock);
+      g_con_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+      char *ring = g_con_event ? malloc(LOG_CON_RING) : NULL;
+      HANDLE c = ring ? CreateThread(NULL, 0, log_console_thread, NULL, 0, NULL) : NULL;
+      if (c) { CloseHandle(c); g_con_ring = ring; }
+      else free(ring);   /* no console thread: the file still gets everything */
+   }
+   HANDLE t = CreateThread(NULL, 0, log_tee_thread, NULL, 0, NULL);
+   if (t) CloseHandle(t);
+   atexit(log_tee_drain);
+   fprintf(stderr, "[log] this run is also saved to %s\n", g_log_path);
+   memwatch_start();
+}
+
+static void crash_module(const void *addr, char *name, size_t cap, uintptr_t *base)
+{
+   HMODULE module = NULL;
+   name[0] = 0; *base = 0;
+   if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)addr, &module) || !module) {
+      snprintf(name, cap, "?");
+      return;
+   }
+   char path[MAX_PATH];
+   DWORD n = GetModuleFileNameA(module, path, sizeof path);
+   const char *slash = n ? strrchr(path, '\\') : NULL;
+   snprintf(name, cap, "%s", n ? (slash ? slash + 1 : path) : "?");
+   *base = (uintptr_t)module;
+}
+static LONG WINAPI crash_filter(EXCEPTION_POINTERS *info)
+{
+   static volatile LONG once;
+   if (InterlockedExchange(&once, 1)) return EXCEPTION_CONTINUE_SEARCH;
+   EXCEPTION_RECORD *rec = info->ExceptionRecord;
+   {
+      /* Straight to the handle, no CRT stream lock: if the faulting thread
+       * held stderr's lock, or the heap is gone, this line still lands. */
+      char raw[512];
+      MEMORY_BASIC_INFORMATION pc = {0}, sp = {0};
+      VirtualQuery(rec->ExceptionAddress, &pc, sizeof pc);
+      VirtualQuery((void *)info->ContextRecord->Rsp, &sp, sizeof sp);
+      NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
+      int n = snprintf(raw, sizeof raw,
+                       "\n[crash] handler: 0x%08lx at %p thread %lu, %s 0x%llx, rsp=%llx\n"
+                       "[crash] pc region base %p alloc %p size 0x%llx protect 0x%lx type 0x%lx\n"
+                       "[crash] rsp region base %p alloc %p size 0x%llx protect 0x%lx; tib stack %p..%p\n",
+                       (unsigned long)rec->ExceptionCode, rec->ExceptionAddress,
+                       (unsigned long)GetCurrentThreadId(),
+                       rec->NumberParameters >= 2 ? (rec->ExceptionInformation[0] == 0 ? "read" :
+                          rec->ExceptionInformation[0] == 1 ? "write" : "execute") : "?",
+                       rec->NumberParameters >= 2 ? (unsigned long long)rec->ExceptionInformation[1] : 0ull,
+                       (unsigned long long)info->ContextRecord->Rsp,
+                       pc.BaseAddress, pc.AllocationBase, (unsigned long long)pc.RegionSize,
+                       (unsigned long)pc.Protect, (unsigned long)pc.Type,
+                       sp.BaseAddress, sp.AllocationBase, (unsigned long long)sp.RegionSize,
+                       (unsigned long)sp.Protect, tib->StackLimit, tib->StackBase);
+      DWORD put;
+      if (n > 0) WriteFile(GetStdHandle(STD_ERROR_HANDLE), raw, (DWORD)n, &put, NULL);
+      /* Code bytes around the fault: names the instruction without a debugger. */
+      if (pc.State == MEM_COMMIT && (pc.Protect & 0xf0)) {
+         const unsigned char *b = (const unsigned char *)rec->ExceptionAddress - 16;
+         int k = snprintf(raw, sizeof raw, "[crash] code at pc-16:");
+         for (int i = 0; i < 32 && k < (int)sizeof raw - 4; i++)
+            k += snprintf(raw + k, sizeof raw - k, " %02x", b[i]);
+         raw[k++] = '\n';
+         WriteFile(GetStdHandle(STD_ERROR_HANDLE), raw, (DWORD)k, &put, NULL);
+      }
+   }
+   CONTEXT ctx = *info->ContextRecord;
+   char module[128];
+   uintptr_t base;
+   crash_module(rec->ExceptionAddress, module, sizeof module, &base);
+   fprintf(stderr, "[crash] exception 0x%08lx at %p (%s+0x%llx) thread %lu\n",
+           (unsigned long)rec->ExceptionCode, rec->ExceptionAddress, module,
+           (unsigned long long)((uintptr_t)rec->ExceptionAddress - base),
+           (unsigned long)GetCurrentThreadId());
+   if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2)
+      fprintf(stderr, "[crash] %s of address 0x%llx\n",
+              rec->ExceptionInformation[0] == 0 ? "read" :
+              rec->ExceptionInformation[0] == 1 ? "write" : "execute",
+              (unsigned long long)rec->ExceptionInformation[1]);
+   fprintf(stderr, "[crash] guest %s\n", arm_exec_guest_state());
+   fprintf(stderr, "[crash] rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx\n"
+                   "[crash] rsp=%llx rbp=%llx r8=%llx r9=%llx r12=%llx r13=%llx\n",
+           (unsigned long long)ctx.Rax, (unsigned long long)ctx.Rbx,
+           (unsigned long long)ctx.Rcx, (unsigned long long)ctx.Rdx,
+           (unsigned long long)ctx.Rsi, (unsigned long long)ctx.Rdi,
+           (unsigned long long)ctx.Rsp, (unsigned long long)ctx.Rbp,
+           (unsigned long long)ctx.R8, (unsigned long long)ctx.R9,
+           (unsigned long long)ctx.R12, (unsigned long long)ctx.R13);
+   for (int frame = 0; frame < 24 && ctx.Rip; frame++) {
+      crash_module((void *)ctx.Rip, module, sizeof module, &base);
+      fprintf(stderr, "[crash] #%d %s+0x%llx\n", frame, module,
+              (unsigned long long)(ctx.Rip - base));
+      DWORD64 image = 0;
+      RUNTIME_FUNCTION *fn = RtlLookupFunctionEntry(ctx.Rip, &image, NULL);
+      if (!fn) {
+         /* A leaf, or JIT code with no unwind data: take the return address
+          * off the stack once, then stop if that does not land in a module. */
+         if (!base) break;
+         ctx.Rip = *(DWORD64 *)ctx.Rsp;
+         ctx.Rsp += 8;
+         continue;
+      }
+      void *handler_data = NULL;
+      DWORD64 establisher = 0;
+      RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, fn, &ctx,
+                       &handler_data, &establisher, NULL);
+   }
+   /* JIT frames carry no unwind data, so the walk above stops at the first
+    * one.  The raw stack still holds return addresses into the executable:
+    * list the first few, which name the host code that entered the JIT. */
+   {
+      const DWORD64 *sp = (const DWORD64 *)info->ContextRecord->Rsp;
+      int shown = 0;
+      for (int i = 0; i < 4096 && shown < 16; i++) {
+         MEMORY_BASIC_INFORMATION mi;
+         if ((!i || !((uintptr_t)(sp + i) & 0xfff)) &&
+             (!VirtualQuery(sp + i, &mi, sizeof mi) || mi.State != MEM_COMMIT ||
+              (mi.Protect & (PAGE_GUARD | PAGE_NOACCESS))))
+            break;
+         uintptr_t mbase;
+         crash_module((const void *)sp[i], module, sizeof module, &mbase);
+         if (!mbase) continue;
+         MEMORY_BASIC_INFORMATION code;
+         if (!VirtualQuery((const void *)sp[i], &code, sizeof code) ||
+             !(code.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))
+            continue;
+         fprintf(stderr, "[crash] stack+0x%x %s+0x%llx\n", i * 8, module,
+                 (unsigned long long)(sp[i] - mbase));
+         shown++;
+      }
+   }
+   fflush(stderr);
+   if (g_log_path[0]) fprintf(stderr, "[crash] log saved to %s\n", g_log_path);
+   log_tee_drain();
+   return EXCEPTION_CONTINUE_SEARCH;
+}
+/* First chance: a fault inside JIT code has no unwind data, so the OS cannot
+ * find a frame that would reach the unhandled filter and ends the process
+ * without calling it.  Lunaria installs no handler of its own for these
+ * codes, so the first one is the crash; report it and let dispatch go on. */
+static LONG WINAPI crash_veh(EXCEPTION_POINTERS *info)
+{
+   switch (info->ExceptionRecord->ExceptionCode) {
+   case EXCEPTION_ACCESS_VIOLATION:
+   case EXCEPTION_ILLEGAL_INSTRUCTION:
+   case EXCEPTION_PRIV_INSTRUCTION:
+   case EXCEPTION_STACK_OVERFLOW:
+   case EXCEPTION_INT_DIVIDE_BY_ZERO:
+      if (getenv("LUNARIA_NO_CRASH_REPORT")) break;
+      return crash_filter(info);
+   default:
+      break;
+   }
+   return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* Translated-code compiles and time, both ARM front ends together. */
+extern uint64_t dynarmic_a64_compile_count(void);
+extern uint64_t dynarmic_a64_compile_ns(void);
+extern uint64_t dynarmic_a32_compile_count(void);
+extern uint64_t dynarmic_a32_compile_ns(void);
+static unsigned long long jit_compiles_total(void)
+{
+   return dynarmic_a64_compile_count() + dynarmic_a32_compile_count();
+}
+static unsigned long long jit_compile_ns_total(void)
+{
+   return dynarmic_a64_compile_ns() + dynarmic_a32_compile_ns();
+}
+
+/* Average length of a 1 ms sleep, in ms. */
+static double host_sleep1_ms(void)
+{
+   LARGE_INTEGER f, a, b;
+   QueryPerformanceFrequency(&f);
+   QueryPerformanceCounter(&a);
+   for (int i = 0; i < 20; ++i) Sleep(1);
+   QueryPerformanceCounter(&b);
+   return (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)f.QuadPart / 20.0;
+}
+
+/* Windows wakes a sleeping thread on its timer tick, 15.6 ms by default, so
+ * usleep(1000) and Sleep(1) take ~15.6 ms unless the process asks for a finer
+ * tick.  Every wait in Lunaria is built from those: the frame pump's idle
+ * steps, the audio pump that runs between them, guest nanosleep, condition
+ * timeouts.  On GitHub's runners a frame was ~24 ms with ~21 ms of it in
+ * those idle steps.  Ask for 1 ms, as games and emulators do while they run;
+ * Windows drops the request when the process exits.
+ * LUNARIA_TIMER_RES=0 leaves the system default (for A/B runs). */
+static void host_timer_resolution(void)
+{
+   const char *e = getenv("LUNARIA_TIMER_RES");
+   const double before = host_sleep1_ms();
+   if (e && e[0] == '0') {
+      fprintf(stderr, "[timer] left at the system default (LUNARIA_TIMER_RES=0): Sleep(1) = %.2f ms\n", before);
+      return;
+   }
+   typedef unsigned (WINAPI *period_fn)(unsigned);
+   HMODULE mm = LoadLibraryA("winmm.dll");
+   period_fn begin = mm ? (period_fn)(void *)GetProcAddress(mm, "timeBeginPeriod") : NULL;
+   const unsigned rc = begin ? begin(1) : 1u;
+   fprintf(stderr, "[timer] 1 ms timer %s: Sleep(1) = %.2f ms before, %.2f ms after\n",
+           rc == 0 ? "on" : "refused", before, host_sleep1_ms());
+}
+
 /* Decode Windows arguments losslessly, including drag-and-drop Unicode paths. */
 int wmain(int argc, wchar_t *wide_argv[])
 {
+   log_tee_start(argc, wide_argv);
+   SetUnhandledExceptionFilter(crash_filter);
+   AddVectoredExceptionHandler(0, crash_veh);
+   host_timer_resolution();
+   luna_os_sampler_start(jit_compiles_total, jit_compile_ns_total);
   char **argv = calloc((size_t)argc + 1, sizeof *argv);
   if (!argv) return EXIT_FAILURE;
   for (int i = 0; i < argc; i++) {
@@ -3317,6 +3933,13 @@ int wmain(int argc, wchar_t *wide_argv[])
     }
   }
   int result = lunaria_main(argc, (const char **)argv);
+   /* The run is over and has said "exiting"; end the process here.  Returning
+    * runs the CRT's atexit handlers and static destructors while the guest's
+    * threads are still alive, and one of them waited forever: a player closing
+    * the window got "Not Responding" with [memwatch] still ticking, and had to
+    * end it from Task Manager.  Nothing left is worth tearing down for. */
+   log_tee_drain();
+   TerminateProcess(GetCurrentProcess(), (UINT)result);
   for (int i = 0; i < argc; i++) free(argv[i]);
   free(argv);
   return result;

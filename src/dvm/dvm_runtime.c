@@ -227,6 +227,9 @@ RT_BUILTIN_DECL(view_frame_api);
 RT_BUILTIN_DECL(view_get_visible_display_frame);
 RT_BUILTIN_DECL(view_request_layout);
 RT_BUILTIN_DECL(view_clear_focus);
+RT_BUILTIN_DECL(view_request_pointer_capture);
+RT_BUILTIN_DECL(view_release_pointer_capture);
+RT_BUILTIN_DECL(view_has_pointer_capture);
 RT_BUILTIN_DECL(view_request_focus);
 RT_BUILTIN_DECL(view_restore_default_focus);
 RT_BUILTIN_DECL(view_has_focus);
@@ -10586,7 +10589,6 @@ static bool loc_getVariant(struct dvm *vm, dvm_ref self, const union dvm_value *
   (void)dvm_get_field(vm, self, "variant", "Ljava/lang/String;", &v);
   RETL(v.l ? v.l : dvm_new_string(vm, ""));
 }
-
 static bool loc_getScript(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                           int nargs, union dvm_value *out)
 {
@@ -18938,6 +18940,7 @@ static bool list_sublist(struct dvm *, dvm_ref, const union dvm_value *, int, un
 
 static const struct rt_method rt_list_methods[] = {
   M("stream", "()Ljava/util/stream/Stream;", coll_stream),
+  M("parallelStream", "()Ljava/util/stream/Stream;", coll_stream),
   M("toString", "()Ljava/lang/String;", list_toString),
   M("subList", "(II)Ljava/util/List;", list_sublist),
   M("equals", "(Ljava/lang/Object;)Z", list_equals),
@@ -20277,8 +20280,29 @@ static bool cv_getAs(struct dvm *vm, dvm_ref self, const union dvm_value *args,
 /* android.content.ContentValues — a string-keyed bag of boxed values used by
  * ContentResolver / SQLite.  Same storage shape as Bundle; the public API
  * spells the writers `put` rather than `putString`/`putInt`. */
+/* ContentValues(ContentValues from): a copy of the other one's entries. */
+static bool content_values_copy(struct dvm *vm, dvm_ref self,
+                                const union dvm_value *args, int nargs,
+                                union dvm_value *out)
+{
+   (void)nargs;
+   union dvm_value ignored = { 0 };
+   if (!map_init(vm, self, NULL, 0, &ignored)) return false;
+   if (!args[0].l) { dvm__throw(vm, "java/lang/NullPointerException", "from"); return false; }
+   struct rt_map *src = map_data(vm, args[0].l);
+   uint32_t n = src ? src->size : 0;
+   for (uint32_t i = 0; i < n; ++i) {
+      src = map_data(vm, args[0].l);
+      if (!src || i >= src->size) break;
+      union dvm_value kv[2] = { { .l = src->e[i].k }, { .l = src->e[i].v } };
+      if (!map_put(vm, self, kv, 2, &ignored)) return false;
+   }
+   (void)out;
+   RETV();
+}
 static const struct rt_method rt_content_values[] = {
   M("<init>", "()V", map_init),
+   M("<init>", "(Landroid/content/ContentValues;)V", content_values_copy),
   M("put", "(Ljava/lang/String;Ljava/lang/String;)V", bundle_putString),
   M("put", "(Ljava/lang/String;Ljava/lang/Integer;)V", bundle_putObject),
   M("put", "(Ljava/lang/String;Ljava/lang/Long;)V", bundle_putObject),
@@ -20821,6 +20845,8 @@ static bool arrays_toString(struct dvm *vm, dvm_ref self,
 }
 
 static const struct rt_method rt_arrays[] = {
+   SM("stream", "([Ljava/lang/Object;)Ljava/util/stream/Stream;", st_arrays_stream),
+   SM("stream", "([Ljava/lang/Object;II)Ljava/util/stream/Stream;", st_arrays_stream),
   SM("toString", "([Z)Ljava/lang/String;", arrays_toString),
   SM("toString", "([B)Ljava/lang/String;", arrays_toString),
   SM("toString", "([S)Ljava/lang/String;", arrays_toString),
@@ -22719,6 +22745,28 @@ static dvm_ref load_host_accepted_issuers(struct dvm *vm)
   if (vm->accepted_issuers) return vm->accepted_issuers;
 
   FILE *fp = luna_certs_open_system_bundle();
+   const unsigned char *const *host_der;
+   const int *host_len;
+   int host_n = fp ? 0 : dvm_tls_host_roots(&host_der, &host_len);
+   if (!fp && host_n > 0) {
+      /* Windows: no bundle file, the system ROOT store instead. */
+      dvm_ref *tmp = malloc((size_t)host_n * sizeof *tmp);
+      int n = 0;
+      for (int i = 0; tmp && i < host_n; ++i) {
+         dvm_ref cert = x509_from_der(vm, (uint8_t *)host_der[i], host_len[i]);
+         if (!cert) continue;
+         dvm_pin(vm, cert);
+         tmp[n++] = cert;
+      }
+      dvm_ref arr = dvm_new_array(vm, 'L', "Ljava/security/cert/X509Certificate;", (uint32_t)n);
+      dvm_ref *items = arr ? (dvm_ref *)dvm_array_data(vm, arr) : NULL;
+      for (int i = 0; items && i < n; ++i) items[i] = tmp[i];
+      free(tmp);
+      vm->accepted_issuers = arr;
+      if (arr) dvm_pin(vm, arr);
+      fprintf(stderr, "[tls] getAcceptedIssuers: %d of %d Windows root certificates\n", n, host_n);
+      return vm->accepted_issuers;
+   }
   if (!fp) {
     fprintf(stderr, "[tls] no host CA bundle — getAcceptedIssuers empty\n");
     vm->accepted_issuers =
@@ -22928,6 +22976,11 @@ static bool ks_get_type(struct dvm *vm,dvm_ref self,const union dvm_value *args,
   dvm_get_field(vm,self,"type","Ljava/lang/String;",out);
   return true;
 }
+/* KeyStore.getDefaultType(): "BKS" on Android.  Left unimplemented it returned
+ * null, and SDKs that build their own trust store (RuStore pay, OkHttp pinning
+ * helpers) died in getInstance(null) with NullPointerException "type". */
+static bool ks_get_default_type(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{ (void)self;(void)args;(void)nargs;RETL(dvm_new_string(vm,"BKS")); }
 static bool ks_certificate(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   if(!ks_require_loaded(vm,self)) return false;
@@ -23041,6 +23094,7 @@ static const struct rt_field rt_keystore_fields[] = {
 
 static const struct rt_method rt_keystore[] = {
   M("getType","()Ljava/lang/String;",ks_get_type),
+   SM("getDefaultType","()Ljava/lang/String;",ks_get_default_type),
   M("getCertificate","(Ljava/lang/String;)Ljava/security/cert/Certificate;",ks_certificate),
   M("setCertificateEntry","(Ljava/lang/String;Ljava/security/cert/Certificate;)V",ks_certificate),
   SM("getInstance", "(Ljava/lang/String;)Ljava/security/KeyStore;",
@@ -23436,6 +23490,16 @@ static const struct rt_method rt_x509_trust_interface[]= {
   {"checkClientTrusted","([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},
   {"checkServerTrusted","([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},
   {"getAcceptedIssuers","()[Ljava/security/cert/X509Certificate;",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},M_END
+};
+/* javax.net.ssl.X509ExtendedTrustManager: abstract; the Socket / SSLEngine
+ * overloads are the subclass's job, as on a device. */
+static const struct rt_method rt_x509_extended_trust_manager[]={
+   M("<init>","()V",empty_void),
+   {"checkClientTrusted","([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljava/net/Socket;)V",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},
+   {"checkServerTrusted","([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljava/net/Socket;)V",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},
+   {"checkClientTrusted","([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljavax/net/ssl/SSLEngine;)V",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},
+   {"checkServerTrusted","([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljavax/net/ssl/SSLEngine;)V",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},
+   M_END
 };
 
 static const struct rt_method rt_x509_trust_manager[]= {
@@ -23852,6 +23916,68 @@ static bool map_putIfAbsent(struct dvm *vm,dvm_ref self,const union dvm_value *a
   if(!map_get(vm,self,args,1,&current))return false;
   if(current.l)RETL(current.l);
   return map_put(vm,self,args,nargs,out);
+}
+
+/* Map's Java 8 compute family, with the JDK's null rules: a null result
+ * removes the key (or adds nothing).  HashMap, ConcurrentHashMap, TreeMap and
+ * Hashtable all share this storage; before these existed the calls fell to the
+ * null stub, so a cache filled with computeIfAbsent stayed empty and its caller
+ * got null back (Yandex ads hit this during LDoE startup). */
+static bool map_set_or_remove(struct dvm *vm,dvm_ref self,dvm_ref key,dvm_ref value,bool had)
+{
+   union dvm_value kv[2]={{.l=key},{.l=value}},ignored={0};
+   if(value) return map_put(vm,self,kv,2,&ignored);
+   if(had) return map_remove(vm,self,kv,1,&ignored);
+   return true;
+}
+static bool map_computeIfAbsent(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   union dvm_value cur={0},r={0};
+   if(!map_get(vm,self,args,1,&cur)) return false;
+   if(cur.l) RETL(cur.l);
+   if(!args[1].l) {dvm__throw(vm,"java/lang/NullPointerException","mappingFunction");return false;}
+   if(!am_vcall(vm,args[1].l,"apply","(Ljava/lang/Object;)Ljava/lang/Object;",args,1,&r)) return false;
+   if(!map_set_or_remove(vm,self,args[0].l,r.l,false)) return false;
+   RETL(r.l);
+}
+static bool map_computeIfPresent(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   union dvm_value cur={0},r={0};
+   if(!map_get(vm,self,args,1,&cur)) return false;
+   if(!cur.l) RETL(0);
+   if(!args[1].l) {dvm__throw(vm,"java/lang/NullPointerException","remappingFunction");return false;}
+   union dvm_value kv[2]={{.l=args[0].l},{.l=cur.l}};
+   if(!am_vcall(vm,args[1].l,"apply","(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",kv,2,&r)) return false;
+   if(!map_set_or_remove(vm,self,args[0].l,r.l,true)) return false;
+   RETL(r.l);
+}
+static bool map_compute(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   union dvm_value cur={0},has={0},r={0};
+   if(!map_get(vm,self,args,1,&cur)) return false;
+   if(!cur.l && !map_containsKey(vm,self,args,1,&has)) return false;
+   if(!args[1].l) {dvm__throw(vm,"java/lang/NullPointerException","remappingFunction");return false;}
+   union dvm_value kv[2]={{.l=args[0].l},{.l=cur.l}};
+   if(!am_vcall(vm,args[1].l,"apply","(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",kv,2,&r)) return false;
+   if(!map_set_or_remove(vm,self,args[0].l,r.l,cur.l||has.i)) return false;
+   RETL(r.l);
+}
+static bool map_merge(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   union dvm_value cur={0},r={0};
+   if(!args[1].l || !args[2].l) {dvm__throw(vm,"java/lang/NullPointerException",NULL);return false;}
+   if(!map_get(vm,self,args,1,&cur)) return false;
+   if(!cur.l) r.l=args[1].l;
+   else {
+      union dvm_value ov[2]={{.l=cur.l},{.l=args[1].l}};
+      if(!am_vcall(vm,args[2].l,"apply","(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",ov,2,&r)) return false;
+   }
+   if(!map_set_or_remove(vm,self,args[0].l,r.l,cur.l!=0)) return false;
+   RETL(r.l);
 }
 
 /* remove(key, value) / replace(key, value) — the conditional forms. */
@@ -24686,6 +24812,18 @@ static const struct rt_method rt_class_value[] = {
    M("putIfAbsent", \
      "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", \
      map_putIfAbsent), \
+   M("computeIfAbsent", \
+     "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;", \
+     map_computeIfAbsent), \
+   M("computeIfPresent", \
+     "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;", \
+     map_computeIfPresent), \
+   M("compute", \
+     "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;", \
+     map_compute), \
+   M("merge", \
+     "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;", \
+     map_merge), \
    M("remove", "(Ljava/lang/Object;Ljava/lang/Object;)Z", map_remove_kv), \
    M("replace", \
      "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", map_replace),
@@ -25149,9 +25287,22 @@ static bool entry_init(struct dvm *vm, dvm_ref self,
   (void)dvm_set_field(vm, self, "value", "Ljava/lang/Object;", value);
   RETV();
 }
+/* SimpleEntry(Map.Entry e) / SimpleImmutableEntry(Map.Entry e). */
+static bool entry_init_copy(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)nargs;
+   union dvm_value kv[2] = { { 0 }, { 0 } };
+   if (!am_vcall(vm, args[0].l, "getKey", "()Ljava/lang/Object;", NULL, 0, &kv[0]) ||
+       !am_vcall(vm, args[0].l, "getValue", "()Ljava/lang/Object;", NULL, 0, &kv[1]))
+      return false;
+   return entry_init(vm, self, kv, 2, out);
+}
 
 static const struct rt_method rt_map_entry[] = {
   M("<init>", "(Ljava/lang/Object;Ljava/lang/Object;)V", entry_init),
+   M("<init>", "(Ljava/util/Map$Entry;)V", entry_init_copy),
   M("getKey", "()Ljava/lang/Object;", entry_getKey),
   M("getValue", "()Ljava/lang/Object;", entry_getValue),
   M("setValue", "(Ljava/lang/Object;)Ljava/lang/Object;", entry_setValue),
@@ -34002,6 +34153,20 @@ static void json_write_string(struct dvm *vm, const char *s,
   bytes_append(b, "\"", 1);
 }
 
+/* True when `c` is `name` or extends it.  org.json is subclassed in the wild
+ * (AppMetrica's Bb extends JSONObject), and org.json's own writer tests
+ * `instanceof JSONObject`, never the exact class.  An exact-name test sent a
+ * subclass to the toString() fallback below, whose toString() is this same
+ * builtin: json_write -> toString -> json_write, in C, until the host stack ran
+ * out.  LDoE threw that StackOverflowError ~500 times a second, and with no GC
+ * every retry's objects stayed, filling an 8 GB laptop. */
+static bool json_class_is(const struct dvm_class *c, const char *name)
+{
+   for (; c; c = c->super)
+      if (c->name && !strcmp(c->name, name)) return true;
+   return false;
+}
+
 static void json_write(struct dvm *vm, dvm_ref v, struct rt_bytes *b)
 {
   if (!v || v == json_null(vm)) {
@@ -34010,6 +34175,8 @@ static void json_write(struct dvm *vm, dvm_ref v, struct rt_bytes *b)
   }
   struct dvm_class *c = dvm_object_class(vm, v);
   const char *n = c ? c->name : "";
+   if (json_class_is(c, "org/json/JSONArray")) n = "org/json/JSONArray";
+   else if (json_class_is(c, "org/json/JSONObject")) n = "org/json/JSONObject";
   const char *s = dvm_string_utf8(vm, v);
   if (s) {
     json_write_string(vm, s, b);
@@ -34342,8 +34509,7 @@ static bool jo_getBoolean(struct dvm *vm, dvm_ref self,
  * shape, so a mismatch is a missing value rather than a coercion. */
 static dvm_ref json_typed(struct dvm *vm, dvm_ref v, const char *name)
 {
-  struct dvm_class *c = v ? dvm_object_class(vm, v) : NULL;
-  return (c && !strcmp(c->name, name)) ? v : 0;
+   return v && json_class_is(dvm_object_class(vm, v), name) ? v : 0;
 }
 
 static bool jo_optJSONObject(struct dvm *vm, dvm_ref self,
@@ -46408,6 +46574,19 @@ static bool intent_getScheme(struct dvm *vm, dvm_ref self,
                               "getScheme", "()Ljava/lang/String;");
   return method && dvm_call(vm, method, data.l, NULL, 0, out);
 }
+/* getDataString(): the data URI as text, or null (AppMetrica reads it). */
+static bool intent_getDataString(struct dvm *vm, dvm_ref self,
+                                 const union dvm_value *args, int nargs,
+                                 union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value data = {0};
+   (void)dvm_get_field(vm, self, "data", "Landroid/net/Uri;", &data);
+   if (!data.l) RETL(0);
+   struct dvm_method *method = dvm_find_method(vm, dvm_object_class(vm, data.l),
+                                              "toString", "()Ljava/lang/String;");
+   return method && dvm_call(vm, method, data.l, NULL, 0, out);
+}
 
 static bool intent_resolveType(struct dvm *vm, dvm_ref self,
                                const union dvm_value *args, int nargs,
@@ -46861,6 +47040,7 @@ static const struct rt_method rt_intent[] = {
   M("setType", "(Ljava/lang/String;)Landroid/content/Intent;", intent_setType),
   M("setDataAndType", "(Landroid/net/Uri;Ljava/lang/String;)Landroid/content/Intent;", intent_setDataAndType),
   M("getData", "()Landroid/net/Uri;", intent_getData),
+   M("getDataString", "()Ljava/lang/String;", intent_getDataString),
   M("getScheme", "()Ljava/lang/String;", intent_getScheme),
   M("setData", "(Landroid/net/Uri;)Landroid/content/Intent;", intent_setData),
   M("getComponent", "()Landroid/content/ComponentName;", intent_getComponent),
@@ -49696,6 +49876,81 @@ static const struct rt_method rt_build_methods[] = {
   M_END,
 };
 
+/* Context's service-name constants. javac inlines them into callers, so only
+ * reflection reads the fields, and Unity's AndroidJavaObject.GetStatic is
+ * reflection: 2 Player Games (Aloa 17-11) asked for ACTIVITY_SERVICE ~100
+ * times a session and every miss became a Java exception through Unity and
+ * Crashlytics. Values are AOSP's. */
+static const struct { const char *field, *value; } k_context_services[] = {
+   { "ACTIVITY_SERVICE", "activity" },
+   { "ALARM_SERVICE", "alarm" },
+   { "AUDIO_SERVICE", "audio" },
+   { "CLIPBOARD_SERVICE", "clipboard" },
+   { "CONNECTIVITY_SERVICE", "connectivity" },
+   { "DISPLAY_SERVICE", "display" },
+   { "DOWNLOAD_SERVICE", "download" },
+   { "INPUT_METHOD_SERVICE", "input_method" },
+   { "INPUT_SERVICE", "input" },
+   { "JOB_SCHEDULER_SERVICE", "jobscheduler" },
+   { "KEYGUARD_SERVICE", "keyguard" },
+   { "LAYOUT_INFLATER_SERVICE", "layout_inflater" },
+   { "LOCATION_SERVICE", "location" },
+   { "NOTIFICATION_SERVICE", "notification" },
+   { "POWER_SERVICE", "power" },
+   { "SENSOR_SERVICE", "sensor" },
+   { "STORAGE_SERVICE", "storage" },
+   { "TELEPHONY_SERVICE", "phone" },
+   { "UI_MODE_SERVICE", "uimode" },
+   { "USAGE_STATS_SERVICE", "usagestats" },
+   { "VIBRATOR_SERVICE", "vibrator" },
+   { "WIFI_SERVICE", "wifi" },
+   { "WINDOW_SERVICE", "window" },
+   { "BATTERY_SERVICE", "batterymanager" },
+   { "CAMERA_SERVICE", "camera" },
+   { "ACCESSIBILITY_SERVICE", "accessibility" },
+   { "ACCOUNT_SERVICE", "account" },
+   { "APP_OPS_SERVICE", "appops" },
+   { "DEVICE_POLICY_SERVICE", "device_policy" },
+   { "USER_SERVICE", "user" },
+   { "STORAGE_STATS_SERVICE", "storagestats" },
+   { "NETWORK_STATS_SERVICE", "netstats" },
+};
+static const struct rt_field rt_context_sfields[] = {
+   { "ACTIVITY_SERVICE", "Ljava/lang/String;" },
+   { "ALARM_SERVICE", "Ljava/lang/String;" },
+   { "AUDIO_SERVICE", "Ljava/lang/String;" },
+   { "CLIPBOARD_SERVICE", "Ljava/lang/String;" },
+   { "CONNECTIVITY_SERVICE", "Ljava/lang/String;" },
+   { "DISPLAY_SERVICE", "Ljava/lang/String;" },
+   { "DOWNLOAD_SERVICE", "Ljava/lang/String;" },
+   { "INPUT_METHOD_SERVICE", "Ljava/lang/String;" },
+   { "INPUT_SERVICE", "Ljava/lang/String;" },
+   { "JOB_SCHEDULER_SERVICE", "Ljava/lang/String;" },
+   { "KEYGUARD_SERVICE", "Ljava/lang/String;" },
+   { "LAYOUT_INFLATER_SERVICE", "Ljava/lang/String;" },
+   { "LOCATION_SERVICE", "Ljava/lang/String;" },
+   { "NOTIFICATION_SERVICE", "Ljava/lang/String;" },
+   { "POWER_SERVICE", "Ljava/lang/String;" },
+   { "SENSOR_SERVICE", "Ljava/lang/String;" },
+   { "STORAGE_SERVICE", "Ljava/lang/String;" },
+   { "TELEPHONY_SERVICE", "Ljava/lang/String;" },
+   { "UI_MODE_SERVICE", "Ljava/lang/String;" },
+   { "USAGE_STATS_SERVICE", "Ljava/lang/String;" },
+   { "VIBRATOR_SERVICE", "Ljava/lang/String;" },
+   { "WIFI_SERVICE", "Ljava/lang/String;" },
+   { "WINDOW_SERVICE", "Ljava/lang/String;" },
+   { "BATTERY_SERVICE", "Ljava/lang/String;" },
+   { "CAMERA_SERVICE", "Ljava/lang/String;" },
+   { "ACCESSIBILITY_SERVICE", "Ljava/lang/String;" },
+   { "ACCOUNT_SERVICE", "Ljava/lang/String;" },
+   { "APP_OPS_SERVICE", "Ljava/lang/String;" },
+   { "DEVICE_POLICY_SERVICE", "Ljava/lang/String;" },
+   { "USER_SERVICE", "Ljava/lang/String;" },
+   { "STORAGE_STATS_SERVICE", "Ljava/lang/String;" },
+   { "NETWORK_STATS_SERVICE", "Ljava/lang/String;" },
+   F_END
+};
+
 static const struct rt_field rt_build_version_sfields[] = {
   { "SDK_INT", "I" },
   { "RELEASE", "Ljava/lang/String;" },
@@ -50423,7 +50678,7 @@ static bool acct_commit(struct acct_db *db)
   }
   const bool ok = fflush(fp) == 0 && luna_file_sync(fileno(fp), 0) == 0;
   fclose(fp);
-  return ok && rename(tmp, db->path) == 0;
+   return ok && luna_file_rename(tmp, db->path) == 0;
 }
 static bool acct_add(struct acct_db *db, char kind, const char *a, const char *b, const char *c, const char *d)
 {
@@ -56860,7 +57115,7 @@ static bool pm_resolveProvider(struct dvm *vm,dvm_ref self,
   const char *wanted=dvm_string_utf8(vm,ARG(0).l);
   if (!wanted) RETL(0);
   struct luna_providers providers;
-  if (luna_providers_open(&providers,getenv("ANDROID_CONTENT_PROVIDERS"),getenv("ANDROID_PACKAGE_NAME"))<0) RETL(0);
+  if (luna_providers_open(&providers,luna_env_long("ANDROID_CONTENT_PROVIDERS"),getenv("ANDROID_PACKAGE_NAME"))<0) RETL(0);
   dvm_ref result=0;
   uint32_t flags=(uint32_t)ARG(1).i;
   for(size_t i=0; i<providers.count; ++i) {
@@ -56883,7 +57138,7 @@ static bool pm_queryContentProviders(struct dvm *vm,dvm_ref self,
   /* A null process requests all known providers; uid then has no effect. */
   if (process && ARG(1).i!=(int32_t)arm_exec_guest_uid()) RETL(0);
   struct luna_providers providers;
-  if (luna_providers_open(&providers,getenv("ANDROID_CONTENT_PROVIDERS"),getenv("ANDROID_PACKAGE_NAME"))<0) RETL(0);
+  if (luna_providers_open(&providers,luna_env_long("ANDROID_CONTENT_PROVIDERS"),getenv("ANDROID_PACKAGE_NAME"))<0) RETL(0);
   dvm_ref result=0;
   union dvm_value ignored= {0};
   bool good=true;
@@ -56960,7 +57215,7 @@ static bool pm_getServiceInfo(struct dvm *vm, dvm_ref self,
   (void)dvm_get_field(vm, ARG(0).l, "pkg", "Ljava/lang/String;", &pkg);
   (void)dvm_get_field(vm, ARG(0).l, "cls", "Ljava/lang/String;", &cls);
   const char *package = dvm_string_utf8(vm, pkg.l), *name = dvm_string_utf8(vm, cls.l);
-  const char *current = getenv("ANDROID_PACKAGE_NAME"), *table = getenv("ANDROID_SERVICES");
+   const char *current = getenv("ANDROID_PACKAGE_NAME"), *table = luna_env_long("ANDROID_SERVICES");
   struct lunaria_android_package record;
   if (!package || !name || !current || strcmp(package, current) ||
       !lunaria_android_package_find(package, &record)) goto missing;
@@ -57017,7 +57272,7 @@ static bool pm_getReceiverInfo(struct dvm *vm, dvm_ref self,
   (void)dvm_get_field(vm, ARG(0).l, "pkg", "Ljava/lang/String;", &pkg);
   (void)dvm_get_field(vm, ARG(0).l, "cls", "Ljava/lang/String;", &cls);
   const char *package = dvm_string_utf8(vm, pkg.l), *name = dvm_string_utf8(vm, cls.l);
-  const char *current = getenv("ANDROID_PACKAGE_NAME"), *table = getenv("ANDROID_RECEIVERS");
+   const char *current = getenv("ANDROID_PACKAGE_NAME"), *table = luna_env_long("ANDROID_RECEIVERS");
   struct lunaria_android_package record;
   if (!package || !name || !current || strcmp(package, current) ||
       !lunaria_android_package_find(package, &record)) goto missing;
@@ -57683,7 +57938,7 @@ static dvm_ref pm_package_info(struct dvm *vm,
     self && !strcmp(self, record->name) ? NULL : record->source_dir);
 
   const char *encoded_permissions = self && !strcmp(self, record->name)
-                                    ? getenv("ANDROID_REQUESTED_PERMISSIONS") : NULL;
+                                   ? luna_env_long("ANDROID_REQUESTED_PERMISSIONS") : NULL;
   if (encoded_permissions && *encoded_permissions) {
     char *copy = strdup(encoded_permissions);
     uint32_t count = 1;
@@ -57978,7 +58233,7 @@ static bool pm_queryIntentServices(struct dvm *vm, dvm_ref self,
 {
   (void)self;
   dvm_ref list = coll_new_list(vm, "Ljava/util/ArrayList;");
-  const char *table = getenv("ANDROID_SERVICES");
+   const char *table = luna_env_long("ANDROID_SERVICES");
   if (!list || nargs < 1 || !ARG(0).l || !table) RETL(list);
   char *rows = strdup(table), *scan = rows, *row;
   if (!rows) {
@@ -59495,15 +59750,43 @@ static const char *webview_chrome_binary(void)
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
     NULL,
   };
+#elif defined(_WIN32)
+   /* Any Chromium-family browser speaks the DevTools pipe.  Windows used to
+    * fall through to the Linux paths below, so no installed browser was ever
+    * found there.  Per-user installs (Chrome, Brave) live under LOCALAPPDATA. */
+   static const struct { const char *root, *rel; } win[] = {
+      { "ProgramFiles",      "Google\\Chrome\\Application\\chrome.exe" },
+      { "ProgramFiles(x86)", "Google\\Chrome\\Application\\chrome.exe" },
+      { "LOCALAPPDATA",      "Google\\Chrome\\Application\\chrome.exe" },
+      { "ProgramFiles",      "BraveSoftware\\Brave-Browser\\Application\\brave.exe" },
+      { "ProgramFiles(x86)", "BraveSoftware\\Brave-Browser\\Application\\brave.exe" },
+      { "LOCALAPPDATA",      "BraveSoftware\\Brave-Browser\\Application\\brave.exe" },
+      { "LOCALAPPDATA",      "Chromium\\Application\\chrome.exe" },
+      { "ProgramFiles(x86)", "Microsoft\\Edge\\Application\\msedge.exe" },
+      { "ProgramFiles",      "Microsoft\\Edge\\Application\\msedge.exe" },
+   };
+   static char found[DVM_PATH_MAX];
+   for (size_t i = 0; i < sizeof win / sizeof win[0]; ++i) {
+      const char *root = getenv(win[i].root);
+      if (!root || !*root) continue;
+      snprintf(found, sizeof found, "%s\\%s", root, win[i].rel);
+      struct stat st;
+      if (luna_file_stat_follow(found, &st) == 0 && S_ISREG(st.st_mode)) return found;
+   }
+   return NULL;
 #else
   static const char *candidates[] = {
     "/opt/google/chrome/chrome", "/usr/lib/chromium/chromium",
-    "/usr/lib/chromium-browser/chromium-browser", NULL,
+      "/usr/lib/chromium-browser/chromium-browser",
+      "/opt/brave.com/brave/brave", "/usr/bin/brave-browser",
+      "/opt/microsoft/msedge/msedge", NULL,
   };
 #endif
+#if !defined(_WIN32)
   for (int i = 0; candidates[i]; ++i)
     if (luna_file_access(candidates[i], X_OK) == 0) return candidates[i];
   return NULL;
+#endif
 }
 
 static const char *webview_browser_binary(void)
@@ -66467,6 +66750,9 @@ static const struct rt_method rt_view[] = {
   view_get_content_description),
   M("setTooltipText", "(Ljava/lang/CharSequence;)V", nop_void),
   M("setPointerIcon", "(Landroid/view/PointerIcon;)V", nop_void),
+   M("requestPointerCapture", "()V", view_request_pointer_capture),
+   M("releasePointerCapture", "()V", view_release_pointer_capture),
+   M("hasPointerCapture", "()Z", view_has_pointer_capture),
   M("setTouchDelegate", "(Landroid/view/TouchDelegate;)V", nop_void),
   M("getHitRect", "(Landroid/graphics/Rect;)V", view_get_hit_rect),
   M("addOnLayoutChangeListener", "(Landroid/view/View$OnLayoutChangeListener;)V", view_add_layout_listener),
@@ -70389,7 +70675,7 @@ static bool ui_capture_draws_children(struct dvm *vm,dvm_ref view)
 static bool legacy_http_enabled(void)
 {
   if(lunaria_app_target_sdk()<28)return true;
-  const char *libraries=getenv("ANDROID_USES_LIBRARIES");
+  const char *libraries=luna_env_long("ANDROID_USES_LIBRARIES");
   for(const char *p=libraries; p && *p;) {
     const char *end=strchr(p,'\n');
     size_t length=end ? (size_t)(end-p) : strlen(p);
@@ -70697,6 +70983,34 @@ static bool act_getCurrentFocus(struct dvm *vm, dvm_ref self,
     if (first) view_dispatch_focus_change(vm, first, true);
   }
   RETL(g_focus_view);
+}
+
+/* Pointer capture (API 26): a first-person game asks for the mouse to be
+ * locked to the window.  Unity does this for Cursor.lockState = Locked.  The
+ * host locks it and keeps feeding the camera as a held finger. */
+static bool view_request_pointer_capture(struct dvm *vm, dvm_ref self,
+                                         const union dvm_value *args, int nargs,
+                                         union dvm_value *out)
+{
+   (void)vm; (void)self; (void)args; (void)nargs; (void)out;
+   arm_exec_pointer_capture(1);
+   return true;
+}
+static bool view_release_pointer_capture(struct dvm *vm, dvm_ref self,
+                                         const union dvm_value *args, int nargs,
+                                         union dvm_value *out)
+{
+   (void)vm; (void)self; (void)args; (void)nargs; (void)out;
+   arm_exec_pointer_capture(0);
+   return true;
+}
+static bool view_has_pointer_capture(struct dvm *vm, dvm_ref self,
+                                     const union dvm_value *args, int nargs,
+                                     union dvm_value *out)
+{
+   (void)vm; (void)self; (void)args; (void)nargs;
+   if (out) out->i = arm_exec_pointer_captured();
+   return true;
 }
 
 /* requestFocus(): the view becomes the one text goes to.  It used to answer
@@ -75538,16 +75852,39 @@ static const struct rt_field rt_context_wrapper_fields[] = {
   F_END
 };
 
+/* The process's real base context, set when the Application is bound. A
+ * ContextWrapper with no mBase NPEs on a device too, but a device never hands
+ * a game one: 2 Player Games (Aloa 17-11) asked an Application with no base
+ * for getSystemService about 100 times a session, and each failure went
+ * through Unity's exception path and Crashlytics, which is stutter. Such a
+ * wrapper borrows the bound base instead, and the first one says so. */
+static dvm_ref g_cw_fallback_base;
+static bool cw_base_or_fallback(struct dvm *vm, dvm_ref self, union dvm_value *base,
+                                const char *what)
+{
+   (void)dvm_get_field(vm, self, "mBase", "Landroid/content/Context;", base);
+   if (base->l) return true;
+   if (g_cw_fallback_base && g_cw_fallback_base != self) {
+      static int said;
+      if (said++ < 4) {
+         struct dvm_class *c = dvm_object_class(vm, self);
+         fprintf(stderr, "[context] %s on an unattached %s: using the application's "
+                 "base context%s\n", what, c && c->name ? c->name : "?",
+                 said == 4 ? " (further cases not reported)" : "");
+      }
+      base->l = g_cw_fallback_base;
+      return true;
+   }
+   dvm__throw(vm, "java/lang/NullPointerException", "unattached ContextWrapper");
+   return false;
+}
+
 static bool cw_get_system_service(struct dvm *vm, dvm_ref self,
                                   const union dvm_value *args, int nargs,
                                   union dvm_value *out)
 {
   union dvm_value base = { 0 };
-  (void)dvm_get_field(vm, self, "mBase", "Landroid/content/Context;", &base);
-  if (!base.l) {
-    dvm__throw(vm, "java/lang/NullPointerException", "unattached ContextWrapper");
-    return false;
-  }
+   if (!cw_base_or_fallback(vm, self, &base, "getSystemService")) return false;
   struct dvm_method *get = dvm_find_method(vm, dvm_object_class(vm, base.l),
                            "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
   return get && dvm_call(vm, get, base.l, args, nargs, out);
@@ -75561,11 +75898,7 @@ static bool cw_create_configuration(struct dvm *vm, dvm_ref self,
                                     union dvm_value *out)
 {
   union dvm_value base = { 0 };
-  (void)dvm_get_field(vm, self, "mBase", "Landroid/content/Context;", &base);
-  if (!base.l) {
-    dvm__throw(vm, "java/lang/NullPointerException", "unattached ContextWrapper");
-    return false;
-  }
+   if (!cw_base_or_fallback(vm, self, &base, "createConfigurationContext")) return false;
   return am_vcall(vm, base.l, "createConfigurationContext",
                   "(Landroid/content/res/Configuration;)Landroid/content/Context;",
                   args, nargs, out);
@@ -75584,11 +75917,7 @@ static bool cw_theme(struct dvm *vm, dvm_ref self,
                      const union dvm_value *args, int nargs, union dvm_value *out)
 {
   union dvm_value base = {0};
-  (void)dvm_get_field(vm, self, "mBase", "Landroid/content/Context;", &base);
-  if (!base.l) {
-    dvm__throw(vm, "java/lang/NullPointerException", "unattached ContextWrapper");
-    return false;
-  }
+   if (!cw_base_or_fallback(vm, self, &base, "getTheme/setTheme")) return false;
   const char *name = nargs ? "setTheme" : "getTheme";
   const char *sig = nargs ? "(I)V" : "()Landroid/content/res/Resources$Theme;";
   struct dvm_method *method = dvm_find_method(vm, dvm_object_class(vm, base.l), name, sig);
@@ -82712,6 +83041,7 @@ bool dvm_bind_application(struct dvm *vm, dvm_ref base, dvm_ref application)
 {
   dvm_ref thread = activity_thread_object(vm);
   if (!thread || !base) return false;
+   g_cw_fallback_base = base;
   union dvm_value bound = {0};
   (void)dvm_get_field(vm, thread, "mBoundApplication",
                       "Landroid/app/ActivityThread$AppBindData;", &bound);
@@ -89809,7 +90139,7 @@ static bool manifest_broadcast(struct dvm *vm,dvm_ref context,dvm_ref intent,boo
   if(!component)return true;
   const char *package=dvm_string_utf8(vm,pending_field(vm,component,"pkg","Ljava/lang/String;"));
   const char *name=dvm_string_utf8(vm,pending_field(vm,component,"cls","Ljava/lang/String;"));
-  const char *current=getenv("ANDROID_PACKAGE_NAME"),*table=getenv("ANDROID_RECEIVERS");
+   const char *current=getenv("ANDROID_PACKAGE_NAME"),*table=luna_env_long("ANDROID_RECEIVERS");
   if(!package || !name || !current || strcmp(package,current) || !table)return true;
   char full[768];
   int length=snprintf(full,sizeof full,"%s%s",name[0]=='.' ? package : "",name);
@@ -89841,7 +90171,7 @@ static bool manifest_broadcast(struct dvm *vm,dvm_ref context,dvm_ref intent,boo
  * resolution. Only the component's declared process queues its callback. */
 static bool route_manifest_broadcast(struct dvm *vm,dvm_ref intent,uint32_t uid,bool enqueue,bool *found)
 {
-  const char *current=getenv("ANDROID_PACKAGE_NAME"),*table=getenv("ANDROID_RECEIVERS");
+  const char *current=getenv("ANDROID_PACKAGE_NAME"),*table=luna_env_long("ANDROID_RECEIVERS");
   const char *process=getenv("ANDROID_PROCESS_NAME");
   if(!process || !*process)process=current;
   if(!current || !table || !process)return true;
@@ -90108,7 +90438,7 @@ void dvm_deliver_boot_completed(struct dvm *vm)
      * Play services' trigger receiver starts the device registration from it. */
     "android.server.checkin.CHECKIN"
   };
-  const char *current=getenv("ANDROID_PACKAGE_NAME"),*table=getenv("ANDROID_RECEIVERS");
+  const char *current=getenv("ANDROID_PACKAGE_NAME"),*table=luna_env_long("ANDROID_RECEIVERS");
   if(!vm || !current || !table || !g_process_application)return;
   const char *process=getenv("ANDROID_PROCESS_NAME");
   if(!process || !*process)process=current;
@@ -98030,6 +98360,12 @@ static const struct rt_class rt_classes[] = {
   { "Ljavax/net/ssl/X509TrustManager;", "Ljava/lang/Object;",
     rt_x509_trust_interface, NULL, rt_iface_trust_manager, NULL, true
   },
+   /* Abstract class (API 24) that SDKs subclass for their own trust logic.
+    * Unlisted, it had no X509TrustManager in its hierarchy, so RuStore pay's
+    * CompositeX509TrustManagerApi24 failed check-cast to X509TrustManager and
+    * LDoE quit during startup. */
+   { "Ljavax/net/ssl/X509ExtendedTrustManager;", "Ljava/lang/Object;",
+     rt_x509_extended_trust_manager, NULL, rt_iface_x509_trust_manager },
   /* The platform default trust manager, as a device names it. */
   { "Lcom/android/org/conscrypt/TrustManagerImpl;", "Ljava/lang/Object;",
     rt_x509_trust_manager, rt_trust_fields, rt_iface_x509_trust_manager
@@ -99722,9 +100058,9 @@ static const struct rt_class rt_classes[] = {
     rt_mutable_context_wrapper, NULL, NULL
   },
   { "Landroid/view/ContextThemeWrapper;", "Landroid/content/ContextWrapper;",
-    rt_context_theme_wrapper, rt_context_theme_wrapper_fields, NULL
-  },
-  { "Landroid/content/Context;", "Ljava/lang/Object;", rt_context, rt_context_fields, NULL },
+     rt_context_theme_wrapper, rt_context_theme_wrapper_fields, NULL },
+   { "Landroid/content/Context;", "Ljava/lang/Object;", rt_context, rt_context_fields, NULL,
+     rt_context_sfields },
   { "Landroid/view/autofill/AutofillId;", "Ljava/lang/Object;", rt_autofill_id, rt_autofill_id_fields, rt_iface_parcelable },
   { "Landroid/view/autofill/AutofillManager;", "Ljava/lang/Object;", rt_autofill_manager, NULL, NULL },
   { "Landroid/view/autofill/AutofillManager$AutofillCallback;", "Ljava/lang/Object;", rt_autofill_callback, NULL, NULL },
@@ -100160,6 +100496,16 @@ struct dvm_class *dvm_runtime_define(struct dvm *vm, const char *desc)
       }
     }
   }
+
+   if (!strcmp(desc, "Landroid/content/Context;") && c->sslots) {
+      for (int f = 0; f < c->nsfields; ++f)
+         for (size_t k = 0; k < sizeof k_context_services / sizeof *k_context_services; ++k)
+            if (c->sfields[f].name && !strcmp(c->sfields[f].name, k_context_services[k].field)) {
+               c->sslots[f].l = dvm_new_string(vm, k_context_services[k].value);
+               if (c->sslots[f].l) dvm_pin(vm, c->sslots[f].l);
+               c->sfields[f].access |= DEX_ACC_PUBLIC | DEX_ACC_STATIC | DEX_ACC_FINAL;
+            }
+   }
 
   if (!strcmp(desc, "Landroid/os/Build$VERSION;") &&
       c->sslots && c->nsfields >= 7) {

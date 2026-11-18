@@ -51,6 +51,8 @@
 #include <time.h>
 #include <unistd.h>
 
+static bool keyedit_pointer(double x, double y, int action);
+static bool keyedit_key(int key, int action);
 static bool  g_ready;          /* luna_init() has run against a live context */
 static bool  g_failed;         /* …and failed; do not retry every frame */
 static char *g_html;           /* guest widget document (dialogs, …) */
@@ -2040,6 +2042,7 @@ bound:
 bool luna_overlay_pointer(double x, double y, int action)
 {
   if (getenv("LUNARIA_TRACE_TOUCH")) fprintf(stderr, "[ovl-in] %.0f,%.0f act=%d paused=%d\n", x, y, action, (int)luna_guest_paused());
+   if (keyedit_pointer(x, y, action)) return true;
   pthread_mutex_lock(&g_doc_lock);
   bool guest = g_html != NULL && !g_native_input_focus;
   bool ime = g_ime_html != NULL;
@@ -2707,23 +2710,45 @@ static void resolution_values(int index, int *width, int *height)
     *width = *height;
     *height = t;
   }
-}
-struct menu_setting {
-  const char *key, *label;
-  int value, initial;
-  const int *choices;
-  size_t count;
-};
-static const int ram_choices[] = {512, 1024, 2048, 4096, 6144, 8192, 12288, 16384};
+/* A numeric setting cycles through `choices` (0 = Automatic, the key unset).
+ * A named one (`names` set) cycles through indices: names[i] is shown and
+ * envs[i] is what the key is set to, NULL leaving it unset. */
+struct menu_setting { const char *key, *label; int value, initial; const int *choices; size_t count;
+                      const char *const *names, *const *envs; };
+static const int ram_choices[] = {512, 1024, 2048, 3072, 4096, 6144, 8192, 12288, 16384};
 static const int cpu_choices[] = {1, 2, 4, 6, 8, 12, 16};
 static const int engine_choices[] = {0, 1, 2, 3, 4, 6, 8};
 static const int dpi_choices[] = {0, 160, 240, 320, 420, 480, 640};
-#define SETTING(key, label, choices) {key, label, 0, 0, choices, sizeof choices / sizeof choices[0]}
+#define SETTING(key, label, choices) {key, label, 0, 0, choices, sizeof choices / sizeof choices[0], NULL, NULL}
+#define SETTING_NAMED(key, label, names, envs) \
+   {key, label, 0, 0, index_choices, sizeof names / sizeof names[0], names, envs}
+static const int index_choices[] = {0, 1, 2, 3};
+static const char *const frame_names[] = {"Automatic (measured)", "Shared GPU textures", "Copy through memory"};
+static const char *const frame_envs[] = {NULL, "1", "0"};
+static const char *const etc_names[] = {"Compressed on GPU", "Unpacked (exact)"};
+static const char *const etc_envs[] = {NULL, "0"};
+static const char *const astc_names[] = {"Convert to BC3", "Convert, uncompressed", "Off (unsupported)"};
+static const char *const astc_envs[] = {NULL, "rgba", "0"};
+static const char *const cache_names[] = {"On", "Off"};
+static const char *const cache_envs[] = {NULL, "0"};
+#ifdef _WIN32
+/* The same choice as the launcher's "Graphics" field: what ANGLE draws with.
+ * DirectX 11 stays the default (ES 3.1); Vulkan gives ES 3.2. Restart. */
+static const char *const backend_names[] = {"DirectX 11", "Vulkan"};
+static const char *const backend_envs[] = {NULL, "vulkan"};
+#endif
 static struct menu_setting g_settings[] = {
   SETTING("LUNARIA_MEM_TOTAL_MB", "Memory reported to Android (MiB)", ram_choices),
   SETTING("LUNARIA_CPU_COUNT", "CPU cores reported to Android", cpu_choices),
   SETTING("LUNARIA_A64_ENGINES", "Parallel execution engines", engine_choices),
   SETTING("LUNARIA_DPI", "Screen density (DPI)", dpi_choices),
+   SETTING_NAMED("LUNARIA_COMP_SHARE", "Frame hand-off", frame_names, frame_envs),
+   SETTING_NAMED("LUNARIA_ETC_LOSSY", "ETC textures", etc_names, etc_envs),
+   SETTING_NAMED("LUNARIA_ASTC", "ASTC textures", astc_names, astc_envs),
+   SETTING_NAMED("LUNARIA_TEXCACHE", "Converted texture cache", cache_names, cache_envs),
+#ifdef _WIN32
+   SETTING_NAMED("LUNARIA_ANGLE_BACKEND", "Graphics backend", backend_names, backend_envs),
+#endif
 };
 #undef SETTING
 static void settings_load(void)
@@ -2734,7 +2759,12 @@ static void settings_load(void)
     struct menu_setting *v = &g_settings[i];
     if (!g_settings_loaded) {
       const char *env = getenv(v->key);
-      v->initial = env ? atoi(env) : i == 0 ? 6144 : i == 1 ? 4 : 0;
+         if (v->names) {
+            v->initial = 0;
+            for (size_t k = 1; env && k < v->count; ++k)
+               if (v->envs[k] && !strcmp(env, v->envs[k])) v->initial = (int)k;
+         } else
+            v->initial = env ? atoi(env) : i == 0 ? (int)lunaria_mem_default_mb() : i == 1 ? 4 : 0;
     }
     v->value = v->initial;
   }
@@ -2813,33 +2843,60 @@ static void keyfiles_read(void)
 }
 
 
-/* macOS context-menu look: a translucent vibrancy panel, 13px system text,
+/* Context-menu look, dark: a translucent near-black panel, 13px system text,
  * rounded selection in the accent blue, hairline separators. */
 static const char g_menu_style[] =
   "#luna-menu-backdrop{position:absolute;left:0;top:0;right:0;bottom:0;"
   "background:transparent;}"
   ".lm{position:absolute;width:" "248" "px;padding:5px;border-radius:10px;"
-  "background:rgba(242,242,246,0.80);backdrop-filter:blur(24px) saturate(1.8);"
-  "border:1px solid rgba(0,0,0,0.14);box-shadow:0 12px 36px rgba(0,0,0,0.30);"
-  "font-size:13px;color:#1d1d1f;}"
+   "background:rgba(28,28,30,0.88);backdrop-filter:blur(24px) saturate(1.8);"
+   "border:1px solid rgba(255,255,255,0.12);box-shadow:0 12px 36px rgba(0,0,0,0.45);"
+   "font-size:13px;color:#f2f2f7;}"
   ".li{position:relative;height:24px;line-height:24px;padding:0 12px 0 24px;"
   "border-radius:5px;white-space:nowrap;overflow:hidden;cursor:pointer;}"
   ".li:hover{background:#0a64d8;color:#ffffff;}"
-  ".li.dis{color:#a1a1a6;cursor:default;}"
-  ".li.dis:hover{background:transparent;color:#a1a1a6;}"
+   ".li.dis{color:#77777c;cursor:default;}"
+   ".li.dis:hover{background:transparent;color:#77777c;}"
   /* the checkmark is drawn, not a glyph: every font has a box */
   ".ck{display:block;position:absolute;left:10px;top:6px;width:4px;height:9px;"
-  "border-right:2px solid #1d1d1f;border-bottom:2px solid #1d1d1f;transform:rotate(45deg);}"
+   "border-right:2px solid #f2f2f7;border-bottom:2px solid #f2f2f7;transform:rotate(45deg);}"
   ".li:hover .ck{border-right:2px solid #ffffff;border-bottom:2px solid #ffffff;}"
   ".kb{position:absolute;right:12px;top:0;color:#8e8e93;font-size:12px;}"
   ".li:hover .kb{color:#ffffff;}"
-  ".sep{height:1px;margin:5px 10px;background:rgba(0,0,0,0.13);}"
+   ".sep{height:1px;margin:5px 10px;background:rgba(255,255,255,0.12);}"
   ".hd{height:22px;line-height:22px;padding:0 12px;font-size:11px;"
   "font-weight:bold;color:#8e8e93;}"
   ".hud{position:absolute;left:50%;top:18px;transform:translate(-50%,0);"
   "padding:8px 16px;border-radius:10px;background:rgba(30,30,32,0.78);"
   "backdrop-filter:blur(20px);color:#ffffff;font-size:13px;white-space:nowrap;"
   "pointer-events:none;}";
+
+static const char g_keyedit_style[] =
+   "#luna-menu-backdrop{position:absolute;left:0;top:0;right:0;bottom:0;}"
+   ".kes{position:absolute;border:2px solid rgba(255,255,255,0.85);background:rgba(255,255,255,0.10);}"
+   ".kes.sel{border:2px solid #0a64d8;background:rgba(10,100,216,0.20);}"
+   ".kel{position:absolute;left:0;right:0;text-align:center;color:#ffffff;font-size:13px;font-weight:bold;}"
+   ".keb{position:absolute;width:42px;height:42px;line-height:42px;border-radius:23px;text-align:center;"
+   "background:rgba(30,30,32,0.80);border:2px solid rgba(255,255,255,0.85);color:#ffffff;font-size:13px;"
+   "font-weight:bold;white-space:nowrap;overflow:hidden;}"
+   ".keb.sel{background:#0a64d8;}"
+   ".keb.pend{background:rgba(10,100,216,0.50);}"
+   ".kebar{position:absolute;left:0;right:0;top:0;height:40px;line-height:40px;padding:0 200px 0 14px;"
+   "background:rgba(30,30,32,0.84);color:#ffffff;font-size:13px;white-space:nowrap;overflow:hidden;}"
+   ".kebtn{position:absolute;border-radius:6px;text-align:center;background:rgba(255,255,255,0.18);"
+   "color:#ffffff;font-size:13px;}"
+   ".kebtn.pri{background:#0a64d8;}";
+
+/* On-screen keymap editor state; the editor itself is beside menu_clicked. */
+static bool g_ke_open;
+static luna_kedit g_ke;
+static char g_ke_path[4096];
+static int g_ke_sel = -1;            /* button index, KE_STICK, or -1 */
+static bool g_ke_drag, g_ke_pending, g_ke_dirty;
+static float g_ke_px, g_ke_py;       /* the clicked spot waiting for a key */
+static char g_ke_msg[160];
+enum { KE_STICK = -2, KE_DOT = 46, KE_BAR_H = 40 };
+static void keyedit_publish_locked(void);
 
 static double menu_now(void)
 {
@@ -2995,6 +3052,7 @@ static int menu_sub_rows(struct menu_buf *b)
     y += menu_header(b, "KEYBOARD CONTROLS");
     y += menu_item(b, "km-off", "Off", !strcmp(current, "off"), NULL);
     y += menu_item(b, strcmp(current, "off") ? "km-reload" : NULL, "Reload Current File", false, NULL);
+      y += menu_item(b, "km-edit", "Edit Controls on Screen", false, NULL);
     y += menu_sep(b);
     y += menu_item(b, "km-up", "Parent Folder", false, "..");
     const char *base = strrchr(g_keydir, '/');
@@ -3155,6 +3213,7 @@ static int menu_sub_rows(struct menu_buf *b)
 /* Publishes the current state; g_menu_lock held. */
 static void menu_publish_locked(void)
 {
+   if (g_ke_open) { keyedit_publish_locked(); return; }
   if (!g_menu_open) {
     if (g_menu_notice[0]) {
       struct menu_buf b = { 0 };
@@ -3171,7 +3230,7 @@ static void menu_publish_locked(void)
     const int width = g_menu_w < 488 ? g_menu_w - 16 : 472;
     menu_put(&doc, "<div id=\"luna-menu-backdrop\"></div>");
     menu_putf(&doc, "<div class=\"lm\" style=\"left:%dpx;top:%dpx;width:%dpx;\">",
-              (g_menu_w - width) / 2, menu_clampi((g_menu_h - 310) / 2, 8, g_menu_h), width);
+                (g_menu_w - width) / 2, menu_clampi((g_menu_h - 400) / 2, 8, g_menu_h), width);
     menu_header(&doc, "SETTINGS — THIS APP");
     menu_item(&doc, NULL, "Resolution applies now; other changes on restart.", false, NULL);
     menu_sep(&doc);
@@ -3179,7 +3238,9 @@ static void menu_publish_locked(void)
       char id[32], value[32];
       snprintf(id, sizeof id, "setting-%zu", i);
       snprintf(value, sizeof value, "%d", g_settings[i].value);
-      menu_item(&doc, id, g_settings[i].label, false, g_settings[i].value ? value : "Automatic");
+         menu_item(&doc, id, g_settings[i].label, false,
+                   g_settings[i].names ? g_settings[i].names[g_settings[i].value]
+                   : g_settings[i].value ? value : "Automatic");
     }
     char resolution[32];
     int rw = g_menu_w, rh = g_menu_h;
@@ -3511,7 +3572,7 @@ static bool menu_conf_write(const char *key, const char *value, bool apply)
         goto done;
       }
     }
-    if (fclose(out) != 0 || rename(tmp, path) != 0) {
+      if (fclose(out) != 0 || luna_file_rename(tmp, path) != 0) {
       unlink(tmp);
       fprintf(stderr, "[menu] cannot replace %s\n", path);
     } else saved = true;
@@ -3545,6 +3606,202 @@ static bool resolution_save(int index)
     arm_exec_request_view_resize(width, height);
   }
   return saved_w && saved_h;
+}
+
+/* ---- On-screen keymap editor ---------------------------------------------
+ * Opened from Input > Edit Controls on Screen.  The game stays visible under
+ * a light tint; every binding is a marker where its touch lands.  Click an
+ * empty spot and press a key to put a button there; drag a marker (or the
+ * stick ring) to move it; select one and press a key to rebind it, Delete to
+ * remove it, [ and ] to resize the stick.  Enter saves, Esc leaves.  Pointer
+ * and keys go to this code, never to the page's HTML or the guest, so the
+ * markers are only drawn by the document. */
+
+static int ke_w(void) { return g_w > 0 ? g_w : g_menu_w > 0 ? g_menu_w : 1024; }
+static int ke_h(void) { return g_h > 0 ? g_h : g_menu_h > 0 ? g_menu_h : 576; }
+static float ke_short(void) { return (float)(ke_w() < ke_h() ? ke_w() : ke_h()); }
+
+/* Save and Cancel sit at the right of the bar; their boxes are laid out here
+ * and hit-tested against the same numbers. */
+static void ke_button_box(int which, int *x, int *y, int *w, int *h)
+{
+   *w = 84; *h = 28; *y = 6;
+   *x = ke_w() - 8 - (which == 0 ? 2 * (*w) + 8 : *w);
+}
+
+static void keyedit_publish_locked(void)
+{
+   struct menu_buf d = { 0 };
+   const int w = ke_w(), h = ke_h();
+   const float m = ke_short();
+   menu_put(&d, "<div id=\"luna-menu-backdrop\" style=\"background:rgba(0,0,0,0.22);\"></div>");
+   /* the stick: its ring is the area a drag of WASD covers */
+   {
+      const float r = g_ke.radius * m;
+      const bool sel = g_ke_sel == KE_STICK;
+      menu_putf(&d, "<div class=\"kes%s\" style=\"left:%dpx;top:%dpx;width:%dpx;height:%dpx;border-radius:%dpx;\">"
+                "<div class=\"kel\" style=\"top:%dpx;\">WASD</div></div>",
+                sel ? " sel" : "", (int)(g_ke.stick_x * w - r), (int)(g_ke.stick_y * h - r),
+                (int)(2 * r), (int)(2 * r), (int)r, (int)(r - 9));
+   }
+   for (int i = 0; i < g_ke.n; ++i) {
+      const luna_kedit_button *b = &g_ke.b[i];
+      menu_putf(&d, "<div class=\"keb%s\" style=\"left:%dpx;top:%dpx;\">", i == g_ke_sel ? " sel" : "",
+                (int)(b->x * w) - KE_DOT / 2, (int)(b->y * h) - KE_DOT / 2);
+      menu_put_text(&d, luna_key_name(b->key));
+      menu_put(&d, "</div>");
+   }
+   if (g_ke_pending)
+      menu_putf(&d, "<div class=\"keb pend\" style=\"left:%dpx;top:%dpx;\">?</div>",
+                (int)(g_ke_px * w) - KE_DOT / 2, (int)(g_ke_py * h) - KE_DOT / 2);
+   menu_put(&d, "<div class=\"kebar\">");
+   menu_put_text(&d, g_ke_msg[0] ? g_ke_msg
+                 : g_ke_pending ? "Press the key for this spot (Esc: cancel)"
+                 : g_ke_sel >= 0 ? "Press a key to rebind, Delete to remove, or drag it"
+                 : g_ke_sel == KE_STICK ? "Drag to move, [ and ] to resize"
+                 : "Click where a button is, then press its key. Drag to move. Enter saves.");
+   menu_put(&d, "</div>");
+   for (int i = 0; i < 2; ++i) {
+      int bx, by, bw, bh; ke_button_box(i, &bx, &by, &bw, &bh);
+      menu_putf(&d, "<div class=\"kebtn%s\" style=\"left:%dpx;top:%dpx;width:%dpx;height:%dpx;line-height:%dpx;\">%s</div>",
+                i == 0 ? " pri" : "", bx, by, bw, bh, bh, i == 0 ? "Save" : "Cancel");
+   }
+   luna_overlay_set_menu(d.p, g_keyedit_style, true);
+   free(d.p);
+}
+
+static void keyedit_close_locked(const char *notice)
+{
+   g_ke_open = false;
+   luna_kedit_free(&g_ke);
+   g_ke_sel = -1; g_ke_drag = g_ke_pending = false;
+   if (notice) menu_notice_locked(notice);
+   menu_publish_locked();
+}
+
+/* Where a save goes: over the file in use (its first version kept as .bak), or
+ * a new custom-N.conf beside the other keymaps when none is loaded. */
+static bool keyedit_target_locked(char *out, size_t cap)
+{
+   if (g_ke_path[0]) return snprintf(out, cap, "%s", g_ke_path) < (int)cap;
+   if (!g_keydir[0]) keyfiles_read();
+   luna_file_mkdir(g_keydir, 0755);
+   for (int i = 1; i < 1000; ++i) {
+      const int n = i > 1 ? snprintf(out, cap, "%s/custom-%d.conf", g_keydir, i)
+                          : snprintf(out, cap, "%s/custom.conf", g_keydir);
+      if (n >= (int)cap) return false;
+      FILE *f = fopen(out, "r");
+      if (!f) return true;
+      fclose(f);
+   }
+   return false;
+}
+
+static void keyedit_save_locked(void)
+{
+   char path[4096];
+   if (!keyedit_target_locked(path, sizeof path) || !luna_kedit_save(&g_ke, path)) {
+      snprintf(g_ke_msg, sizeof g_ke_msg, "Cannot save the keymap (check the walk key and stick size)");
+      fprintf(stderr, "[keyedit] save failed: %s\n", path);
+      keyedit_publish_locked();
+      return;
+   }
+   fprintf(stderr, "[keyedit] saved %d buttons to %s\n", g_ke.n, path);
+   if (luna_keymap_select(path)) menu_conf_set("LUNARIA_KEYMAP", path);
+   keyedit_close_locked("Keyboard controls saved");
+}
+
+static void keyedit_begin_locked(void)
+{
+   char path[4096]; luna_keymap_current(path, sizeof path);
+   if (!strcmp(path, "off")) path[0] = 0;
+   if (!luna_kedit_load(&g_ke, path)) {
+      menu_notice_locked("Cannot read the keymap file");
+      return;
+   }
+   snprintf(g_ke_path, sizeof g_ke_path, "%s", path);
+   g_ke_open = true;
+   g_ke_sel = -1; g_ke_drag = g_ke_pending = g_ke_dirty = false;
+   g_ke_msg[0] = 0;
+   fprintf(stderr, "[keyedit] editing %s (%d buttons)\n", path[0] ? path : "a new keymap", g_ke.n);
+}
+
+static bool keyedit_pointer(double x, double y, int action)
+{
+   pthread_mutex_lock(&g_menu_lock);
+   if (!g_ke_open) { pthread_mutex_unlock(&g_menu_lock); return false; }
+   const float fx = (float)(x / ke_w()), fy = (float)(y / ke_h());
+   bool changed = false;
+   if (action == 1) {
+      g_ke_msg[0] = 0;
+      for (int i = 0; i < 2; ++i) {
+         int bx, by, bw, bh; ke_button_box(i, &bx, &by, &bw, &bh);
+         if (x >= bx && x < bx + bw && y >= by && y < by + bh) {
+            if (i == 0) keyedit_save_locked(); else keyedit_close_locked(NULL);
+            pthread_mutex_unlock(&g_menu_lock);
+            return true;
+         }
+      }
+      int hit = -1;
+      float best = (KE_DOT / 2.f + 4) * (KE_DOT / 2.f + 4);
+      for (int i = 0; i < g_ke.n; ++i) {
+         const float dx = (float)x - g_ke.b[i].x * ke_w(), dy = (float)y - g_ke.b[i].y * ke_h();
+         if (dx * dx + dy * dy <= best) { best = dx * dx + dy * dy; hit = i; }
+      }
+      const float sr = g_ke.radius * ke_short();
+      const float sdx = (float)x - g_ke.stick_x * ke_w(), sdy = (float)y - g_ke.stick_y * ke_h();
+      if (hit < 0 && sdx * sdx + sdy * sdy <= sr * sr) hit = KE_STICK;
+      g_ke_pending = false;
+      if (hit != -1) { g_ke_sel = hit; g_ke_drag = true; }
+      else if (y >= KE_BAR_H) { g_ke_sel = -1; g_ke_pending = true; g_ke_px = fx; g_ke_py = fy; }
+      changed = true;
+   } else if (action == -1 && g_ke_drag) {
+      const float cx = fx < 0 ? 0 : fx > 1 ? 1 : fx, cy = fy < 0 ? 0 : fy > 1 ? 1 : fy;
+      if (g_ke_sel == KE_STICK) { g_ke.stick_x = cx; g_ke.stick_y = cy; }
+      else if (g_ke_sel >= 0) { g_ke.b[g_ke_sel].x = cx; g_ke.b[g_ke_sel].y = cy; }
+      g_ke_dirty = changed = true;
+   } else if (action == 0) {
+      g_ke_drag = false;
+   }
+   if (changed && g_ke_open) keyedit_publish_locked();
+   pthread_mutex_unlock(&g_menu_lock);
+   return true;
+}
+
+static bool keyedit_key(int key, int action)
+{
+   pthread_mutex_lock(&g_menu_lock);
+   if (!g_ke_open) { pthread_mutex_unlock(&g_menu_lock); return false; }
+   if (action != 1) { pthread_mutex_unlock(&g_menu_lock); return true; }   /* GLFW_PRESS only */
+   g_ke_msg[0] = 0;
+   if (key == 256) {                                   /* Esc */
+      if (g_ke_pending || g_ke_sel != -1) { g_ke_pending = false; g_ke_sel = -1; }
+      else { keyedit_close_locked(NULL); pthread_mutex_unlock(&g_menu_lock); return true; }
+   } else if (key == 257 || key == 335) {              /* Enter */
+      keyedit_save_locked();
+      pthread_mutex_unlock(&g_menu_lock);
+      return true;
+   } else if ((key == 261 || key == 259) && g_ke_sel >= 0) {   /* Delete, Backspace */
+      luna_kedit_remove(&g_ke, g_ke_sel);
+      g_ke_sel = -1; g_ke_dirty = true;
+   } else if ((key == 91 || key == 93) && g_ke_sel == KE_STICK) {  /* [ ] */
+      float r = g_ke.radius + (key == 93 ? .01f : -.01f);
+      g_ke.radius = r < .05f ? .05f : r > .5f ? .5f : r;
+      g_ke_dirty = true;
+   } else if (g_ke_pending || g_ke_sel >= 0) {
+      const int index = g_ke_pending ? -1 : g_ke_sel;
+      const float x = g_ke_pending ? g_ke_px : g_ke.b[g_ke_sel].x;
+      const float y = g_ke_pending ? g_ke_py : g_ke.b[g_ke_sel].y;
+      const int r = luna_kedit_set(&g_ke, index, key, x, y);
+      if (r >= 0) { g_ke_sel = r; g_ke_pending = false; g_ke_dirty = true; }
+      else snprintf(g_ke_msg, sizeof g_ke_msg, "%s",
+                    r == LUNA_KEDIT_TAKEN ? "That key is used by a walk/macro line in this file"
+                    : r == LUNA_KEDIT_FULL ? "No room for more buttons in one keymap"
+                    : "Use a letter, a digit, Space, Shift or Ctrl (WASD is the stick)");
+   }
+   keyedit_publish_locked();
+   pthread_mutex_unlock(&g_menu_lock);
+   return true;
 }
 
 static void menu_clicked(const char *id)
@@ -3648,7 +3905,8 @@ static void menu_clicked(const char *id)
       if (v->value == v->initial) continue;
       restart_required = true;
       snprintf(value, sizeof value, "%d", v->value);
-      if (menu_conf_write(v->key, v->value ? value : NULL, false)) v->initial = v->value;
+         const char *to = v->names ? v->envs[v->value] : v->value ? value : NULL;
+         if (menu_conf_write(v->key, to, false)) v->initial = v->value;
       else saved = false;
     }
     if (g_resolution_dirty) {
@@ -3765,6 +4023,9 @@ static void menu_clicked(const char *id)
         keep_open = true;
       }
     } else keep_open = true;
+   } else if (!strcmp(id, "km-edit")) {
+      keyedit_begin_locked();
+      keep_open = !g_ke_open;
   } else if (!strcmp(id, "km-off") || !strcmp(id, "km-reload")) {
     char path[4096];
     luna_keymap_current(path, sizeof path);
@@ -3878,10 +4139,109 @@ static void menu_clicked(const char *id)
   pthread_mutex_unlock(&g_menu_lock);
 }
 
+/* LUNARIA_DBG_SETTINGS=S: S seconds in, open Settings and step the Frame
+ * hand-off and ASTC rows once each (nothing is saved; Cancel 20 s later), so
+ * a headless run can photograph the panel. */
+static void settings_selftest_tick(void)
+{
+   static int stage = -1;
+   static double t0;
+   if (stage == -1) {
+      const char *e = getenv("LUNARIA_DBG_SETTINGS");
+      stage = e && atoi(e) > 0 ? 0 : 99;
+      t0 = menu_now() + (e ? atoi(e) : 0);
+      return;
+   }
+   if (stage >= 99 || menu_now() < t0 + (stage ? 20 : 0)) return;
+   if (stage == 0) {
+      luna_menu_open(20, 20, ke_w(), ke_h());
+      menu_clicked("luna-menu-settings");
+      for (size_t i = 0; i < sizeof g_settings / sizeof g_settings[0]; ++i)
+         if (!strcmp(g_settings[i].key, "LUNARIA_COMP_SHARE") || !strcmp(g_settings[i].key, "LUNARIA_ASTC")) {
+            char id[48]; snprintf(id, sizeof id, "luna-menu-setting-%zu", i);
+            menu_clicked(id);
+            fprintf(stderr, "[settings-test] %s -> %s\n", g_settings[i].label, g_settings[i].names[g_settings[i].value]);
+         }
+      stage = 1;
+   } else {
+      menu_clicked("luna-menu-settings-cancel");
+      fprintf(stderr, "[settings-test] cancelled, settings open=%d\n", (int)g_settings_open);
+      stage = 99;
+   }
+}
+
+/* LUNARIA_DBG_KEYEDIT=S: S seconds after the first menu tick, drive the
+ * keymap editor through luna_overlay_pointer / luna_overlay_host_key exactly
+ * as the window's input would (add J, drag the stick, add K, save 26 s
+ * later), so a headless run can photograph it with LUNARIA_COMP_SHOT_S and
+ * check the file it wrote. */
+static void keyedit_selftest_tick(void)
+{
+   static int stage = -1;
+   static double t0;
+   if (stage == -1) {
+      const char *e = getenv("LUNARIA_DBG_KEYEDIT");
+      stage = e && atoi(e) > 0 ? 0 : 99;
+      t0 = menu_now() + (e ? atoi(e) : 0);
+      return;
+   }
+   if (stage >= 99) return;
+   const double t = menu_now() - t0, w = ke_w(), h = ke_h();
+   if (t < stage) return;
+   switch (stage) {
+   case 0:
+      menu_clicked("luna-menu-km-edit");
+      fprintf(stderr, "[keyedit-test] editor open=%d size %dx%d\n", (int)g_ke_open, (int)w, (int)h);
+      break;
+   case 1:
+      luna_overlay_pointer(w * .60, h * .40, 1);
+      luna_overlay_pointer(w * .60, h * .40, 0);
+      break;
+   case 2:
+      luna_overlay_host_key('J', 1, 0);
+      luna_overlay_host_key('J', 0, 0);
+      break;
+   case 3: {
+      pthread_mutex_lock(&g_menu_lock);
+      const double sx = g_ke.stick_x * w, sy = g_ke.stick_y * h;
+      pthread_mutex_unlock(&g_menu_lock);
+      luna_overlay_pointer(sx, sy, 1);
+      luna_overlay_pointer(sx + w * .05, sy - h * .03, -1);
+      luna_overlay_pointer(w * .22, h * .70, -1);
+      luna_overlay_pointer(w * .22, h * .70, 0);
+      break;
+   }
+   case 4:
+      luna_overlay_pointer(w * .78, h * .62, 1);
+      luna_overlay_pointer(w * .78, h * .62, 0);
+      luna_overlay_host_key('K', 1, 0);
+      luna_overlay_host_key('K', 0, 0);
+      pthread_mutex_lock(&g_menu_lock);
+      fprintf(stderr, "[keyedit-test] %d buttons, stick %.3f,%.3f r %.3f\n", g_ke.n, g_ke.stick_x, g_ke.stick_y, g_ke.radius);
+      pthread_mutex_unlock(&g_menu_lock);
+      stage = 29;   /* hold the editor up for the screenshots, then save */
+      return;
+   case 30: {
+      luna_overlay_host_key(257, 1, 0);
+      char path[4096]; luna_keymap_current(path, sizeof path);
+      fprintf(stderr, "[keyedit-test] after Enter: editor open=%d, keymap now %s\n", (int)g_ke_open, path);
+      FILE *f = fopen(path, "r");
+      char line[256];
+      while (f && fgets(line, sizeof line, f)) fprintf(stderr, "[keyedit-test]   %s", line);
+      if (f) fclose(f);
+      stage = 99;
+      return;
+   }
+   default: break;
+   }
+   ++stage;
+}
+
 void luna_menu_open(double x, double y, int w, int h)
 {
   luna_overlay_set_menu_handler(menu_clicked);
   pthread_mutex_lock(&g_menu_lock);
+   if (g_ke_open) { pthread_mutex_unlock(&g_menu_lock); return; }   /* the editor is up */
   g_menu_open = true;
   g_settings_open = false;
   g_menu_sub = SUB_NONE;
@@ -3905,6 +4265,8 @@ void luna_menu_close(void)
 
 void luna_menu_tick(void)
 {
+   keyedit_selftest_tick();
+   settings_selftest_tick();
   pthread_mutex_lock(&g_menu_lock);
   if (g_menu_notice[0] && menu_now() >= g_menu_notice_until) {
     g_menu_notice[0] = '\0';
@@ -3914,17 +4276,20 @@ void luna_menu_tick(void)
 }
 
 /* No editable host menu fields currently consume keyboard input. */
+/* Only the on-screen keymap editor takes host keys: while it is up every key
+ * is its own and none reaches the guest. */
 bool luna_overlay_host_char(uint32_t cp)
 {
   (void)cp;
-  return false;
+   pthread_mutex_lock(&g_menu_lock);
+   const bool open = g_ke_open;
+   pthread_mutex_unlock(&g_menu_lock);
+   return open;
 }
 bool luna_overlay_host_key(int key, int action, int mods)
 {
-  (void)key;
-  (void)action;
-  (void)mods;
-  return false;
+   (void)mods;
+   return keyedit_key(key, action);
 }
 
 /* Share the actual selected faces with native Android font consumers. */

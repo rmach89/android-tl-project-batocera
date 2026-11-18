@@ -536,7 +536,7 @@ Limits: one controller at a time; a controller plugged in after launch is listed
 
 ## Touchscreen
 
-On a touchscreen (a touch laptop or monitor, Steam Deck, a Linux tablet), fingers reach the game as Android multi-touch, up to ten at once. The first finger also works the emulator's own menus and dialogs and the edge swipe for Back, like the mouse. Touches come from XInput 2.2 on X11 (including Steam Deck Game Mode), `wl_touch` on Wayland and `WM_TOUCH` on Windows. While touch input is attached, the system does not also turn fingers into mouse clicks. `LUNARIA_TOUCHSCREEN=off` turns it off. On X11 it needs `libXi.so.6`, which desktop installs ship.
+On a touchscreen (a touch laptop or monitor, Steam Deck, a Linux tablet), fingers reach the game as Android multi-touch, up to seven at once. The first finger also works the emulator's own menus and dialogs and the edge swipe for Back, like the mouse. Touches come from XInput 2.2 on X11 (including Steam Deck Game Mode), `wl_touch` on Wayland and `WM_TOUCH` on Windows. While touch input is attached, the system does not also turn fingers into mouse clicks. `LUNARIA_TOUCHSCREEN=off` turns it off. On X11 it needs `libXi.so.6`, which desktop installs ship.
 
 ## Capture frames
 

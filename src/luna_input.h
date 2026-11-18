@@ -15,7 +15,7 @@ extern "C" {
 #define LUNA_PAD_AXES 10   /* X Y Z RZ HAT_X HAT_Y LTRIGGER RTRIGGER GAS BRAKE */
 #define LUNA_TOUCH_MAX 10
 #define LUNA_HOST_TOUCH_ID 20
-#define LUNA_HOST_FINGERS 10   /* the first finger, then ids 20-28 */
+#define LUNA_HOST_FINGERS 7    /* the first finger, then ids 20-25 */
 typedef struct luna_touch_point { int id; float x, y; } luna_touch_point;
 typedef struct luna_touch_event {
     int action;
@@ -104,8 +104,9 @@ typedef struct luna_pad_event {
 #define LUNA_PAD_BUTTONS 17
 /* Touch contact ids (Android pointer ids, 0-31): 0 the mouse or the first
  * finger on a real touchscreen, 1 the keymap joystick, 2-18 keymap buttons
- * and macros, 19 the right stick's camera drag, 20-28 further fingers on a
- * touchscreen, 29 the wheel slide, 30-31 the Ctrl+wheel pinch. */
+ * and macros, 19 the right stick's camera drag, 20-25 further fingers on a
+ * touchscreen, 26-28 mouse look (F8), 29 the wheel slide, 30-31 the
+ * Ctrl+wheel pinch. */
 #define LUNA_LOOK_ID 19
 #define LUNA_KEY_POINTS 4      /* contacts one key can press at the same time */
 #define LUNA_KEYMAP_MACROS 8
@@ -167,6 +168,37 @@ void luna_keymap_release(luna_keymap *, float width, float height, luna_keymap_e
  * "look".  Returns 0 when the keymap does not use that stick. */
 int luna_keymap_axis(luna_keymap *, int stick, float x, float y, float width, float height,
                      luna_keymap_emit, void *);
+
+/* Editing a keymap file: the stick and plain one-point buttons are modelled,
+ * every other line is kept verbatim in its place (see luna_input.c). */
+/* One-point buttons the editor places: the contact ids keymaps own (2-18). */
+#define LUNA_KEDIT_MAX (LUNA_LOOK_ID - 2)
+enum { LUNA_KEDIT_KEEP = -1, LUNA_KEDIT_STICK = -2 };
+enum { LUNA_KEDIT_BADKEY = -1, LUNA_KEDIT_TAKEN = -2, LUNA_KEDIT_FULL = -3 };
+typedef struct luna_kedit_button { int key, origin; float x, y; } luna_kedit_button;
+typedef struct luna_kedit {
+    float stick_x, stick_y, radius;
+    int has_stick, n, kept_buttons, nreserved, nlines, cap_lines;
+    luna_kedit_button b[LUNA_KEDIT_MAX];
+    int reserved[32];          /* keys owned by kept lines (walk, macros, ...) */
+    char **lines;
+    int *tags;                 /* LUNA_KEDIT_KEEP / _STICK / button origin */
+} luna_kedit;
+/* NULL, "" or "off" starts an empty keymap with a default stick. */
+int luna_kedit_load(luna_kedit *, const char *path);
+int luna_kedit_find(const luna_kedit *, int key);
+/* index -1 adds (or moves the button already on that key); otherwise rebinds
+ * button `index`, dropping any other button on the key.  Returns the index or
+ * LUNA_KEDIT_BADKEY / _TAKEN / _FULL. */
+int luna_kedit_set(luna_kedit *, int index, int key, float x, float y);
+void luna_kedit_remove(luna_kedit *, int index);
+/* Writes path (first save keeps the old file as path.bak); only a file that
+ * luna_keymap_load accepts replaces it. */
+int luna_kedit_save(const luna_kedit *, const char *path);
+void luna_kedit_free(luna_kedit *);
+/* Keymap name of a GLFW key code ("A", "7", "SPACE", ...) or NULL. */
+const char *luna_key_name(int code);
+int luna_key_normalize(int code);
 
 /* Everything that happens on a clock rather than a key event: repeat taps,
  * macro steps and the replay of a recording.  Call it regularly from the

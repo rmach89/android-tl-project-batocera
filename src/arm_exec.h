@@ -160,7 +160,7 @@ static inline unsigned luna_pcm_mix(struct luna_pcm_queue *q, int32_t *mix, unsi
  * dvm_runtime.c) all include this one already.
  *
  * Env (all optional):
- *   LUNARIA_MEM_TOTAL_MB      — total RAM advertised (default 6144 = 6 GiB)
+ *   LUNARIA_MEM_TOTAL_MB      — total RAM advertised (default 3/8 of the PC, 2-6 GiB)
  *   LUNARIA_MEM_AVAIL_MB      — available RAM (default ~5/6 of total)
  *   LUNARIA_MEM_THRESHOLD_MB  — low-memory threshold (default 48)
  *   LUNARIA_MEM_FREE_MB       — MemFree in /proc/meminfo (default ~2/3 avail)
@@ -189,10 +189,37 @@ static inline uint32_t lunaria_env_u32(const char *name, uint32_t def)
   return end != e && value <= UINT32_MAX ? (uint32_t)value : def;
 }
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+int luna_os_mem_info(uint64_t *total_bytes, uint64_t *avail_bytes);
+#ifdef __cplusplus
+}
+#endif
+
+/* With no LUNARIA_MEM_TOTAL_MB, advertise 3/8 of this PC's RAM, 2-6 GiB in
+ * 512 MiB steps.  A flat 6 GiB made Unity size its heaps and caches for a
+ * phone with 6 GiB to spare: Last Day on Earth took 4.5 GB of an 8 GB laptop,
+ * the PC swapped, and the game froze for seconds at a time and drew nothing.
+ * 8 GB -> 3 GiB, 16 GB and up -> the old 6 GiB. */
+static inline long lunaria_mem_default_mb(void)
+{
+    static long cached;
+    if (cached) return cached;
+    uint64_t total = 0;
+    long mb = 6144;
+    if (luna_os_mem_info(&total, NULL) == 0 && total) {
+        mb = (long)((total >> 20) * 3 / 8) & ~511L;
+        if (mb < 2048) mb = 2048;
+        if (mb > 6144) mb = 6144;
+    }
+    return cached = mb;
+}
+
 /* Clamp phone-class totals into a sane range for the emulator. */
 static inline long lunaria_mem_total_mb(void)
 {
-  long mb = lunaria_env_long("LUNARIA_MEM_TOTAL_MB", 6144);
+    long mb = lunaria_env_long("LUNARIA_MEM_TOTAL_MB", lunaria_mem_default_mb());
   if (mb < 512)
     mb = 512;
   if (mb > 16384)
@@ -508,6 +535,9 @@ void arm_exec_audio_output_params(int32_t *frames_per_buffer, int32_t *rate);
 /* The package version from the <manifest> element (PackageInfo.versionCode /
  * versionName).  Never yields 0 or NULL — see the definition. */
 void arm_exec_apk_version(int32_t *code, const char **name);
+/* versionCode / versionName of an APK file on the host (1 = code, 2 = name). */
+int arm_exec_apk_file_version(const char *apk, int32_t *code,
+                              char *name, size_t name_size);
 /* Who this process is, as Android would answer it.
  *
  * One process has one pid and one uid, and every API that reports them has to
@@ -809,6 +839,12 @@ uint32_t  arm_exec_input_queue_handle(void);
 void  arm_exec_clipboard_set(const char *utf8);
 char *arm_exec_clipboard_get(void);
 
+/* View.requestPointerCapture / releasePointerCapture: the guest wants the
+ * mouse locked to the window (a first-person camera).  The host hides the
+ * cursor and turns relative motion into a held finger.  Any thread. */
+void arm_exec_pointer_capture(int on);
+int  arm_exec_pointer_captured(void);
+
 /* Returns 1 if the GLFW window close button was pressed, 0 otherwise. */
 int arm_exec_glfw_should_close(void);
 void arm_exec_request_quit(void);
@@ -1083,6 +1119,10 @@ void arm_exec_log_guest_chain(const char *tag);
 /* Presents the guest itself drove through the EGL bridge.  The pump loop
  * watches this to notice that the guest has stopped producing frames. */
 uint64_t arm_exec_guest_swap_count(void);
+/* The guest's frame times since the last call (and resets them): median,
+ * 99th percentile and worst in ms, frames over 33 ms and over 50 ms.
+ * Returns how many frames, 0 for none. */
+int arm_exec_frame_times(double *p50, double *p99, double *worst, int *over33, int *over50);
 
 /*
  * Host calls: a guest-callable entry point for a host function, without an

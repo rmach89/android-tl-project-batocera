@@ -854,6 +854,7 @@ static const struct rt_method rt_array_list[]= {
   M("addAll","(Ljava/util/Collection;)Z",array_list_add_all),M("addAll","(ILjava/util/Collection;)Z",array_list_add_all),
   M("removeAll","(Ljava/util/Collection;)Z",array_list_remove_all),M("retainAll","(Ljava/util/Collection;)Z",array_list_remove_all),
   M("forEach","(Ljava/util/function/Consumer;)V",array_list_function),
+   M("stream","()Ljava/util/stream/Stream;",coll_stream),
   M("replaceAll","(Ljava/util/function/UnaryOperator;)V",array_list_function),
   M("removeIf","(Ljava/util/function/Predicate;)Z",array_list_function),
   M("sort","(Ljava/util/Comparator;)V",array_list_sort),
@@ -1179,7 +1180,7 @@ static bool pm_query_activities(struct dvm *vm, dvm_ref intent, int flags,
   const char *name=cc.l ? dvm_string_utf8(vm,cc.l) : NULL;
   if (self && *self && (!wanted || !strcmp(wanted,self)) &&
       !pm_activity_candidates(vm,intent,flags,list,self,name,
-        getenv("ANDROID_ACTIVITIES"),getenv("ANDROID_ACTIVITY_FILTERS"),true)) return false;
+        luna_env_long("ANDROID_ACTIVITIES"),luna_env_long("ANDROID_ACTIVITY_FILTERS"),true)) return false;
   size_t count=lunaria_android_package_count();
   for (size_t i=0;i<count;++i) {
     struct lunaria_android_package record;

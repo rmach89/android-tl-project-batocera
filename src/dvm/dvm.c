@@ -1395,13 +1395,21 @@ void dvm__throw(struct dvm *vm, const char *class_name, const char *fmt, ...)
 
   if (g_throw_want_stack && vm) {
     g_throw_want_stack = false;
+      const size_t room = luna_os_stack_remaining();
+      fprintf(stderr, "[dvm]   sample throw: %s \"%s\", java depth %d, host stack left %s%zu KB\n",
+              class_name, msg, vm->depth, room == SIZE_MAX ? "unknown " : "",
+              room == SIZE_MAX ? (size_t)0 : room / 1024);
+      /* Walk the live frame chain, not vm->callstack: that array keeps only
+       * the OUTERMOST frames once it is full, so a 5557-deep recursion printed
+       * its first ten callers with no repeats and read as "not a loop". */
     fprintf(stderr, "[dvm]   the loop, innermost first:\n");
-    for (int i = vm->ncallstack - 1, shown = 0; i >= 0 && shown < 10;
-         --i, ++shown) {
-      const struct dvm_method *f = vm->callstack[i];
-      if (!f) continue;
-      fprintf(stderr, "[dvm]     #%d %s.%s%s\n", shown,
-              f->cls ? f->cls->name : "?", f->name, f->sig ? f->sig : "");
+      int shown = 0;
+      for (const struct dvm_call_frame *f = vm->invoke_frame; f && shown < 10;
+           f = f->previous) {
+         const struct dvm_method *fm = f->method;
+         if (!fm) continue;
+         fprintf(stderr, "[dvm]     #%d %s.%s%s\n", shown++,
+                 fm->cls ? fm->cls->name : "?", fm->name, fm->sig ? fm->sig : "");
     }
   }
 
@@ -5728,6 +5736,7 @@ bool dvm_main_work_due(struct dvm *vm)
  *
  * The pump's frame is this emulator's main-thread loop, so this belongs in it
  * next to the other things a device's main thread does every turn. */
+void dvm_deliver_inbox_url(struct dvm *vm);
 void dvm_main_looper_tick(struct dvm *vm)
 {
   /* Not only when a message is pending: input the emulator's own windows
@@ -5763,6 +5772,7 @@ void dvm_main_looper_tick(struct dvm *vm)
   const dvm_ref saved_looper = g_current_looper;
   g_current_looper = 0;
   dvm__network_tick(vm);
+  dvm_deliver_inbox_url(vm);
   unsigned native_depth=dvm_gil_unlock_all(vm);
   const int native_events=arm_exec_alooper_dispatch_main();
   dvm_gil_relock(vm,native_depth);
@@ -6047,6 +6057,35 @@ static void dvm_waitdump(int sig)
 }
 #endif
 
+/* Signals for parked Java threads (arm_exec_dvm_take_signals).  The waits
+ * below re-check after every wake-up, take any signal with g_gil.m released,
+ * and go back to waiting with the same deadline: on Android a signal runs its
+ * handler and the interrupted wait carries on. */
+extern int arm_exec_dvm_signal_pending(void) __attribute__((weak));
+extern int arm_exec_dvm_take_signals(void) __attribute__((weak));
+
+static bool dvm_sig_pending(void)
+{
+   return arm_exec_dvm_signal_pending && arm_exec_dvm_signal_pending();
+}
+
+/* Called with g_gil.m held; returns with it held. */
+static void dvm_sig_take_unlocked(void)
+{
+   pthread_mutex_unlock(&g_gil.m);
+   if (arm_exec_dvm_take_signals) (void)arm_exec_dvm_take_signals();
+   pthread_mutex_lock(&g_gil.m);
+}
+
+void dvm_signal_kick(void)
+{
+   pthread_mutex_lock(&g_gil.m);
+   pthread_cond_broadcast(&g_gil_change);
+   for (struct dvm_event_waiter *w = g_event_waiters; w; w = w->next)
+      pthread_cond_signal(&w->cv);
+   pthread_mutex_unlock(&g_gil.m);
+}
+
 void dvm_gil_notify(void)
 {
   pthread_mutex_lock(&g_gil.m);
@@ -6311,6 +6350,7 @@ void dvm_gil_wait(struct dvm *vm, unsigned ms)
   }
   pthread_mutex_lock(&g_gil.m);
   while (g_gil_change_seq == seen && !dvm_is_stopping(vm)) {
+      if (dvm_sig_pending()) { dvm_sig_take_unlocked(); continue; }
     int rc = pthread_cond_timedwait(&g_gil_change, &g_gil.m, &ts);
     if (rc != 0) break;
   }
@@ -6399,6 +6439,7 @@ static void gil_wait_channel(struct dvm *vm, uintptr_t channel, uint64_t ns,bool
 
   pthread_mutex_lock(&g_gil.m);
   while (!w.ready && !dvm_is_stopping(vm)) {
+      if (dvm_sig_pending()) { dvm_sig_take_unlocked(); continue; }
     int rc = ns == UINT64_MAX ? pthread_cond_wait(&w.cv, &g_gil.m)
              : pthread_cond_timedwait(&w.cv, &g_gil.m, &ts);
     if (rc != 0) break;

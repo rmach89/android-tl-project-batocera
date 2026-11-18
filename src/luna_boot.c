@@ -43,6 +43,7 @@
 #include <time.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <shobjidl.h>
 #else
 #include <unistd.h>
 #endif
@@ -1177,6 +1178,7 @@ static void pick_select_label(size_t i)
 
 static void pick_select_close(int panel)
 {
+    luna_remove_class(panel, "open");
   luna_add_class(panel, "hidden");
   luna_update_element_style(panel);
   luna_pop_focus_trap(panel);
@@ -1223,6 +1225,9 @@ static void pick_select_toggle(LunaElement *element)
     snprintf(style, sizeof style, "max-height:%.0fpx;overflow:auto;", available > 44 ? available : 44);
     luna_dom_set_attr(panel, "style", style);
     luna_remove_class(panel, "hidden");
+        /* .open carries the drop-in animation; a fresh class each time is what
+         * restarts the keyframes (an unchanged animation keeps its old clock). */
+        luna_add_class(panel, "open");
     luna_update_element_style(panel);
     snprintf(id, sizeof id, "set%zu", i);
     luna_dom_set_attr(luna_get_element_by_id(id), "aria-expanded", "true");
@@ -1255,10 +1260,9 @@ static void pick_select_option(LunaElement *element)
   }
 }
 
-static void pick_continue(LunaElement *element) {
-  (void)element;
-  pick_chosen = 1;
-}
+static void pick_continue(LunaElement *element) { (void)element; pick_chosen = 1; }
+static int pick_google;
+static void pick_google_click(LunaElement *element) { (void)element; pick_google = 1; }
 
 static void pick_dialog_done(const LunaFileDialogResult *result, void *userdata)
 {
@@ -1268,6 +1272,124 @@ static void pick_dialog_done(const LunaFileDialogResult *result, void *userdata)
   if (pick_folder_for >= 0) snprintf(pick_folder, sizeof pick_folder, "%s", result->paths[0]);
   else snprintf(dropped, sizeof dropped, "%s", result->paths[0]);
 }
+
+#ifdef _WIN32
+/* Windows: the system Open / Select Folder dialog instead of the built-in
+ * one (players reported its Browse buttons doing nothing).  It runs on its own
+ * thread so the launcher keeps drawing; the picker loop collects the answer
+ * through win_pick_poll().  ole32/shell32 are loaded at run time, so the link
+ * line does not change.  LUNARIA_BUILTIN_FILE_DIALOG=1 keeps the old dialog. */
+static const GUID win_clsid_file_open = {0xDC1C5A9C,0xE88A,0x4DDE,{0xA5,0xA1,0x60,0xF8,0x2A,0x20,0xAE,0xF7}};
+static const GUID win_iid_file_open = {0xD57C7288,0xD4AD,0x4768,{0xBE,0x02,0x9D,0x96,0x95,0x32,0xD9,0x60}};
+static const GUID win_iid_shell_item = {0x43826D1E,0xE718,0x42EE,{0xBC,0x55,0xA1,0xE2,0x61,0xC3,0x7B,0xFE}};
+static atomic_int win_pick_state;         /* 0 idle, 1 dialog open, 2 answer ready */
+static int win_pick_folder_mode;
+static wchar_t win_pick_title[256], win_pick_initial[4096];
+static HWND win_pick_owner;
+static char win_pick_result[4096];
+
+static DWORD WINAPI win_pick_thread(LPVOID unused)
+{
+    (void)unused;
+    win_pick_result[0] = 0;
+    typedef HRESULT (WINAPI *init_fn)(LPVOID, DWORD);
+    typedef void (WINAPI *uninit_fn)(void);
+    typedef HRESULT (WINAPI *create_fn)(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID *);
+    typedef void (WINAPI *free_fn)(LPVOID);
+    typedef HRESULT (WINAPI *item_fn)(PCWSTR, void *, REFIID, void **);
+    HMODULE ole = LoadLibraryA("ole32.dll"), shell = LoadLibraryA("shell32.dll");
+    init_fn co_init = ole ? (init_fn)(void *)GetProcAddress(ole, "CoInitializeEx") : NULL;
+    uninit_fn co_uninit = ole ? (uninit_fn)(void *)GetProcAddress(ole, "CoUninitialize") : NULL;
+    create_fn co_create = ole ? (create_fn)(void *)GetProcAddress(ole, "CoCreateInstance") : NULL;
+    free_fn co_free = ole ? (free_fn)(void *)GetProcAddress(ole, "CoTaskMemFree") : NULL;
+    item_fn item_from_path = shell ? (item_fn)(void *)GetProcAddress(shell, "SHCreateItemFromParsingName") : NULL;
+    IFileOpenDialog *dialog = NULL;
+    if (co_init && co_uninit && co_create && co_free &&
+        SUCCEEDED(co_init(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE))) {
+        if (SUCCEEDED(co_create(&win_clsid_file_open, NULL, CLSCTX_INPROC_SERVER,
+                                &win_iid_file_open, (void **)&dialog)) && dialog) {
+            FILEOPENDIALOGOPTIONS options = 0;
+            dialog->lpVtbl->GetOptions(dialog, &options);
+            options |= FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST |
+                       (win_pick_folder_mode ? FOS_PICKFOLDERS : FOS_FILEMUSTEXIST);
+            dialog->lpVtbl->SetOptions(dialog, options);
+            if (win_pick_title[0]) dialog->lpVtbl->SetTitle(dialog, win_pick_title);
+            if (!win_pick_folder_mode) {
+                COMDLG_FILTERSPEC types[] = {
+                    { L"Android packages", L"*.apk;*.xapk;*.apks;*.apkm;*.aab;*.so" },
+                    { L"All files", L"*.*" },
+                };
+                dialog->lpVtbl->SetFileTypes(dialog, 2, types);
+            }
+            IShellItem *start = NULL;
+            if (win_pick_initial[0] && item_from_path &&
+                SUCCEEDED(item_from_path(win_pick_initial, NULL, &win_iid_shell_item, (void **)&start)) && start) {
+                dialog->lpVtbl->SetFolder(dialog, start);
+                start->lpVtbl->Release(start);
+            }
+            IShellItem *chosen = NULL;
+            if (SUCCEEDED(dialog->lpVtbl->Show(dialog, win_pick_owner)) &&
+                SUCCEEDED(dialog->lpVtbl->GetResult(dialog, &chosen)) && chosen) {
+                PWSTR path = NULL;
+                if (SUCCEEDED(chosen->lpVtbl->GetDisplayName(chosen, SIGDN_FILESYSPATH, &path)) && path) {
+                    if (!WideCharToMultiByte(CP_UTF8, 0, path, -1, win_pick_result,
+                                             (int)sizeof win_pick_result, NULL, NULL))
+                        win_pick_result[0] = 0;
+                    co_free(path);
+                }
+                chosen->lpVtbl->Release(chosen);
+            }
+            dialog->lpVtbl->Release(dialog);
+        }
+        co_uninit();
+    }
+    if (!dialog) fprintf(stderr, "[apk-ui] Windows file dialog unavailable; using the built-in one\n");
+    atomic_store(&win_pick_state, dialog ? 2 : 3);
+    return 0;
+}
+
+/* 1 = the Windows dialog is handling it (or already open), 0 = use built-in. */
+static int win_pick_open(int folder, const char *title, const char *initial)
+{
+    const char *builtin = getenv("LUNARIA_BUILTIN_FILE_DIALOG");
+    if (builtin && builtin[0] && builtin[0] != '0') return 0;
+    int idle = 0;
+    if (!atomic_compare_exchange_strong(&win_pick_state, &idle, 1)) return 1;
+    win_pick_folder_mode = folder;
+    win_pick_title[0] = win_pick_initial[0] = 0;
+    if (title) MultiByteToWideChar(CP_UTF8, 0, title, -1, win_pick_title, 256);
+    win_pick_title[255] = 0;
+    if (initial && initial[0]) {
+        MultiByteToWideChar(CP_UTF8, 0, initial, -1, win_pick_initial, 4096);
+        win_pick_initial[4095] = 0;
+        for (wchar_t *c = win_pick_initial; *c; ++c) if (*c == L'/') *c = L'\\';
+    }
+    win_pick_owner = GetActiveWindow();
+    HANDLE thread = CreateThread(NULL, 0, win_pick_thread, NULL, 0, NULL);
+    if (!thread) { atomic_store(&win_pick_state, 0); return 0; }
+    CloseHandle(thread);
+    fprintf(stderr, "[apk-ui] Windows %s dialog opened\n", folder ? "folder" : "file");
+    return 1;
+}
+static void pick_open_dialog(int field);
+/* Called every frame of the picker loop. */
+static void win_pick_poll(void)
+{
+    int state = atomic_load(&win_pick_state);
+    if (state == 3) {           /* COM failed: fall back to the built-in dialog */
+        atomic_store(&win_pick_state, 4);
+        pick_open_dialog(pick_folder_for);
+        atomic_store(&win_pick_state, 0);
+        return;
+    }
+    if (state != 2) return;
+    if (win_pick_result[0]) {
+        if (pick_folder_for >= 0) snprintf(pick_folder, sizeof pick_folder, "%s", win_pick_result);
+        else snprintf(dropped, sizeof dropped, "%s", win_pick_result);
+    } else pick_folder_for = -1;
+    atomic_store(&win_pick_state, 0);
+}
+#endif
 
 static void pick_open_dialog(int field)
 {
@@ -1293,8 +1415,20 @@ static void pick_open_dialog(int field)
     config.title = "Open an application";
     config.initial_path = start[0] ? start : NULL;
     config.filter_name = "Android packages";
-    config.filter_patterns = "*.apk *.xapk *.apks *.aab *.so";
+        config.filter_patterns = "*.apk *.xapk *.apks *.apkm *.aab *.so";
   }
+#ifdef _WIN32
+    /* state 4 = the Windows dialog failed and asked for the built-in one */
+    if (atomic_load(&win_pick_state) != 4) {
+        char downloads[4096] = "";
+        const char *profile = getenv("USERPROFILE");
+        if (!config.initial_path && profile)
+            snprintf(downloads, sizeof downloads, "%s\\Downloads", profile);
+        if (win_pick_open(field >= 0, config.title,
+                          config.initial_path ? config.initial_path : downloads))
+            return;
+    }
+#endif
   if (luna_file_dialog_show(&config, pick_dialog_done, NULL) < 0)
     luna_set_text(luna_get_element_by_id("error"),
                   "Cannot open the file browser. Drop the file on this window.");
@@ -1345,7 +1479,7 @@ static int pick_clean(const char *in, char *out, size_t capacity)
 
 static int pick_acceptable(const char *path)
 {
-  static const char *const kinds[] = { ".apk", ".xapk", ".apks", ".aab", ".so" };
+    static const char *const kinds[] = { ".apk", ".xapk", ".apks", ".apkm", ".aab", ".so" };
   const size_t len = strlen(path);
   luna_file_info info;
   if (luna_file_infoat(LUNA_AT_FDCWD, path, &info, 0)) return 0;
@@ -1480,17 +1614,93 @@ static const char pick_css_extra[] =
   "#launcher-card .select_option{box-sizing:border-box;height:34px;padding:8px;cursor:pointer;}"
   "#launcher-card .select_option:hover,#launcher-card .select_option:focus{background:#e3f1fb;}"
   "#launcher-card .select-panel.hidden{display:none;}"
+    /* Aloa 15-11: the dropdown "has no animation". It drops in (or rises, when
+     * it opens upwards) and fades, and the arrow turns over while it is open. */
+    "@keyframes selectdrop{0%{opacity:0;transform:translateY(-8px);}100%{opacity:1;transform:translateY(0px);}}"
+    "@keyframes selectrise{0%{opacity:0;transform:translateY(8px);}100%{opacity:1;transform:translateY(0px);}}"
+    "#launcher-card .select-panel.open{animation:selectdrop 160ms ease-out;}"
+    "#launcher-card .select-panel.open.opens-up{animation:selectrise 160ms ease-out;}"
+    "#launcher-card .select-box[aria-expanded=true]::after{top:18px;transform:rotate(225deg);}"
+
   "#launcher-card .hint{margin:0 0 2px 0;font-size:12px;color:#6f8ca2;}"
   "#launcher-card #error{color:#c0392b;margin:10px 0 0 0;min-height:18px;font-size:13px;}"
   "#launcher-card #store-status.failed{color:#c0392b;font-size:13px;}"
   "#launcher-card .store-result{display:block;width:100%;padding:9px 12px;margin:4px 0;text-align:left;font-size:13px;}"
+    "#launcher-card button.google{display:block;width:100%;height:40px;margin:4px 0 0 0;text-align:center;cursor:pointer;}"
   "#launcher-card .hidden{display:none;}"
   "#launcher-card #store-cancel{padding:6px 12px;margin:4px 0;}"
   "#launcher-card .bar{position:absolute;left:0;right:0;bottom:0;height:68px;"
   "border-top:1px solid #d6e6f2;border-radius:0 0 16px 16px;background:rgba(255,255,255,0.97);}"
   "#launcher-card .bar .note{position:absolute;left:32px;top:25px;font-size:12px;color:#6f8ca2;}"
   "#launcher-card #continue{position:absolute;right:32px;top:13px;width:150px;height:42px;margin:0;"
-  "background:#0b8fe0;color:#ffffff;border:1px solid #0b8fe0;font-weight:700;}";
+    "background:#0b8fe0;color:#ffffff;border:1px solid #0b8fe0;font-weight:700;}"
+    /* Dark theme for the launcher page only (the boot splash keeps its sky).
+     * Later rules of equal specificity win, so this block restyles what is
+     * above without touching the layout. */
+    ":root{--sky-top:#16191e;--sky-bot:#050607;}"
+    "body{background:linear-gradient(to top,#16191e 0%,#050607 100%);}"
+    ".flake{opacity:0.25;}"
+    ".mark{color:#e8ecf0;text-shadow:none;}"
+    "#launcher-card{background:rgba(18,20,24,0.96);box-shadow:0 14px 42px rgba(0,0,0,0.6);}"
+    "#launcher-card .main{color:#e8ecf0;}"
+    "#launcher-card h1{color:#ffffff;}"
+    "#launcher-card h2,#launcher-card .sub{color:#9aa4ae;}"
+    "#launcher-card button.drop{background:#121519;border-color:#3a414a;color:#9fc9ea;}"
+    "#launcher-card button.drop:hover,#launcher-card button.drop:focus{background:#181c21;border-color:#0b8fe0;}"
+    "#launcher-card .row input,#launcher-card .cell input,#launcher-card .cell .select-box"
+    "{background:#0d0f12;color:#e8ecf0;border-color:#2c3239;}"
+    "#launcher-card button{background:#1c2026;color:#e8ecf0;border-color:#2c3239;}"
+    "#launcher-card button:hover,#launcher-card button:focus{background:#252a31;}"
+    "#launcher-card .select-box::after{border-right-color:#9aa4ae;border-bottom-color:#9aa4ae;}"
+    "#launcher-card .select-panel{background:#15181d;border-color:#2c3239;}"
+    "#launcher-card .select_option{color:#e8ecf0;}"
+    "#launcher-card .select_option[aria-selected=true],#launcher-card .select_option:hover,"
+    "#launcher-card .select_option:focus{background:#252a31;}"
+    "#launcher-card .hint,#launcher-card .bar .note{color:#8a949e;}"
+    "#launcher-card #error{color:#ff6b5b;}"
+    "#launcher-card .bar{background:rgba(14,16,19,0.98);border-top-color:#262b31;}"
+    "#launcher-card #continue{background:#0b8fe0;color:#ffffff;border-color:#0b8fe0;}"
+    /* Aloa 15-11: "the bar feels bland". It gets a lit accent edge and depth,
+     * and the controls answer the pointer: fields light their border, buttons
+     * ease their colour, Continue lifts. Last, so it wins over the dark rules. */
+    "#launcher-card .cell .select-box,#launcher-card .cell input,#launcher-card .row input"
+    "{transition:border-color 140ms,background 140ms;}"
+    "#launcher-card .cell .select-box:hover,#launcher-card .cell .select-box[aria-expanded=true],"
+    "#launcher-card .cell input:focus,#launcher-card .row input:focus{border-color:#0b8fe0;}"
+    "#launcher-card button{transition:background 140ms,border-color 140ms,transform 140ms;}"
+    "#launcher-card button.recent:hover,#launcher-card button.recent:focus{border-color:#0b8fe0;color:#ffffff;}"
+    "#launcher-card .bar{background:linear-gradient(to bottom,rgba(24,28,34,0.98) 0%,rgba(11,13,16,0.98) 100%);"
+    "border-top:1px solid rgba(11,143,224,0.45);}"
+    "#launcher-card #continue{transition:background 140ms,border-color 140ms,transform 140ms;}"
+    "#launcher-card #continue:hover,#launcher-card #continue:focus"
+    "{background:#2aa6f2;border-color:#2aa6f2;transform:translateY(-2px);}";
+
+/* "Play again": packages opened before, from lunaria-recent.txt via apk.c. */
+#define RECENT_SHOWN 8
+static char g_recent[RECENT_SHOWN][4096];
+static size_t g_recent_n;
+static char g_recent_shown[RECENT_SHOWN][4096];   /* the ones that still exist, in button order */
+static size_t g_recent_shown_n;
+
+void luna_launcher_set_recent(const char **paths, size_t count)
+{
+    g_recent_n = 0;
+    for (size_t i = 0; i < count && g_recent_n < RECENT_SHOWN; i++)
+        if (paths[i] && strlen(paths[i]) < sizeof g_recent[0])
+            strcpy(g_recent[g_recent_n++], paths[i]);
+}
+
+static void pick_recent(LunaElement *element)
+{
+    for (size_t i = 0; i < g_recent_shown_n; i++) {
+        char id[32]; snprintf(id, sizeof id, "recent%zu", i);
+        if (luna_element_at(luna_get_element_by_id(id)) == element) {
+            /* the same route as a dropped file: validated, then opened */
+            snprintf(dropped, sizeof dropped, "%s", g_recent_shown[i]);
+            return;
+        }
+    }
+}
 
 static int launcher_form(char *path, size_t capacity,
                          luna_launcher_setting *settings, size_t count,
@@ -1501,18 +1711,19 @@ static int launcher_form(char *path, size_t capacity,
   pick_settings = settings;
   pick_count = count;
   if (!use_pbuffer && window) glfwSetWindowTitle(window, "Lunaria");
-  choosing = 1;
-  pick_chosen = 0;
-  dropped[0] = 0;
-  pick_folder[0] = 0;
-  pick_folder_for = -1;
-  pick_select_for = -1;
+    choosing = 1; pick_chosen = 0; pick_google = 0; dropped[0] = 0; pick_folder[0] = 0; pick_folder_for = -1; pick_select_for = -1;
 
   /* luna-ui's file dialog is part of the document, hidden until Browse. */
   const char *dialog_html = luna_file_dialog_overlay_html();
   const char *dialog_css = luna_file_dialog_css();
-  size_t html_size = 8192 + count * 768 + strlen(dialog_html);
+    size_t html_size = 8192 + count * 768 + strlen(dialog_html) + RECENT_SHOWN * 96;
+    g_recent_shown_n = 0;
+    if (!package && !title)
+        for (size_t i = 0; i < g_recent_n; i++)
+            if (pick_acceptable(g_recent[i]))
+                strcpy(g_recent_shown[g_recent_shown_n++], g_recent[i]);
   for (size_t i = 0; i < count; ++i) {
+        if (settings[i].heading) html_size += 32 + strlen(settings[i].heading);
     if (!settings[i].choices) continue;
     for (size_t k = 0; settings[i].choices[k]; ++k) {
       size_t extra = 160 + strlen(settings[i].choices[k]);
@@ -1538,6 +1749,12 @@ static int launcher_form(char *path, size_t capacity,
                                "</div><div class=\"mark\">LUNARIA</div>"
                                "<div class=\"card\" id=\"launcher-card\"><div class=\"main\"><h1 id=\"launcher-title\"></h1>"
                                "<p class=\"sub\" id=\"launcher-sub\"></p>");
+    if (g_recent_shown_n) {
+        at += (size_t)snprintf(html + at, html_size - at, "<div class=\"lbl\">Play again</div>");
+        for (size_t i = 0; i < g_recent_shown_n; i++)
+            at += (size_t)snprintf(html + at, html_size - at,
+                "<button class=\"google recent\" id=\"recent%zu\"></button>", i);
+    }
   if (!package) {
     at += (size_t)snprintf(html + at, html_size - at,
                            "<button class=\"drop\" id=\"drop\">Drop a package file here or click to browse…</button>");
@@ -1552,14 +1769,23 @@ static int launcher_form(char *path, size_t capacity,
     for (int i=0; i<APKPURE_RESULTS; ++i)
       at += (size_t)snprintf(html + at, html_size - at,
                              "<button class=\"store-result hidden\" id=\"store-result%d\"></button>",i);
+        /* Play services only installs from a local file, which the in-game
+         * right-click menu used to be the only way to reach. */
+        at += (size_t)snprintf(html + at, html_size - at,
+            "<div class=\"lbl\">Google services</div>"
+            "<button class=\"google\" id=\"google\">Install Google services from a file…</button>"
+            "<div class=\"hint\">Some games need Google Play services. Pick the APK or XAPK once; every app can use it.</div>");
   }
   if (package || count)
     at += (size_t)snprintf(html + at, html_size - at, "<h2>%s</h2>", package ? "PROFILE" : "SETTINGS");
   for (size_t i = 0; i < count; ++i) {
+        if (settings[i].heading)
+            at += (size_t)snprintf(html + at, html_size - at, "<h2>%s</h2>", settings[i].heading);
     if (settings[i].compact) {
-      /* a run of compact settings is one row of equal columns */
+            /* a run of settings sharing one compact value is one row of equal columns */
       size_t run = 0;
-      while (i + run < count && settings[i + run].compact) ++run;
+            while (i + run < count && settings[i + run].compact == settings[i].compact &&
+                   (!run || !settings[i + run].heading)) ++run;
       at += (size_t)snprintf(html + at, html_size - at, "<div class=\"trio\">");
       for (size_t k = 0; k < run; ++k) {
         at += (size_t)snprintf(html + at, html_size - at,
@@ -1614,10 +1840,21 @@ static int launcher_form(char *path, size_t capacity,
   if (!package) {
     luna_set_on_click(luna_get_element_by_id("drop"), pick_browse);
   }
+    for (size_t i = 0; i < g_recent_shown_n; i++) {
+        char id[32], label[300];
+        snprintf(id, sizeof id, "recent%zu", i);
+        const char *name = g_recent_shown[i];
+        for (const char *p = name; *p; p++) if (*p == '/' || *p == '\\') name = p + 1;
+        snprintf(label, sizeof label, "Play  %.280s", name);
+        int node = luna_get_element_by_id(id);
+        luna_set_text(node, label);
+        luna_set_on_click(node, pick_recent);
+    }
   if (!package && !title) {
     pick_store.count=0;
     luna_set_on_click(luna_get_element_by_id("store-search"),pick_store_search);
     luna_set_on_click(luna_get_element_by_id("store-cancel"),pick_store_cancel);
+        luna_set_on_click(luna_get_element_by_id("google"),pick_google_click);
     for (int i=0; i<APKPURE_RESULTS; ++i) {
       char id[32];
       snprintf(id,sizeof id,"store-result%d",i);
@@ -1652,11 +1889,21 @@ static int launcher_form(char *path, size_t capacity,
   while (!cancelled) {
     frame(1);
     if (!package && !title) pick_store_tick();
+#ifdef _WIN32
+        win_pick_poll();
+#endif
     if (pick_folder[0] && pick_folder_for >= 0) {
       pick_set_field((size_t)pick_folder_for, pick_folder);
       pick_folder[0] = 0;
       pick_folder_for = -1;
     }
+        if (pick_google) {
+            pick_google = 0;
+            if (!package && !title && !pick_store.active && !pick_read_fields()) {
+                result = LUNA_LAUNCHER_GOOGLE;
+                break;
+            }
+        }
     if (dropped[0]) {
       snprintf(selected_path, sizeof selected_path, "%s", dropped);
       dropped[0] = 0;
@@ -1698,7 +1945,13 @@ static int launcher_form(char *path, size_t capacity,
     if (use_pbuffer) {
       luna_qfkey_wait(launcher_wait_ms);
     } else {
-      glfwWaitEventsTimeout((double)launcher_wait_ms / 1000.0);
+            /* Wait only for what is left of a 60 Hz frame.  A flat 20 ms wait
+             * came on top of the render and the vsync wait in eglSwapBuffers,
+             * so the form ran at ~45-50 fps and felt laggy (Windows, 12-11). */
+            const uint64_t spent = luna_os_monotonic_ns() - last_frame;
+            const uint64_t period = UINT64_C(16666667);
+            if (spent < period) glfwWaitEventsTimeout((double)(period - spent) / 1e9);
+            else glfwPollEvents();
     }
   }
   if (pick_store.active) {

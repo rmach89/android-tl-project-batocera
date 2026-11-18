@@ -1,0 +1,99 @@
+name: Windows smoke test (fork)
+
+# Runs a published Windows build of this fork on a GitHub Windows runner for a
+# few minutes with the repo's UnitySampleGame.apk, then uploads the log and the
+# compositor's own periodic screenshots. No GPU on the runner: D3D11 lands on
+# Windows' software adapter, so this finds crashes and missing frames, not speed.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag of this fork to test
+        required: true
+      seconds:
+        description: How long to let the game run
+        required: false
+        default: "240"
+      env:
+        description: Extra environment, K=V separated by ';'
+        required: false
+        default: ""
+      vulkan_sw:
+        description: "1 = install Mesa's software Vulkan driver (lavapipe) so the Vulkan backend runs without a GPU"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ inputs.tag }}" -R "${{ github.repository }}" -p "*windows*.zip" -D dl
+          Expand-Archive (Get-ChildItem dl\*.zip | Select-Object -First 1).FullName -DestinationPath app
+          Get-ChildItem app
+
+      - name: Software Vulkan (lavapipe)
+        if: inputs.vulkan_sw == '1'
+        shell: pwsh
+        run: |
+          C:\msys64\usr\bin\pacman.exe -Sy --noconfirm --needed mingw-w64-x86_64-mesa mingw-w64-x86_64-vulkan-loader | Out-Null
+          $icd = Get-ChildItem C:\msys64\mingw64 -Recurse -Filter "lvp_icd*.json" | Select-Object -First 1
+          if (-not $icd) { throw "no lavapipe ICD json in the mesa package" }
+          Get-Content $icd.FullName
+          # The runner is elevated, and the Vulkan loader ignores VK_DRIVER_FILES /
+          # VK_ICD_FILENAMES in an elevated process. Register it the way a real
+          # driver does instead (this runner is thrown away after the job).
+          New-Item -Force "HKLM:\SOFTWARE\Khronos\Vulkan\Drivers" | Out-Null
+          New-ItemProperty -Force -Path "HKLM:\SOFTWARE\Khronos\Vulkan\Drivers" -Name $icd.FullName -PropertyType DWord -Value 0 | Out-Null
+          # lavapipe needs its mingw64 DLLs on PATH; lunaria.exe still loads its own first (app folder wins).
+          "C:\msys64\mingw64\bin" | Add-Content $env:GITHUB_PATH
+
+      - name: Run sample game
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem app -Recurse -Filter lunaria.exe | Select-Object -First 1)
+          New-Item -ItemType Directory -Force out\shots, data | Out-Null
+          Get-CimInstance Win32_Processor | ForEach-Object { "cpu: $($_.Name), $($_.NumberOfCores) cores / $($_.NumberOfLogicalProcessors) threads" } | Tee-Object out\machine.txt
+          "ram: $([math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)) GB" | Tee-Object -Append out\machine.txt
+          $env:LUNARIA_COMP_SHOT_S = "15"
+          foreach ($kv in "${{ inputs.env }}".Split(';')) { if ($kv -match '^([^=]+)=(.*)$') { Set-Item "env:$($matches[1])" $matches[2]; "env $($matches[1])=$($matches[2])" } }
+          $env:LUNARIA_DUMP_DIR = (Resolve-Path out\shots).Path -replace '\\','/'
+          $p = Start-Process -FilePath $exe.FullName `
+                 -ArgumentList "--data-root `"$((Resolve-Path data).Path)`" `"$((Resolve-Path UnitySampleGame.apk).Path)`"" `
+                 -WorkingDirectory $exe.DirectoryName `
+                 -RedirectStandardError out\lunaria-stderr.log -RedirectStandardOutput out\lunaria-stdout.log -PassThru
+          $deadline = (Get-Date).AddSeconds([int]"${{ inputs.seconds }}")
+          $start = Get-Date; $maxCommit = 0; $maxWs = 0
+          while (-not $p.HasExited -and (Get-Date) -lt $deadline) {
+            Start-Sleep 5
+            $q = Get-Process -Id $p.Id -ErrorAction SilentlyContinue
+            if ($q) {
+              $c = [math]::Round($q.PrivateMemorySize64 / 1MB); $w = [math]::Round($q.WorkingSet64 / 1MB)
+              if ($c -gt $maxCommit) { $maxCommit = $c }; if ($w -gt $maxWs) { $maxWs = $w }
+              "t=$([int]((Get-Date) - $start).TotalSeconds)s commit=${c}MB ram=${w}MB" | Add-Content out\memory.txt
+            }
+          }
+          if ($p.HasExited) { "lunaria exited early, code $($p.ExitCode)" | Tee-Object out\result.txt }
+          else { "lunaria still running after ${{ inputs.seconds }}s" | Tee-Object out\result.txt; Get-Process lunaria -ErrorAction SilentlyContinue | Stop-Process -Force }
+          "peak commit (ram + page file charge): ${maxCommit} MB, peak ram in use: ${maxWs} MB" | Tee-Object -Append out\result.txt
+          Get-ChildItem out\shots | Measure-Object | ForEach-Object { "screenshots: $($_.Count)" } | Tee-Object -Append out\result.txt
+          $logFile = Join-Path $exe.DirectoryName 'lunaria-last-run.log'
+          if (Test-Path $logFile) { Copy-Item $logFile out\; "log file: $([math]::Round((Get-Item $logFile).Length / 1KB)) KB, stderr capture: $([math]::Round((Get-Item out\lunaria-stderr.log).Length / 1KB)) KB" | Tee-Object -Append out\result.txt }
+          else { "log file: MISSING (lunaria-last-run.log next to the exe)" | Tee-Object -Append out\result.txt }
+          Select-String -Path out\lunaria-stderr.log -Pattern "init_host_egl|fastmem|fatal|abort|crash|exception|first guest frame" |
+            Select-Object -First 60 | ForEach-Object { $_.Line } | Tee-Object out\highlights.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lunaria-smoke-${{ inputs.tag }}-${{ github.run_id }}
+          path: out

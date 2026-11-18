@@ -1119,7 +1119,7 @@ static char *pq_owner(const char *authority)
   const char *self = getenv("ANDROID_PACKAGE_NAME");
   if(self) {
     struct luna_providers providers;
-    if(!luna_providers_open(&providers,getenv("ANDROID_CONTENT_PROVIDERS"),self)) {
+    if(!luna_providers_open(&providers,luna_env_long("ANDROID_CONTENT_PROVIDERS"),self)) {
       const char *process=getenv("ANDROID_PROCESS_NAME");
       if(!process || !*process)process=self;
       bool remote=false;

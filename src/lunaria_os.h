@@ -510,6 +510,19 @@ enum {
   LUNA_PC_SYMLINK_MAX=13, LUNA_PC_CHOWN_RESTRICTED=14, LUNA_PC_NO_TRUNC=15,
   LUNA_PC_VDISABLE=16, LUNA_PC_ASYNC_IO=17, LUNA_PC_PRIO_IO=18, LUNA_PC_SYNC_IO=19
 };
+#ifdef __cplusplus
+extern "C" {
+#endif
+/* getenv() for the manifest tables (ANDROID_SERVICES, ...).  Windows caps one
+ * environment variable at 32767 characters and Play services' tables are far
+ * longer, so apk.c stores an over-long value in a file and the variable holds
+ * LUNA_ENV_FILE_PREFIX + its path; this follows it.  The result stays valid
+ * for the life of the process. */
+#define LUNA_ENV_FILE_PREFIX "@lunaria-env-file:"
+const char *luna_env_long(const char *key);
+#ifdef __cplusplus
+}
+#endif
 #ifdef _WIN32
 #define LUNA_FILE_CLOEXEC _O_NOINHERIT
 #define LUNA_FILE_SYNC 0x10000000
@@ -1607,6 +1620,18 @@ void luna_os_srand48(int32_t seed);
  * Returns NULL on failure. */
 void *luna_os_reserve(void *want, size_t len, int exact);
 
+/* Windows commits a big reservation piece by piece on first touch; the kernel
+ * does not, so a buffer handed to ReadFile/recv must be committed first.  A
+ * no-op everywhere else. */
+#ifdef _WIN32
+void luna_lazy_ensure(const void *addr, size_t len);
+/* LUNARIA_SAMPLE=MS starts a CPU sampler (debug); no-op when unset.  The two
+ * callbacks (may be NULL) report translated-code compiles and their time. */
+void luna_os_sampler_start(unsigned long long (*jit_count)(void), unsigned long long (*jit_ns)(void));
+#else
+static inline void luna_lazy_ensure(const void *addr, size_t len) { (void)addr; (void)len; }
+#endif
+
 /* Give a range back.  Safe on a sub-range of an earlier reservation. */
 int luna_os_release(void *addr, size_t len);
 
@@ -1678,6 +1703,14 @@ int luna_os_fd_path(int fd, char *buf, size_t bufsz);
  * a launcher or Finder is free to choose. */
 int luna_os_executable_path(char *buf, size_t bufsz);
 
+/* Open an http:// or https:// URL in a browser on the host desktop.
+ * LUNARIA_EXTERNAL_BROWSER picks the browser; default is the system's.
+ * Anything but http/https is refused (EINVAL). */
+/* Register `scheme` links to run `command` (%1 = the link) for this user.
+ * 0 registered, 1 another program already owns the scheme, -1 failed. */
+int luna_os_register_url_scheme(const char *scheme, const char *command);
+int luna_os_open_url(const char *url);
+
 /* True when a dynamic-loader address belongs to executable code.  Guest
  * calls need an ABI bridge; host data symbols must never receive one. */
 int luna_os_symbol_is_function(void *address);
@@ -1692,8 +1725,17 @@ const char *luna_os_library_error(void);
 /* Host launch configuration. Windows follows its CRT convention: setting
  * an empty value removes that variable. Guest environ is managed separately. */
 int luna_os_setenv(const char *name, const char *value, int overwrite);
+#ifdef _WIN32
+/* This PC's own time zone as an IANA name ("Africa/Cairo"), or NULL. */
+const char *luna_os_host_timezone(void);
+/* This PC's display language as "en-US" / "ar-EG", or NULL. */
+const char *luna_os_host_locale(void);
+#endif
 /* Remove a host launch variable without changing guest environ. */
 int luna_os_unsetenv(const char *name);
+/* Windows: call before ANGLE's Vulkan backend starts (see lunaria_windows.c).
+ * Elsewhere a no-op. Safe to call more than once and from any thread. */
+void luna_os_angle_vulkan_prepare(void);
 /* Nonblocking external command input: POSIX FIFO or Windows named pipe.
  * Windows paths use \\.\pipe\NAME. Open returns -1 on failure. */
 intptr_t luna_os_command_pipe_open(const char *path);
@@ -1972,6 +2014,11 @@ static inline void luna_timer_destroy(struct luna_posix_timers *s)
 int luna_os_mem_info(uint64_t *total_bytes, uint64_t *avail_bytes);
 /* Peak host resident memory, in Android/Linux's KiB units. */
 uint64_t luna_os_peak_rss_kb(void);
+/* One line of where the RAM is right now (Windows: working set by owner).
+ * Returns -1 and leaves out empty where the OS has no such view. */
+int luna_os_mem_breakdown(char *out, size_t out_len);
+/* This process's GPU memory (Windows: DXGI). -1 where unknown. */
+int luna_os_gpu_mem_mb(uint64_t *vram_mb, uint64_t *shared_mb, uint64_t *vram_budget_mb);
 int luna_os_disk_info(const char *path, uint64_t *total_bytes,
                       uint64_t *free_bytes, uint64_t *block_size);
 
@@ -2427,6 +2474,8 @@ int luna_process_pool_send_to_host_fds(struct luna_process_pool *,uint32_t,const
 /* Send to live hosts only, excluding the originating host. Never spawn. */
 int luna_process_pool_publish(struct luna_process_pool *,uint32_t exclude_host,const void *,size_t);
 int luna_process_pool_publish_fds(struct luna_process_pool *,uint32_t,const void *,size_t,const int *,size_t);
+/* Start the host named `name` without sending it anything (no-op if alive). */
+int luna_process_pool_warm(struct luna_process_pool *,const char *name);
 int luna_process_pool_send(struct luna_process_pool *,const char *process,
                            const void *,size_t,uint32_t *guest_pid);
 int luna_process_pool_send_fds(struct luna_process_pool *,const char *,const void *,size_t,uint32_t *,const int *,size_t);

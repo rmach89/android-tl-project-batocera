@@ -16,6 +16,7 @@
 
 #include "lunaria_os.h"
 #include "lunaria_file.h"
+#include "luna_texcache.h"
 #include "lib/inc/log_assert.h"
 #include "luna_boot.h"
 #include <algorithm>
@@ -137,6 +138,7 @@ static const uint32_t cxa_guard_abort_code64[] = {
 #include <memory>
 #include <deque>
 #include <mutex>
+#include <tuple>
 #include <condition_variable>
 #include <exception>
 #include <typeinfo>
@@ -431,6 +433,7 @@ static inline const char *android_gai_strerror(int error)
 #if defined(__APPLE__) || defined(_WIN32)
 #include <EGL/eglext_angle.h>
 #endif
+#include "luna_egl_mc.h"   /* records every eglMakeCurrent below; see the header */
 #include <GLES2/gl2.h>
 
 #include "binary128.h"
@@ -3530,6 +3533,8 @@ static const char *guest_pc_lr_str(void) {
            g_current_tid);
   return buf;
 }
+/* The crashing thread's guest position, for the Windows crash filter. */
+extern "C" const char *arm_exec_guest_state(void) { return guest_pc_lr_str(); }
 // Dump the A64 register file of the running JIT.
 static void (*g_a64_regdump)(const char *why) = nullptr;
 /* The faulting thread's guest call chain, for the same reason: a bad pointer
@@ -4418,7 +4423,12 @@ static thread_local unsigned g_guest_timezone_depth;
 extern "C" const char *arm_exec_device_timezone(void)
 {
   const char *zone = lunaria_env("LUNARIA_TIMEZONE");
-  return zone && *zone ? zone : "Asia/Tokyo";
+    if (zone && *zone) return zone;
+#ifdef _WIN32
+    /* This PC's zone; the Tokyo default predates the Windows port. */
+    if (const char *host = luna_os_host_timezone()) return host;
+#endif
+    return "Asia/Tokyo";
 }
 /* The device has one timezone for the life of the process, so install it
  * once and leave it installed. Saving the host's TZ, setting the device zone
@@ -9080,6 +9090,144 @@ static uint32_t g_watch_flag_last = 0;
 // semaphore counters keyed by guest sem_t VA
 static std::map<GuestVA, int32_t> g_sems;
 
+/* Who posted and who took a semaphore, for the one case that needs it: a
+ * thread that polls sem_getvalue forever.  Boehm's stop-the-world waits for
+ * its ack semaphore to read EXACTLY the number of threads it signalled and
+ * only resends to threads it believes have not answered, so one ack too many
+ * (or one lost) spins the collector with no signal sent and no thread
+ * waiting -- the Kefir logo hang seen 14-11 on ldoe32.  The history says which
+ * thread posted or took what; called under the execution lock. */
+struct SemEvent { GuestVA sva; uint32_t tid; int32_t delta, after; uint64_t lr; };
+static SemEvent g_sem_history[64];
+static unsigned g_sem_history_n;
+
+/* The same hang needs more than the semaphore: a stop-the-world round ends
+ * when the ack count EQUALS the number of threads signalled, so one ack that
+ * arrives after its round has ended is counted in the next one and every
+ * later round is off by one forever (16-11, n44-7: rounds start at value 1,
+ * restart acks outnumber the collector's takes). Which thread was late, and
+ * whether its signal was late or its handler was, is in the order of sends,
+ * handler entries, sigreturns, posts and takes. All of them go in this ring
+ * without printing (printing moves the timing); it is printed with the poll
+ * report. K=pthread_kill(other=target) E=handler entered R=rt_sigreturn
+ * P=post T=take; val = signal, or the semaphore value after. */
+struct GcEv { uint64_t ns; GuestVA sva; uint32_t tid, other; int32_t val; char type; };
+static GcEv g_gc_ev[4096];
+static std::atomic<uint32_t> g_gc_ev_n{0};
+static uint64_t host_mono_ns();
+static void gc_ev_note(char type, uint32_t other, int32_t val, GuestVA sva = 0)
+{
+    const uint32_t i = g_gc_ev_n.fetch_add(1, std::memory_order_relaxed);
+    g_gc_ev[i % 4096u] = { host_mono_ns(), sva, g_current_tid, other, val, type };
+}
+static void gc_ev_dump(GuestVA sva)
+{
+    const uint32_t end = g_gc_ev_n.load(std::memory_order_relaxed);
+    const uint32_t n = end < 4096u ? end : 4096u;
+    const uint64_t now = host_mono_ns();
+    unsigned shown = 0;
+    fprintf(stderr, "[gc-ev] signal/ack timeline for sem 0x%llx (%u events kept), "
+            "oldest first, ms before now:\n", (unsigned long long)sva, n);
+    for (uint32_t k = 0; k < n; ++k) {
+        const GcEv &e = g_gc_ev[(end - n + k) % 4096u];
+        if ((e.type == 'P' || e.type == 'T') && e.sva != sva) continue;
+        if (++shown > 1500u) break;
+        fprintf(stderr, "[gc-ev] %9.2f %c tid=%u other=%u val=%d\n",
+                (now - e.ns) / 1e6, e.type, e.tid, e.other, e.val);
+    }
+}
+
+static std::map<GuestVA, uint64_t> g_sem_last_change_ns;
+static void sem_history_note(GuestVA sva, int32_t delta, int32_t after, uint64_t lr)
+{
+    gc_ev_note(delta > 0 ? 'P' : 'T', (uint32_t)lr, after, sva);
+    g_sem_history[g_sem_history_n++ % 64u] = { sva, g_current_tid, delta, after, lr };
+    g_sem_last_change_ns[sva] = host_mono_ns();
+}
+
+/* Boehm's stop-the-world (il2cpp) waits until its ack semaphore reads EXACTLY
+ * the number of threads it signalled. When a signalled thread has marked
+ * itself stopped (or restarted) but has not posted yet, and stays that way
+ * for its RETRY_INTERVAL (100 ms), Boehm decides the thread is gone and
+ * lowers its count; the post still arrives and stays in the semaphore. From
+ * then on every round reads one too many and the equality never holds: the
+ * collector polls sem_getvalue + usleep(3000) forever, the game freezes for
+ * good, and any server it talks to drops the connection. 100 ms is nothing
+ * for an emulated thread on 4 cores waiting for an execution lock that is
+ * sometimes held for most of a second (r23: GetMethodID 984 ms).
+ * In that state the collector resends nothing (every thread is marked), and
+ * no post or take touches the semaphore. A genuinely missing ack looks
+ * different: Boehm resends to that thread every 100 ms, which shows up as
+ * pthread_kill. So: one thread polling a semaphore with a positive value that
+ * has not changed for 2 s, while nobody was sent a signal for 2 s, holds one
+ * stale token; drop it and say so. LUNARIA_GC_SEM_REPAIR=0 disables. */
+static std::atomic<uint64_t> g_last_kill_ns{0};
+static std::set<GuestVA> g_sem_signal_acked;
+static bool sem_stale_token_repair(GuestVA sva, int32_t &value)
+{
+    static const bool off = [] {
+        const char *e = lunaria_env("LUNARIA_GC_SEM_REPAIR");
+        return e && *e == '0';
+    }();
+    static thread_local GuestVA watch_sva;
+    static thread_local int32_t watch_val;
+    static thread_local uint64_t watch_since;
+    static thread_local uint32_t watch_polls;
+    static unsigned repairs;
+    if (off || value <= 0 || !g_sem_signal_acked.count(sva)) {
+        watch_sva = 0;
+        return false;
+    }
+    const uint64_t now = host_mono_ns();
+    if (sva != watch_sva || value != watch_val) {
+        watch_sva = sva; watch_val = value; watch_since = now; watch_polls = 0;
+        return false;
+    }
+    ++watch_polls;
+    const uint64_t quiet = 2'000'000'000ull;
+    auto ch = g_sem_last_change_ns.find(sva);
+    const uint64_t changed = ch == g_sem_last_change_ns.end() ? 0 : ch->second;
+    if (now - watch_since < quiet || watch_polls < 100u ||
+        now - changed < quiet ||
+        now - g_last_kill_ns.load(std::memory_order_relaxed) < quiet ||
+        repairs >= 256u)
+        return false;
+    ++repairs;
+    --g_sems[sva];
+    --value;
+    sem_history_note(sva, -1, value, 0xdeadull);
+    fprintf(stderr, "[gc-fix] tid=%u has polled sem 0x%llx %u times over %.1f s at "
+            "value %d with no post, take or signal sent: dropping one stale "
+            "token (Boehm stop-the-world count), now %d (repair #%u)\n",
+            g_current_tid, (unsigned long long)sva, watch_polls,
+            (now - watch_since) / 1e9, value + 1, value, repairs);
+    watch_val = value; watch_since = now; watch_polls = 0;
+    return true;
+}
+
+static void sem_poll_note(GuestVA sva, int32_t value, uint64_t lr)
+{
+    static thread_local GuestVA last_sva;
+    static thread_local uint32_t polls;
+    static unsigned said;
+    if (sva != last_sva) { last_sva = sva; polls = 0; }
+    if (++polls != 3000u || said >= 6u) return;
+    ++said;
+    fprintf(stderr, "[sem] tid=%u has polled sem 0x%llx 3000 times (value %d, lr=0x%llx); "
+            "its last posts/takes, oldest first:\n", g_current_tid,
+            (unsigned long long)sva, value, (unsigned long long)lr);
+    const unsigned n = g_sem_history_n < 64u ? g_sem_history_n : 64u;
+    for (unsigned i = 0; i < n; ++i) {
+        const SemEvent &e = g_sem_history[(g_sem_history_n - n + i) % 64u];
+        if (e.sva != sva) continue;
+        fprintf(stderr, "[sem]   %s by tid=%u -> %d (lr=0x%llx)\n",
+                e.delta > 0 ? "post" : "take", e.tid, e.after,
+                (unsigned long long)e.lr);
+    }
+    gc_ev_dump(sva);
+}
+
+
 // Signal handler table is declared with the synthetic /proc implementation:
 // both sigaction and /proc/status expose the same process-wide dispositions.
 /* Linux signal numbers the emulator raises on the guest's behalf. */
@@ -9181,6 +9329,7 @@ static void a64_fill_signal_frame(ArmExecCtx &ctx, int sig, uint32_t target_tid,
                                   GuestVA supplied_si = 0,
                                   GuestVA supplied_uc = 0,
                                   Dynarmic::A64::Jit *live_jit = nullptr) {
+    gc_ev_note('E', target_tid, sig);
   static thread_local GuestVA fallback_si = 0, fallback_uc = 0;
   GuestVA si_va = supplied_si;
   GuestVA uc_va = supplied_uc;
@@ -10319,12 +10468,19 @@ static void sched_pass_notify(void)
 static std::map<GuestVA, uint32_t> g_futex_wake_tokens;
 // LUNARIA_TRACE_FUTEX_ADDR=hexaddr: full WAIT/WAKE/park/unpark trace for one
 // futex word (uaddr-filtered so it stays quiet).
+// A leading '~' matches the low 24 bits only: heap arenas move the high bits
+// between runs, so a word found in one run's dump has a different address in
+// the next, while its offset inside the arena does not (Unity's GfxDevice
+// worker word sat at ...1120d0 in three runs out of three).
+static GuestVA g_ftrace_mask = ~(GuestVA)0;
 static bool ftrace_addr(GuestVA uaddr) {
   static GuestVA a = [] {
     const char *e = lunaria_env("LUNARIA_TRACE_FUTEX_ADDR");
-    return e ? (GuestVA)strtoull(e, nullptr, 16) : (GuestVA)0;
+        if (!e) return (GuestVA)0;
+        if (*e == '~') { g_ftrace_mask = 0xffffffu; ++e; }
+        return (GuestVA)strtoull(e, nullptr, 16) & g_ftrace_mask;
   }();
-  return a && a == uaddr;
+    return a && a == (uaddr & g_ftrace_mask);
 }
 // LUNARIA_TRACE_MUTEX_ADDR=hexaddr — every lock/unlock/park/grant on one pthread_mutex.
 static bool mtrace_addr(GuestVA va) {
@@ -10584,6 +10740,7 @@ static void arm_signal_resume_sem(ArmExecCtx &ctx, ArmThread &t,
     auto it = g_sems.find(sva);
     if (it != g_sems.end() && it->second > 0) {
       --it->second;
+            sem_history_note(sva, -1, it->second, 0);
       t.waiting_sem = 0;
       t.sem_skip_passes = 0;
       t.sem_timed = false;
@@ -10658,9 +10815,77 @@ static void arm_signal_resume_futex(ArmExecCtx &ctx, ArmThread &t,
   t.regs[0] = (uint32_t)result;
 }
 
+/* A callback's FUTEX_WAIT has no ArmThread to put on g_futex_waiters: it
+ * waits for a wake token. futex_wake_parked() hands each WAKE to a parked
+ * guest thread first, so on a word that guest threads queue on all the time
+ * the callback never gets one. s53-1 (17-11): a callback 16 s on the guest
+ * heap lock, word 2, 378,000 mallocs by others meanwhile, zero tokens. That is
+ * starvation, not a lost wake, and it is what the LDoE "connection lost"
+ * stall and the 2 Player Games lockups are. A kernel futex queue is FIFO, so a
+ * waiter that has been there longest goes first; a callback that has waited
+ * more than 20 ms marks the address here (refreshed every poll), and while the
+ * mark is fresh a WAKE leaves its token for the callback instead of
+ * completing a parked thread. A mark not refreshed for 50 ms is ignored, so a
+ * callback that went away cannot hold the address. Under the execution lock. */
+static std::unordered_map<GuestVA, uint64_t> g_cb_futex_starving;
+static bool cb_futex_starving(GuestVA uaddr)
+{
+    auto it = g_cb_futex_starving.find(uaddr);
+    if (it == g_cb_futex_starving.end()) return false;
+    if (host_mono_ns() - it->second < 50'000'000ull) return true;
+    g_cb_futex_starving.erase(it);
+    return false;
+}
+
+/* Giving a starving callback the WAKE is not enough on the guest heap lock.
+ * The callback reacts in milliseconds (its host thread polls, and often is
+ * running other guest threads when the wake lands); the threads hammering
+ * malloc re-take the free word in microseconds, so by the time the callback
+ * runs its exchange the lock is held again, and it waits again. s55-1: 24
+ * fair wakes on other words, the heap waiter still 7.8 s and +259,000
+ * mallocs. So on this one word, whose protocol is known (src/lib/guest.c:
+ * 0 free, 1 held, 2 held with waiters), the wake also RESERVES the lock for
+ * the callback: 0 -> 1 right after the unlocker's exchange, so newcomers see
+ * it held and queue. When the callback consumes its token it puts the word
+ * back to 0 and its own exchange, microseconds later, takes it. A reservation
+ * nobody collects in 100 ms is released (and its waiters woken) so a callback
+ * that went away cannot hold the heap. Under the execution lock. */
+static bool     g_heap_reserved = false;
+static uint64_t g_heap_reserved_ns = 0;
+static uint64_t g_heap_handoffs = 0;
+static bool heap_word_va(GuestVA a) {
+    return g_lh.ctl && a == a64_guest_va(HEAP_BASE + 8u);
+}
+static uint32_t futex_publish_wake(GuestVA uaddr, uint32_t max_wake);
+static void heap_reserve_expire(void) {
+    if (!g_heap_reserved || host_mono_ns() - g_heap_reserved_ns < 100'000'000ull) return;
+    g_heap_reserved = false;
+    const uint32_t old = __atomic_exchange_n(&g_lh.ctl->state, 0u, __ATOMIC_SEQ_CST);
+    static int said;
+    if (said++ < 8)
+        fprintf(stderr, "[heap-handoff] reservation not collected in 100 ms; released "
+                "(word was %u)\n", old);
+    if (old == 2u) (void)futex_publish_wake(a64_guest_va(HEAP_BASE + 8u), 1u);
+}
+/* The callback's side: its WAKE token was consumed. */
+static void heap_reserve_collect(GuestVA uaddr) {
+    if (!g_heap_reserved || !heap_word_va(uaddr)) return;
+    g_heap_reserved = false;
+    /* 1 = reserved, nobody queued since; 2 = others queued behind it, and the
+     * callback's exchange writes 2 back, so its unlock still wakes them. */
+    (void)__atomic_exchange_n(&g_lh.ctl->state, 0u, __ATOMIC_SEQ_CST);
+    ++g_heap_handoffs;
+    if (g_heap_handoffs <= 8 || (g_heap_handoffs & (g_heap_handoffs - 1)) == 0)
+        fprintf(stderr, "[heap-handoff] guest heap lock handed to a starving callback "
+                "(tid=%u) after %.1f ms reserved (%llu so far)\n", g_current_tid,
+                (host_mono_ns() - g_heap_reserved_ns) / 1e6,
+                (unsigned long long)g_heap_handoffs);
+}
+
 static uint32_t futex_publish_wake(GuestVA uaddr, uint32_t max_wake)
 {
   if (!uaddr || !max_wake) return 0;
+    heap_reserve_expire();
   const auto active = g_futex_wait_addrs.find(uaddr);
   if (active == g_futex_wait_addrs.end() || active->second == 0u)
     return 0;
@@ -10673,7 +10898,16 @@ static uint32_t futex_publish_wake(GuestVA uaddr, uint32_t max_wake)
   const uint32_t wake_count = std::min(max_wake, eligible);
   if (!wake_count) return 0;
   g_futex_wake_tokens[uaddr] += wake_count;
+    if (!cb_futex_starving(uaddr)) {
   (void)futex_wake_parked(uaddr, wake_count);
+    } else if (!g_heap_reserved && heap_word_va(uaddr)) {
+        uint32_t expect = 0u;
+        if (__atomic_compare_exchange_n(&g_lh.ctl->state, &expect, 1u, false,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+            g_heap_reserved = true;
+            g_heap_reserved_ns = host_mono_ns();
+        }
+    }
   /* Callback waiters have no schedulable ArmThread to publish as ready. */
   sched_pass_notify();
   return wake_count;
@@ -10725,6 +10959,7 @@ static void sem_wake_parked(GuestVA sva, uint32_t max_wake)
     if (!tp || tp->finished || tp->waiting_sem != sva)
       continue;
     --sit->second;
+        sem_history_note(sva, -1, sit->second, 0);
     tp->waiting_sem = 0;
     tp->sem_skip_passes = 0;
     tp->sem_timed = false;
@@ -12510,18 +12745,13 @@ extern "C" void arm_exec_device_locale(char *lang2, char *country2)
              isalpha((unsigned char)s[0]) &&
              isalpha((unsigned char)s[1]);
     };
-    if (!usable(spec)) {
-      spec = getenv("LC_ALL");
-      source = "LC_ALL";
-    }
-    if (!usable(spec)) {
-      spec = getenv("LC_MESSAGES");
-      source = "LC_MESSAGES";
-    }
-    if (!usable(spec)) {
-      spec = getenv("LANG");
-      source = "LANG";
-    }
+        if (!usable(spec)) { spec = getenv("LC_ALL"); source = "LC_ALL"; }
+        if (!usable(spec)) { spec = getenv("LC_MESSAGES"); source = "LC_MESSAGES"; }
+        if (!usable(spec)) { spec = getenv("LANG"); source = "LANG"; }
+#ifdef _WIN32
+        /* Windows sets none of those: use the display language. */
+        if (!usable(spec)) { spec = luna_os_host_locale(); source = "Windows display language"; }
+#endif
     /* "ja_JP.UTF-8", "ja-JP", "ja".  "C" and "POSIX" name no place. */
     char l[3] = "ja", c[3] = "JP";
     if (usable(spec)) {
@@ -12926,6 +13156,97 @@ static void join_wake_on_target_exit(ArmExecCtx &ctx, uint32_t target_tid)
 static thread_local uint32_t g_egl_bound_handle = 0u;
 static thread_local EGLSurface g_egl_bound_surf = EGL_NO_SURFACE;
 static thread_local EGLSurface g_egl_bound_read_surf = EGL_NO_SURFACE;
+/* True on the host threads the A64 engine pool dispatches slices to.  They run
+ * guest code but never the scheduler itself. */
+static thread_local bool g_a64_is_worker = false;
+/* The host thread that drives the frame pump. It owns the GL context, so it
+ * is the only thread allowed to run a guest thread that has touched GL. "Not
+ * a worker" is not the same test: every dvm bytecode thread also passes it,
+ * and each one that ran a slice would build an engine of its own. */
+static thread_local bool g_a64_is_pump = false;
+
+/* The window surface belongs to the guest once a guest context has bound it on
+ * a host thread other than the pump. Before that the pump keeps the bootstrap
+ * context current with the window surface (host entries, the stalled-guest
+ * frame), and a surface current on one thread makes every other thread's
+ * eglMakeCurrent on it fail with EGL_BAD_ACCESS. That was the 4-core startup
+ * hang (ldoe45 ring, 16-11): the pump drew its stalled-guest frame with the
+ * bootstrap context 8 ms before Unity's first bind on its own host thread,
+ * Unity's bind was refused, and its main thread ran with no context at all.
+ * `wants` is raised by a refused guest bind and makes the pump let go at its
+ * next frame; `owns` keeps it from taking the surface back afterwards. */
+static std::atomic<bool> g_egl_guest_wants_window{false};
+static std::atomic<bool> g_egl_guest_owns_window{false};
+static bool egl_pump_must_yield_window(void) {
+    return g_egl_guest_wants_window.load(std::memory_order_acquire) ||
+           g_egl_guest_owns_window.load(std::memory_order_acquire);
+}
+
+/* ---- eglMakeCurrent recorder (see luna_egl_mc.h) ---------------------- */
+struct EglMcRec {
+    uint64_t ns, host;
+    EGLContext ctx;
+    EGLSurface draw;
+    const char *file;
+    int line;
+    uint32_t tid;
+    uint8_t ok, pump, worker;
+};
+enum { EGL_MC_RING = 512 };
+static EglMcRec g_egl_mc_ring[EGL_MC_RING];
+static std::atomic<uint32_t> g_egl_mc_pos{0};
+
+extern "C" EGLBoolean luna_egl_make_current_rec(EGLDisplay dpy, EGLSurface draw,
+                                                EGLSurface read, EGLContext ctx,
+                                                const char *file, int line) {
+    const EGLBoolean ok = (eglMakeCurrent)(dpy, draw, read, ctx);
+    const uint32_t i = g_egl_mc_pos.fetch_add(1, std::memory_order_relaxed);
+    EglMcRec &r = g_egl_mc_ring[i % EGL_MC_RING];
+    r.ns = host_mono_ns();
+    r.host = luna_os_thread_token();
+    r.ctx = ctx; r.draw = draw; r.file = file; r.line = line;
+    r.tid = g_current_tid;
+    r.ok = ok ? 1 : 0; r.pump = g_a64_is_pump; r.worker = g_a64_is_worker;
+    return ok;
+}
+
+/* Names that can be read without the ledger: the bootstrap context and
+ * surface, the guest's table, else the raw pointer. */
+static void egl_mc_name_ctx(EGLContext c, char *out, size_t n) {
+    if (c == EGL_NO_CONTEXT) { snprintf(out, n, "none"); return; }
+    if (c == g_egl_ctx) { snprintf(out, n, "boot"); return; }
+    for (size_t k = 0; k < g_egl_ctx_tab.size(); ++k)
+        if (g_egl_ctx_tab[k] == c) {
+            snprintf(out, n, "0x%x", (unsigned)(ARM_EGL_CTXTAB_BASE + k));
+            return;
+        }
+    snprintf(out, n, "%p", (void *)c);
+}
+
+extern "C" void luna_egl_mc_dump(const char *why) {
+    static std::atomic<int> dumps{0};
+    if (dumps.fetch_add(1, std::memory_order_relaxed) >= 3) return;
+    const uint32_t end = g_egl_mc_pos.load(std::memory_order_relaxed);
+    const uint32_t start = end > EGL_MC_RING ? end - EGL_MC_RING : 0u;
+    fprintf(stderr, "[egl-mc] %s: %u binds recorded, oldest first "
+            "(this host thread %llx)\n", why, end,
+            (unsigned long long)luna_os_thread_token());
+    const uint64_t now = host_mono_ns();
+    for (uint32_t i = start; i < end; ++i) {
+        const EglMcRec &r = g_egl_mc_ring[i % EGL_MC_RING];
+        char c[24];
+        egl_mc_name_ctx(r.ctx, c, sizeof c);
+        const char *f = r.file ? strrchr(r.file, '/') : nullptr;
+        if (!f && r.file) f = strrchr(r.file, '\\');
+        fprintf(stderr, "[egl-mc] #%u -%.3fs host %llx %s tid=%u ctx=%s surf=%s "
+                "%s %s:%d\n", i, (now - r.ns) / 1e9, (unsigned long long)r.host,
+                r.pump ? "pump" : r.worker ? "worker" : "other", r.tid, c,
+                r.draw == EGL_NO_SURFACE ? "none"
+                    : r.draw == g_egl_surf ? "win" : "other",
+                r.ok ? "ok" : "FAILED", f ? f + 1 : (r.file ? r.file : "?"),
+                r.line);
+    }
+}
 /* Buffer bindings belong to an EGL context, not to the process.
  * GL_ARRAY_BUFFER is context state, but GL_ELEMENT_ARRAY_BUFFER is *vertex
  * array object* state: glBindVertexArray changes which element buffer is
@@ -13078,10 +13399,20 @@ static EGLSurface egl_host_surf(uint32_t handle) {
 static const char *egl_diag_host_role(void);
 static void egl_note_bound(uint32_t handle, EGLSurface surf, EGLSurface read) {
   if (handle != g_egl_bound_handle && lunaria_env("LUNARIA_TRACE_EGL")) {
-    static int n = 0;
-    if (n++ < 64)
-      fprintf(stderr, "[egl] host binding 0x%x -> 0x%x (tid=%u)\n",
-              g_egl_bound_handle, handle, g_current_tid);
+        /* The bootstrap context is re-bound on every new host thread a JNI
+         * entry arrives on, and those lines used to eat the whole budget
+         * before the game made a context of its own. Guest contexts are the
+         * ones whose host thread matters: one current on the wrong thread
+         * makes every later bind elsewhere fail with EGL_BAD_ACCESS. */
+        const bool guest_ctx = handle >= ARM_EGL_CTXTAB_BASE ||
+                               g_egl_bound_handle >= ARM_EGL_CTXTAB_BASE;
+        static std::atomic<int> n{0};
+        if (guest_ctx && n.fetch_add(1, std::memory_order_relaxed) < 256)
+            fprintf(stderr, "[egl] host binding 0x%x -> 0x%x (tid=%u %s) on host "
+                    "thread %llx (%s)\n", g_egl_bound_handle, handle, g_current_tid,
+                    thread_name_of(g_current_tid),
+                    (unsigned long long)luna_os_thread_token(),
+                    g_a64_is_pump ? "pump" : g_a64_is_worker ? "worker" : "other");
   }
   g_egl_bound_handle = handle;
   g_egl_bound_surf = surf;
@@ -13134,6 +13465,34 @@ extern "C" void arm_exec_egl_note_current(void *egl_ctx, void *egl_draw) {
   egl_note_bound(h, surf, eglGetCurrentSurface(EGL_READ));
 }
 
+/* A guest context another host thread must give up (see the sync failure
+ * below). One slot: two contexts contended at once just take turns. */
+static std::atomic<uint32_t> g_egl_ctx_release_req{0};
+static void egl_request_ctx_release(uint32_t h) {
+    g_egl_ctx_release_req.store(h, std::memory_order_release);
+}
+/* Called at SVC entry. Cheap unless a release is pending: then, if this host
+ * thread holds that context and the guest thread running here no longer owns
+ * it in the ledger, unbind. */
+static void egl_poll_ctx_release(void) {
+    const uint32_t h = g_egl_ctx_release_req.load(std::memory_order_acquire);
+    if (!h || g_egl_bound_handle != h || g_egl_dpy == EGL_NO_DISPLAY) return;
+    {
+        ArmLockGuard locked;
+        auto it = g_egl_tid_ctx.find(g_current_tid);
+        if (it != g_egl_tid_ctx.end() && it->second == h) return;   /* still ours */
+    }
+    eglMakeCurrent(g_egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    egl_note_bound(0u, EGL_NO_SURFACE);
+    uint32_t expect = h;
+    g_egl_ctx_release_req.compare_exchange_strong(expect, 0u);
+    static std::atomic<int> said{0};
+    if (said.fetch_add(1, std::memory_order_relaxed) < 16)
+        fprintf(stderr, "[egl] host thread %llx (tid=%u) released ctx=0x%x: a newer "
+                "guest eglMakeCurrent gave it to another thread\n",
+                (unsigned long long)luna_os_thread_token(), g_current_tid, h);
+}
+
 // Re-point the single host binding at whichever context the guest thread that is about to run had made current.
 static void egl_sync_current_context(uint32_t tid) {
   if (g_egl_tid_ctx.empty() || g_egl_dpy == EGL_NO_DISPLAY) return;
@@ -13154,18 +13513,31 @@ static void egl_sync_current_context(uint32_t tid) {
     return;
   if (eglMakeCurrent(g_egl_dpy, want_s, want_read, ectx)) {
     egl_note_bound(want, want_s, want_read);
-  } else {
-    /* The context is current on another host thread (EGL_BAD_ACCESS): the
-     * guest thread is running somewhere other than the thread that owns GL,
-     * and every GL call it makes will find no context. */
-    static std::atomic<int> failures{0};
-    const EGLint err = eglGetError();
-    if (failures.fetch_add(1) < 16)
-      fprintf(stderr, "[egl] cannot bind ctx=0x%x for guest tid=%u on host "
-                      "thread %lu role=%s (err=0x%x, host_ctx=%p)\n",
-              want, tid, (unsigned long)pthread_self(), egl_diag_host_role(),
-              (unsigned)err, (void *)eglGetCurrentContext());
+    return;
   }
+    /* A context is current to at most one host thread. If the guest thread's
+     * context is still current on the host thread it last ran on, this fails
+     * with EGL_BAD_ACCESS and every GL call that follows runs with no context:
+     * glGetIntegerv answers 0, the version reads as ES 2.0, and Unity decides
+     * the GPU supports no texture size at all, then crashes (the 4-core
+     * startup hang, 16-11). It used to fail without a word. */
+    const EGLint err = eglGetError();
+    /* The guest ledger already moved the context to this thread (the newer
+     * eglMakeCurrent evicted the old owner), but the host thread the old owner
+     * runs on still has it current, and keeps it while that thread lives inside
+     * a callback. Unity's main thread (a JNI callback) and its render thread
+     * pass one context between them; with the main thread holding it on the
+     * host, every render-thread GL call ran with no context and LDoE's shaders
+     * failed to link (37x "GLSL link failed" in Aloa's log, 17-11). Ask the
+     * holder to let go at its next SVC; this sync retries on the next slice. */
+    if (err == EGL_BAD_ACCESS) egl_request_ctx_release(want);
+    static std::atomic<int> said{0};
+    if (said.fetch_add(1, std::memory_order_relaxed) < 32)
+        fprintf(stderr, "[egl] sync FAILED: tid=%u wants ctx=0x%x surf=0x%x on host "
+                "thread %llx role=%s, err=0x%x (bound here=0x%x)\n", tid, want, want_sh,
+                (unsigned long long)luna_os_thread_token(), egl_diag_host_role(),
+                (unsigned)err, g_egl_bound_handle);
+    luna_egl_mc_dump("context re-bind refused");
 }
 
 /* Bind EGL for a host->guest entry (JNI callback, etc.). Prefer the calling
@@ -13178,8 +13550,47 @@ static void egl_rebind_for_host_entry(void) {
     return;
   }
   if (g_egl_ctx != EGL_NO_CONTEXT) {
-    if (eglMakeCurrent(g_egl_dpy, g_egl_surf, g_egl_surf, g_egl_ctx))
+        /* Only the pump may take the bootstrap context once the guest has a
+         * context of its own. Every Java thread that calls into native code
+         * comes through here; the first one bound the bootstrap context AND
+         * the window surface on its own host thread and never let go, and a
+         * surface current on one thread makes every other thread's
+         * eglMakeCurrent on it fail with EGL_BAD_ACCESS. On 4 cores that hit
+         * Unity's very first bind on its main thread (16-11, ldoe42 traces):
+         * the main thread then ran with no context, read every GL limit as 0
+         * and the version as ES 2.0, decided the GPU had no texture size,
+         * crashed, and hung in its crash handler before drawing a frame.
+         * LUNARIA_EGL_FALLBACK_ANY_THREAD=1 restores the old behaviour. */
+        static const bool any_thread = [] {
+            const char *e = lunaria_env("LUNARIA_EGL_FALLBACK_ANY_THREAD");
+            return e && *e && *e != '0';
+        }();
+        /* Not only after the guest has a context: ldoe43 still hung once in
+         * six, with Unity's main thread on the pump and its bind refused all
+         * the same, so the surface had been taken by a Java thread's entry
+         * BEFORE the game created its context. Nothing on a non-pump host
+         * thread draws with the bootstrap context. */
+        if (!any_thread && g_ctx && g_ctx->is_arm64 && !g_a64_is_pump)
+            return;
+        if (g_a64_is_pump && egl_pump_must_yield_window()) {
+            if (eglGetCurrentContext() == g_egl_ctx) {
+                eglMakeCurrent(g_egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                               EGL_NO_CONTEXT);
+                egl_note_bound(0u, EGL_NO_SURFACE);
+            }
+            return;
+        }
+        if (eglMakeCurrent(g_egl_dpy, g_egl_surf, g_egl_surf, g_egl_ctx)) {
       egl_note_bound(ARM_EGL_CONTEXT, g_egl_surf);
+            if (!g_a64_is_pump) {
+                static std::atomic<int> said{0};
+                if (said.fetch_add(1, std::memory_order_relaxed) < 16)
+                    fprintf(stderr, "[egl] bootstrap context + window surface taken "
+                            "by non-pump host thread %llx (tid=%u %s)\n",
+                            (unsigned long long)luna_os_thread_token(),
+                            g_current_tid, thread_name_of(g_current_tid));
+            }
+        }
   }
 }
 
@@ -13206,6 +13617,14 @@ static void egl_ensure_window_surface_current(void) {
     if (h) {
       g_egl_tid_surf[g_current_tid] = ARM_EGL_SURFACE;
       egl_note_bound(h, g_egl_surf);
+        } else if (!g_a64_is_pump) {
+            /* Same hazard as the host-entry fallback: the bootstrap context
+             * and the window surface now belong to this host thread. */
+            static std::atomic<int> said{0};
+            if (said.fetch_add(1, std::memory_order_relaxed) < 16)
+                fprintf(stderr, "[egl] ensure-window bound the bootstrap context on "
+                        "non-pump host thread %llx (tid=%u)\n",
+                        (unsigned long long)luna_os_thread_token(), g_current_tid);
     }
     static int n = 0;
     if (n++ < 12)
@@ -14506,13 +14925,105 @@ static void drive_ndk_choreographer(ArmExecCtx &ctx) {
   }
 }
 
-// A64 persistent mappings share driver storage in the guest address space.
-// Other mappings retain a shadow until flush/unmap.
+/* ---- [compat]: what a game asks the host GL for and does not get --------
+ * A game written for a phone GPU can need things ANGLE's backend does not
+ * offer (D3D11 stops at ES 3.1: no geometry/tessellation shaders, no
+ * framebuffer fetch, ...).  On a device that never fails, so the game rarely
+ * checks; here it shows up as a black model or a missing effect and nothing
+ * in the log says why.  These lines say why, once per distinct problem:
+ *   - a shader's `#version 320 es` when the host context is below 3.2,
+ *   - a shader's `#extension NAME` the host does not list,
+ *   - a shader that failed to compile or a program that failed to link, with
+ *     the host compiler's own message.
+ * Always on: each distinct line prints once, so a working game costs nothing. */
+static std::mutex g_compat_mu;
+static std::set<std::string> g_compat_seen;
+static bool compat_once(const std::string &key) {
+    std::lock_guard<std::mutex> lock(g_compat_mu);
+    if (g_compat_seen.size() > 512) return false;
+    return g_compat_seen.insert(key).second;
+}
+static const std::string &compat_host_exts(void) {
+    static std::string exts;
+    static bool loaded;
+    if (!loaded) {
+        typedef const unsigned char *(*GetStr)(unsigned);
+        static GetStr gs = (GetStr)eglGetProcAddress("glGetString");
+        const char *e = gs ? (const char *)gs(0x1F03 /* GL_EXTENSIONS */) : nullptr;
+        if (e) { exts = std::string(" ") + e + " "; loaded = true; }
+    }
+    return exts;
+}
+static int compat_host_es_minor(void) {
+    static int minor = -1;
+    if (minor < 0) {
+        typedef const unsigned char *(*GetStr)(unsigned);
+        static GetStr gs = (GetStr)eglGetProcAddress("glGetString");
+        const char *v = gs ? (const char *)gs(0x1F02 /* GL_VERSION */) : nullptr;
+        int ma = 0, mi = 0;
+        if (v && sscanf(v, "OpenGL ES %d.%d", &ma, &mi) == 2) minor = ma * 10 + mi;
+    }
+    return minor;
+}
+static void compat_check_shader_source(uint64_t id, const std::string &src) {
+    const std::string &exts = compat_host_exts();
+    size_t at = 0;
+    while (at < src.size()) {
+        size_t eol = src.find('\n', at);
+        if (eol == std::string::npos) eol = src.size();
+        size_t ws = src.find_first_not_of(" \t", at);
+        if (ws != std::string::npos && ws < eol && src[ws] == '#') {
+            std::string line = src.substr(ws, eol - ws);
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            int ver = 0;
+            char name[128], how[32];
+            if (sscanf(line.c_str(), "#version %d es", &ver) == 1) {
+                const int have = compat_host_es_minor();
+                if (ver >= 320 && have > 0 && have < 32 &&
+                    compat_once("ver" + std::to_string(ver)))
+                    fprintf(stderr, "[compat] shader %llu needs GLSL ES %d.%02d; this host context is "
+                            "OpenGL ES %d.%d (ANGLE's D3D11 backend stops at 3.1; its Vulkan "
+                            "backend does 3.2)\n", (unsigned long long)id, ver / 100, ver % 100,
+                            have / 10, have % 10);
+            } else if (sscanf(line.c_str(), "#extension %127[A-Za-z0-9_] : %31s", name, how) == 2 &&
+                       strcmp(name, "all") != 0 && !exts.empty() &&
+                       exts.find(std::string(" ") + name + " ") == std::string::npos &&
+                       compat_once(std::string("ext ") + name)) {
+                fprintf(stderr, "[compat] shader %llu asks for %s (%s), which this host does not "
+                        "offer%s\n", (unsigned long long)id, name, how,
+                        !strcmp(how, "require") ? ": the shader will fail to compile" :
+                        ": the shader must take its fallback path");
+            }
+        }
+        at = eol + 1;
+    }
+}
+static void compat_report_failure(const char *what, unsigned id, const char *log) {
+    std::string first = log ? log : "";
+    if (first.size() > 400) first.resize(400);
+    for (char &c : first) if (c == '\n' || c == '\r') c = ' ';
+    /* Key on the message, not the id: a game that fails one way fails it in
+     * every material. */
+    std::string key = std::string(what) + first.substr(0, 120);
+    if (!compat_once(key)) return;
+    fprintf(stderr, "[compat] %s %u failed: %s\n", what, id,
+            first.empty() ? "(no message from the host compiler)" : first.c_str());
+}
+
+// glMapBufferRange shadows: host pointers can't be exposed to the guest.
+// A64 persistent mappings share driver storage in the guest address space
+// (`shared`); other mappings retain a shadow until flush/unmap.
+/* `deferred`: a write-only map that never touched the host buffer.  The guest
+ * writes the shadow; unmap / flush upload it with glBufferData/SubData.  See
+ * SVC_GL3_MapBufferRange. */
 struct GlMappedBuf {
   void *host;
   GuestVA gva;
   uint32_t len, access;
-  int shared;
+  int shared = 0;
+  uint32_t off = 0, size = 0;
+  GLenum usage = 0;
+  bool deferred = false;
 };
 static std::map<uint32_t, GlMappedBuf> g_gl_mapped;    /* keyed by buffer name */
 static void gl_mapped_release(ArmExecCtx &ctx,GLuint buffer)
@@ -14564,6 +15075,35 @@ static std::vector<uint32_t> g_egl_sync_free;
 
 // Counts presents the guest drove through the EGL bridge.
 static uint64_t g_guest_egl_swap_count = 0;
+/* Time between the guest's presents, for the [perf] line: an average fps hides
+ * the hitch a player feels, the slowest frames show it. */
+static std::mutex g_frame_time_mu;
+static std::vector<float> g_frame_time_ms;
+static uint64_t g_frame_time_last_ns;
+static uint64_t host_mono_ns();
+static void frame_time_note(void) {
+    const uint64_t now = host_mono_ns();
+    std::lock_guard<std::mutex> lock(g_frame_time_mu);
+    if (g_frame_time_last_ns && g_frame_time_ms.size() < 100000)
+        g_frame_time_ms.push_back((float)((double)(now - g_frame_time_last_ns) / 1e6));
+    g_frame_time_last_ns = now;
+}
+extern "C" int arm_exec_frame_times(double *p50, double *p99, double *worst,
+                                    int *over33, int *over50) {
+    std::vector<float> v;
+    {
+        std::lock_guard<std::mutex> lock(g_frame_time_mu);
+        v.swap(g_frame_time_ms);
+    }
+    if (v.empty()) return 0;
+    std::sort(v.begin(), v.end());
+    *p50 = v[v.size() / 2];
+    *p99 = v[std::min(v.size() - 1, (size_t)((double)v.size() * 0.99))];
+    *worst = v.back();
+    *over33 = (int)(v.end() - std::upper_bound(v.begin(), v.end(), 33.4f));
+    *over50 = (int)(v.end() - std::upper_bound(v.begin(), v.end(), 50.0f));
+    return (int)v.size();
+}
 /* Latched false once the boot card is down, so the SVC dispatch stops paying
  * for it entirely rather than calling across into libjvm.so for ever. */
 static bool g_boot_card_up = true;
@@ -15908,6 +16448,411 @@ static void gldraw_trace_texture(const char *what) {
   }
 }
 
+/* LUNARIA_DBG_DRAW=N: for the first N DrawElements, print what the host GL
+ * actually holds: the program's attribute slots, its uniforms as the host
+ * reads them back, blend/depth/raster state, and the first vertices the
+ * indices pick.  LUNARIA_DBG_NOBLEND / _NODEPTH / _NOCULL force that state
+ * off for every draw, to see which one hides the draws. */
+/* LUNARIA_DBG_VBO=1: draw client-array DrawElements from temporary buffer
+ * objects instead (vertices and indices copied out of guest memory), then put
+ * the client pointers back.  An A/B for "the host drops client-array draws". */
+/* LUNARIA_DBG_SELFTEST=1: once, at the guest's first DrawElements, draw a
+ * centred triangle in the guest's own context with a few tiny programs and
+ * read the centre pixel back after each.  Tells "this context draws nothing"
+ * apart from "this kind of shader draws nothing". */
+static void dbg_selftest() {
+    static int done = 0;
+    if (done || !lunaria_env("LUNARIA_DBG_SELFTEST")) return;
+    done = 1;
+    typedef GLuint (*PFCreateShader)(GLenum);
+    typedef void (*PFShaderSource)(GLuint, GLsizei, const char *const *, const GLint *);
+    typedef void (*PFU1)(GLuint);
+    typedef GLuint (*PFCreateProgram)(void);
+    typedef void (*PFAttach)(GLuint, GLuint);
+    typedef void (*PFBindAttrib)(GLuint, GLuint, const char *);
+    typedef void (*PFGetiv)(GLuint, GLenum, GLint *);
+    typedef void (*PFLog)(GLuint, GLsizei, GLsizei *, char *);
+    typedef void (*PFGen)(GLsizei, GLuint *);
+    typedef void (*PFBind)(GLenum, GLuint);
+    typedef void (*PFData)(GLenum, GLsizeiptr, const void *, GLenum);
+    typedef void (*PFDrawArrays)(GLenum, GLint, GLsizei);
+    typedef void (*PFUM4)(GLint, GLsizei, GLboolean, const GLfloat *);
+    typedef GLint (*PFLoc)(GLuint, const char *);
+    typedef void (*PFClearColor)(GLfloat, GLfloat, GLfloat, GLfloat);
+    typedef void (*PFGetPtr)(GLuint, GLenum, void **);
+    typedef void (*PFGetAttribiv)(GLuint, GLenum, GLint *);
+    PFCreateShader cs = (PFCreateShader)host_gl_proc({"glCreateShader"});
+    PFShaderSource ss = (PFShaderSource)host_gl_proc({"glShaderSource"});
+    PFU1 comp = (PFU1)host_gl_proc({"glCompileShader"});
+    PFCreateProgram cp = (PFCreateProgram)host_gl_proc({"glCreateProgram"});
+    PFAttach at = (PFAttach)host_gl_proc({"glAttachShader"});
+    PFBindAttrib ba = (PFBindAttrib)host_gl_proc({"glBindAttribLocation"});
+    PFU1 link = (PFU1)host_gl_proc({"glLinkProgram"});
+    PFU1 use = (PFU1)host_gl_proc({"glUseProgram"});
+    PFGetiv gpi = (PFGetiv)host_gl_proc({"glGetProgramiv"});
+    PFGetiv gsi = (PFGetiv)host_gl_proc({"glGetShaderiv"});
+    PFLog plog = (PFLog)host_gl_proc({"glGetProgramInfoLog"});
+    PFLog slog = (PFLog)host_gl_proc({"glGetShaderInfoLog"});
+    PFGen gen = (PFGen)host_gl_proc({"glGenBuffers"});
+    PFBind bind = (PFBind)host_gl_proc({"glBindBuffer"});
+    PFData data = (PFData)host_gl_proc({"glBufferData"});
+    PFDrawArrays da = (PFDrawArrays)host_gl_proc({"glDrawArrays"});
+    PFUM4 um4 = (PFUM4)host_gl_proc({"glUniformMatrix4fv"});
+    PFLoc uloc = (PFLoc)host_gl_proc({"glGetUniformLocation"});
+    PFClearColor cc = (PFClearColor)host_gl_proc({"glClearColor"});
+    PFGetPtr gptr = (PFGetPtr)host_gl_proc({"glGetVertexAttribPointerv"});
+    PFGetAttribiv gav = (PFGetAttribiv)host_gl_proc({"glGetVertexAttribiv"});
+    if (!cs || !ss || !comp || !cp || !at || !ba || !link || !use || !gpi || !gsi || !gen ||
+        !bind || !data || !da || !cc || !pfn_glReadPixels || !pfn_glVertexAttribPointer ||
+        !pfn_glGetIntegerv || !pfn_glClear || !pfn_glDisable || !pfn_glEnable) {
+        fprintf(stderr, "[selftest] missing GL entry points\n");
+        return;
+    }
+    GLint prog0 = 0, abuf0 = 0, blend0 = 0, depth0 = 0;
+    pfn_glGetIntegerv(0x8B8D, &prog0);
+    pfn_glGetIntegerv(0x8894, &abuf0);
+    pfn_glGetIntegerv(0x0BE2, &blend0);
+    pfn_glGetIntegerv(0x0B71, &depth0);
+    GLint a0sz = 4, a0ty = 0x1406, a0norm = 0, a0st = 0, a0en = 0; void *a0ptr = nullptr;
+    if (gav && gptr) {
+        gav(0, 0x8623, &a0sz); gav(0, 0x8625, &a0ty); gav(0, 0x886A, &a0norm);
+        gav(0, 0x8624, &a0st); gav(0, 0x8622, &a0en); gptr(0, 0x8645, &a0ptr);
+    }
+    auto make = [&](const char *vs, const char *fs, const char *tag) -> GLuint {
+        GLuint v = cs(0x8B31), f = cs(0x8B30);
+        ss(v, 1, &vs, nullptr); comp(v);
+        ss(f, 1, &fs, nullptr); comp(f);
+        GLint okv = 0, okf = 0; gsi(v, 0x8B81, &okv); gsi(f, 0x8B81, &okf);
+        GLuint pr = cp(); at(pr, v); at(pr, f);
+        ba(pr, 0, "_glesVertex");
+        link(pr);
+        GLint okp = 0; gpi(pr, 0x8B82, &okp);
+        char lg[512] = {0};
+        if (!okp && plog) plog(pr, sizeof lg, nullptr, lg);
+        if (!okv && slog) slog(v, sizeof lg, nullptr, lg);
+        if (!okf && slog) slog(f, sizeof lg, nullptr, lg);
+        fprintf(stderr, "[selftest] %s compile vs=%d fs=%d link=%d %s\n", tag, okv, okf, okp, lg);
+        return okp ? pr : 0;
+    };
+    static const char *vs_plain =
+        "attribute vec4 _glesVertex;\nvoid main(){ gl_Position = _glesVertex; }\n";
+    static const char *vs_unity =
+        "uniform highp mat4 glstate_matrix_mvp;\nattribute vec4 _glesVertex;\n"
+        "void main(){ gl_Position = (glstate_matrix_mvp * _glesVertex); }\n";
+    static const char *fs_color =
+        "precision mediump float;\nvoid main(){ gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); }\n";
+    static const char *fs_data =
+        "precision mediump float;\nvoid main(){ gl_FragData[0] = vec4(1.0, 0.0, 0.0, 1.0); }\n";
+    struct T { const char *tag, *vs, *fs; int mvp; } tests[] = {
+        {"A plain+FragColor", vs_plain, fs_color, 0},
+        {"B plain+FragData0", vs_plain, fs_data, 0},
+        {"C unityVS+FragColor", vs_unity, fs_color, 1},
+        {"D unityVS+FragData0", vs_unity, fs_data, 1},
+    };
+    /* NDC triangle around the centre, and the same in Unity's pixel space for
+     * the mvp the splash uses (x*2/1024-1, y*2/576-1, z*-0.0198-0.98). */
+    static const GLfloat tri_ndc[] = { -0.5f,-0.5f,0.f,1.f,  0.5f,-0.5f,0.f,1.f,  0.f,0.5f,0.f,1.f };
+    static const GLfloat tri_px[]  = { 256.f,144.f,0.f,1.f,  768.f,144.f,0.f,1.f, 512.f,432.f,0.f,1.f };
+    static const GLfloat mvp[16] = { 0.001953125f,0,0,0, 0,0.003472222f,0,0, 0,0,-0.019802f,0, -1,-1,-0.980198f,1 };
+    {
+        GLint v[24] = {0};
+        const GLenum q[] = { 0x80A0 /*SAMPLE_COVERAGE*/, 0x809E /*SAMPLE_ALPHA_TO_COVERAGE*/,
+                             0x8E51 /*SAMPLE_MASK*/, 0x80A8 /*SAMPLE_BUFFERS*/, 0x80A9 /*SAMPLES*/,
+                             0x0D52, 0x0D53, 0x0D54, 0x0D55, 0x0D56, 0x0D57 /*R G B A D S bits*/,
+                             0x8CA6 /*DRAW_FB*/, 0x8CAA /*READ_FB*/, 0x8825 /*DRAW_BUFFER0*/,
+                             0x0C02 /*READ_BUFFER*/, 0x8C89 /*RASTERIZER_DISCARD*/,
+                             0x8037 /*POLYGON_OFFSET_FILL*/, 0x0B90 /*STENCIL_TEST*/,
+                             0x0C11 /*SCISSOR_TEST*/, 0x8E24 /*TF_ACTIVE*/, 0x0BD0 /*DITHER*/ };
+        const char *qn[] = { "sample_coverage", "a2c", "sample_mask", "sample_buffers", "samples",
+                             "rbits", "gbits", "bbits", "abits", "dbits", "sbits",
+                             "draw_fb", "read_fb", "draw_buffer0", "read_buffer", "rast_discard",
+                             "poly_offset", "stencil", "scissor", "tf_active", "dither" };
+        for (size_t i = 0; i < sizeof q / sizeof q[0]; ++i) {
+            if (q[i] == 0x80A0 || q[i] == 0x809E || q[i] == 0x8E51 || q[i] == 0x8C89 ||
+                q[i] == 0x8037 || q[i] == 0x0B90 || q[i] == 0x0C11 || q[i] == 0x0BD0)
+                v[i] = pfn_glIsEnabled ? pfn_glIsEnabled(q[i]) : -1;
+            else
+                pfn_glGetIntegerv(q[i], &v[i]);
+            GLenum e = pfn_glGetError ? pfn_glGetError() : 0;
+            fprintf(stderr, "[selftest] state %s=%d%s\n", qn[i], v[i], e ? " (query error)" : "");
+        }
+        typedef void (*PFGetIntegeri)(GLenum, GLuint, GLint *);
+        PFGetIntegeri gii = (PFGetIntegeri)host_gl_proc({"glGetIntegeri_v"});
+        if (gii) {
+            GLint m = -1; gii(0x8E52 /*SAMPLE_MASK_VALUE*/, 0, &m);
+            GLenum e = pfn_glGetError ? pfn_glGetError() : 0;
+            fprintf(stderr, "[selftest] state sample_mask_value0=0x%x%s\n", (unsigned)m, e ? " (query error)" : "");
+        }
+        GLfloat cv = -1; GLboolean ci = 0;
+        typedef void (*PFGetFloatv)(GLenum, GLfloat *);
+        typedef void (*PFGetBooleanv)(GLenum, GLboolean *);
+        PFGetFloatv gf = (PFGetFloatv)host_gl_proc({"glGetFloatv"});
+        PFGetBooleanv gb = (PFGetBooleanv)host_gl_proc({"glGetBooleanv"});
+        if (gf) gf(0x80AA /*SAMPLE_COVERAGE_VALUE*/, &cv);
+        if (gb) gb(0x80AB /*SAMPLE_COVERAGE_INVERT*/, &ci);
+        fprintf(stderr, "[selftest] state coverage_value=%g invert=%d\n", cv, (int)ci);
+    }
+    GLuint vb[2]; gen(2, vb);
+    bind(0x8892, vb[0]); data(0x8892, sizeof tri_ndc, tri_ndc, 0x88E4);
+    bind(0x8892, vb[1]); data(0x8892, sizeof tri_px, tri_px, 0x88E4);
+    pfn_glDisable(0x0BE2); pfn_glDisable(0x0B71);
+    for (const T &t : tests) {
+        GLuint pr = make(t.vs, t.fs, t.tag);
+        if (!pr) continue;
+        use(pr);
+        if (t.mvp && um4 && uloc) um4(uloc(pr, "glstate_matrix_mvp"), 1, 0, mvp);
+        bind(0x8892, t.mvp ? vb[1] : vb[0]);
+        pfn_glVertexAttribPointer(0, 4, 0x1406, 0, 0, nullptr);
+        if (pfn_glEnableVertexAttribArray) pfn_glEnableVertexAttribArray(0);
+        cc(0.f, 1.f, 0.f, 1.f); pfn_glClear(0x4000);
+        unsigned char before[4] = {0}, after[4] = {0};
+        pfn_glReadPixels(512, 288, 1, 1, 0x1908, 0x1401, before);
+        da(0x0004, 0, 3);
+        pfn_glReadPixels(512, 288, 1, 1, 0x1908, 0x1401, after);
+        GLenum e = pfn_glGetError ? pfn_glGetError() : 0;
+        fprintf(stderr, "[selftest] %s: before=%u,%u,%u after=%u,%u,%u err=0x%x  (red = drew)\n",
+                t.tag, before[0], before[1], before[2], after[0], after[1], after[2], e);
+    }
+    {
+        GLuint pr = make(vs_plain, fs_color, "E plain, all raster state off");
+        if (pr) {
+            use(pr);
+            const GLenum off[] = { 0x80A0, 0x809E, 0x8E51, 0x8C89, 0x8037, 0x0B90, 0x0C11, 0x0B44 };
+            for (GLenum c : off) pfn_glDisable(c);
+            if (pfn_glGetError) while (pfn_glGetError()) {}
+            if (pfn_glViewport) pfn_glViewport(0, 0, 1024, 576);
+            typedef void (*PFColorMask)(GLboolean, GLboolean, GLboolean, GLboolean);
+            PFColorMask cm = (PFColorMask)host_gl_proc({"glColorMask"});
+            if (cm) cm(1, 1, 1, 1);
+            bind(0x8892, vb[0]);
+            pfn_glVertexAttribPointer(0, 4, 0x1406, 0, 0, nullptr);
+            cc(0.f, 1.f, 0.f, 1.f); pfn_glClear(0x4000);
+            da(0x0004, 0, 3);
+            unsigned char px[4] = {0};
+            pfn_glReadPixels(512, 288, 1, 1, 0x1908, 0x1401, px);
+            GLenum e = pfn_glGetError ? pfn_glGetError() : 0;
+            fprintf(stderr, "[selftest] E all-off: after=%u,%u,%u err=0x%x\n", px[0], px[1], px[2], e);
+
+            typedef void (*PFGenFB)(GLsizei, GLuint *);
+            typedef void (*PFBindFB)(GLenum, GLuint);
+            typedef void (*PFFBTex)(GLenum, GLenum, GLenum, GLuint, GLint);
+            typedef GLenum (*PFCheckFB)(GLenum);
+            typedef void (*PFGenTex)(GLsizei, GLuint *);
+            typedef void (*PFBindTex)(GLenum, GLuint);
+            typedef void (*PFTexImage)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
+            PFGenFB gfb = (PFGenFB)host_gl_proc({"glGenFramebuffers"});
+            PFBindFB bfb = (PFBindFB)host_gl_proc({"glBindFramebuffer"});
+            PFFBTex fbt = (PFFBTex)host_gl_proc({"glFramebufferTexture2D"});
+            PFCheckFB chk = (PFCheckFB)host_gl_proc({"glCheckFramebufferStatus"});
+            PFGenTex gt = (PFGenTex)host_gl_proc({"glGenTextures"});
+            PFBindTex bt = (PFBindTex)host_gl_proc({"glBindTexture"});
+            PFTexImage ti = (PFTexImage)host_gl_proc({"glTexImage2D"});
+            if (gfb && bfb && fbt && chk && gt && bt && ti) {
+                GLint fb0 = 0, tex0 = 0;
+                pfn_glGetIntegerv(0x8CA6, &fb0);
+                pfn_glGetIntegerv(0x8069 /*TEXTURE_BINDING_2D*/, &tex0);
+                GLuint fb = 0, tx = 0;
+                gfb(1, &fb); gt(1, &tx);
+                bt(0x0DE1, tx);
+                ti(0x0DE1, 0, 0x1908, 1024, 576, 0, 0x1908, 0x1401, nullptr);
+                bfb(0x8D40, fb);
+                fbt(0x8D40, 0x8CE0, 0x0DE1, tx, 0);
+                GLenum st = chk(0x8D40);
+                cc(0.f, 1.f, 0.f, 1.f); pfn_glClear(0x4000);
+                da(0x0004, 0, 3);
+                unsigned char q2[4] = {0};
+                pfn_glReadPixels(512, 288, 1, 1, 0x1908, 0x1401, q2);
+                GLenum e2 = pfn_glGetError ? pfn_glGetError() : 0;
+                fprintf(stderr, "[selftest] F own FBO status=0x%x: after=%u,%u,%u err=0x%x\n",
+                        st, q2[0], q2[1], q2[2], e2);
+                bfb(0x8D40, (GLuint)fb0);
+                bt(0x0DE1, (GLuint)tex0);
+            }
+        }
+    }
+    use((GLuint)prog0);
+    bind(0x8892, 0);
+    pfn_glVertexAttribPointer(0, a0sz, (GLenum)a0ty, (GLboolean)a0norm, a0st, a0ptr);
+    if (!a0en && pfn_glDisableVertexAttribArray) pfn_glDisableVertexAttribArray(0);
+    bind(0x8892, (GLuint)abuf0);
+    if (blend0) pfn_glEnable(0x0BE2);
+    if (depth0) pfn_glEnable(0x0B71);
+}
+
+static bool dbg_vbo_draw(GLenum mode, GLsizei count, GLenum type, const void *idx) {
+    static int on = -1;
+    if (on < 0) on = lunaria_env("LUNARIA_DBG_VBO") != nullptr;
+    if (!on || !idx || count <= 0 || !pfn_glVertexAttribPointer || !pfn_glDrawElements) return false;
+    typedef void (*PFGen)(GLsizei, GLuint *);
+    typedef void (*PFBind)(GLenum, GLuint);
+    typedef void (*PFData)(GLenum, GLsizeiptr, const void *, GLenum);
+    typedef void (*PFGetPtr)(GLuint, GLenum, void **);
+    typedef void (*PFGetAttribiv)(GLuint, GLenum, GLint *);
+    static PFGen gen = (PFGen)host_gl_proc({"glGenBuffers"});
+    static PFBind bind = (PFBind)host_gl_proc({"glBindBuffer"});
+    static PFData data = (PFData)host_gl_proc({"glBufferData"});
+    static PFGetPtr gptr = (PFGetPtr)host_gl_proc({"glGetVertexAttribPointerv"});
+    static PFGetAttribiv gav = (PFGetAttribiv)host_gl_proc({"glGetVertexAttribiv"});
+    if (!gen || !bind || !data || !gptr || !gav || !pfn_glGetIntegerv) return false;
+    GLint abuf = 0, ebuf = 0;
+    pfn_glGetIntegerv(0x8894 /* ARRAY_BUFFER_BINDING */, &abuf);
+    pfn_glGetIntegerv(0x8895 /* ELEMENT_ARRAY_BUFFER_BINDING */, &ebuf);
+    if (ebuf) return false;
+    uint32_t maxi = 0;
+    size_t isz = type == 0x1401 ? 1 : type == 0x1403 ? 2 : 4;
+    for (GLsizei i = 0; i < count; ++i) {
+        uint32_t v = isz == 1 ? ((const uint8_t *)idx)[i]
+                   : isz == 2 ? ((const uint16_t *)idx)[i] : ((const uint32_t *)idx)[i];
+        if (v > maxi) maxi = v;
+    }
+    static GLuint bufs[17] = {0};
+    if (!bufs[0]) gen(17, bufs);
+    struct Saved { GLuint a; GLint sz, ty, norm, st; void *ptr; };
+    Saved saved[16]; int ns = 0;
+    for (GLuint a = 0; a < 16; ++a) {
+        GLint en = 0, buf = 0;
+        gav(a, 0x8622, &en); gav(a, 0x889F, &buf);
+        if (!en || buf) continue;
+        Saved sv{}; sv.a = a;
+        gav(a, 0x8623, &sv.sz); gav(a, 0x8625, &sv.ty); gav(a, 0x886A, &sv.norm); gav(a, 0x8624, &sv.st);
+        gptr(a, 0x8645, &sv.ptr);
+        if (!sv.ptr) continue;
+        size_t esz = (size_t)sv.sz * (sv.ty == 0x1406 || sv.ty == 0x1404 || sv.ty == 0x1405 ? 4 : sv.ty == 0x1402 || sv.ty == 0x1403 ? 2 : 1);
+        size_t stride = sv.st ? (size_t)sv.st : esz;
+        size_t bytes = (size_t)maxi * stride + esz;
+        bind(0x8892, bufs[1 + a]);
+        data(0x8892, (GLsizeiptr)bytes, sv.ptr, 0x88E0 /* STREAM_DRAW */);
+        pfn_glVertexAttribPointer(a, sv.sz, (GLenum)sv.ty, (GLboolean)sv.norm, sv.st, nullptr);
+        saved[ns++] = sv;
+    }
+    bind(0x8893, bufs[0]);
+    data(0x8893, (GLsizeiptr)(isz * (size_t)count), idx, 0x88E0);
+    static int nlog = 0;
+    if (nlog++ < 4)
+        fprintf(stderr, "[dbgvbo] draw count=%d maxidx=%u attrs=%d\n", (int)count, maxi, ns);
+    if (nlog <= 4 && pfn_glReadPixels) {
+        unsigned char px[4] = {0, 0, 0, 0};
+        pfn_glReadPixels(512, 288, 1, 1, 0x1908, 0x1401, px);
+        fprintf(stderr, "[dbgvbo] before center=%u,%u,%u,%u\n", px[0], px[1], px[2], px[3]);
+    }
+    pfn_glDrawElements(mode, count, type, nullptr);
+    if (nlog <= 4 && pfn_glReadPixels) {
+        unsigned char px[4] = {0, 0, 0, 0};
+        pfn_glReadPixels(512, 288, 1, 1, 0x1908, 0x1401, px);
+        GLenum e = pfn_glGetError ? pfn_glGetError() : 0;
+        fprintf(stderr, "[dbgvbo] after  center=%u,%u,%u,%u err=0x%x\n", px[0], px[1], px[2], px[3], e);
+    }
+    bind(0x8893, 0);
+    bind(0x8892, 0);
+    for (int i = 0; i < ns; ++i)
+        pfn_glVertexAttribPointer(saved[i].a, saved[i].sz, (GLenum)saved[i].ty,
+                                  (GLboolean)saved[i].norm, saved[i].st, saved[i].ptr);
+    bind(0x8892, (GLuint)abuf);
+    if (nlog <= 4)
+        for (int i = 0; i < ns; ++i) {
+            void *q = nullptr; gptr(saved[i].a, 0x8645, &q);
+            fprintf(stderr, "[dbgvbo] restored a%u ptr=%p (want %p)\n", saved[i].a, q, saved[i].ptr);
+        }
+    return true;
+}
+
+static void dbg_draw_probe(GLenum mode, GLsizei count, GLenum type, const void *idx) {
+    static long lim = -1;
+    static int noblend = 0, nodepth = 0, nocull = 0;
+    if (lim < 0) {
+        const char *e = lunaria_env("LUNARIA_DBG_DRAW");
+        lim = e ? strtol(e, nullptr, 10) : 0;
+        noblend = lunaria_env("LUNARIA_DBG_NOBLEND") != nullptr;
+        nodepth = lunaria_env("LUNARIA_DBG_NODEPTH") != nullptr;
+        nocull  = lunaria_env("LUNARIA_DBG_NOCULL") != nullptr;
+    }
+    if (pfn_glDisable) {
+        if (noblend) pfn_glDisable(0x0BE2);
+        if (nodepth) pfn_glDisable(0x0B71);
+        if (nocull)  pfn_glDisable(0x0B44);
+    }
+    static long n = 0;
+    if (n >= lim || !pfn_glGetIntegerv) return;
+    ++n;
+    typedef void (*PFActive)(GLuint, GLuint, GLsizei, GLsizei *, GLint *, GLenum *, char *);
+    typedef GLint (*PFLoc)(GLuint, const char *);
+    typedef void (*PFGetPtr)(GLuint, GLenum, void **);
+    typedef void (*PFGetAttribiv)(GLuint, GLenum, GLint *);
+    typedef void (*PFGetUf)(GLuint, GLint, GLfloat *);
+    typedef void (*PFGetProgiv)(GLuint, GLenum, GLint *);
+    typedef void (*PFGetFloatv)(GLenum, GLfloat *);
+    static PFActive act = (PFActive)host_gl_proc({"glGetActiveAttrib"});
+    static PFActive actu = (PFActive)host_gl_proc({"glGetActiveUniform"});
+    static PFLoc aloc = (PFLoc)host_gl_proc({"glGetAttribLocation"});
+    static PFLoc uloc = (PFLoc)host_gl_proc({"glGetUniformLocation"});
+    static PFGetPtr gptr = (PFGetPtr)host_gl_proc({"glGetVertexAttribPointerv"});
+    static PFGetAttribiv gav = (PFGetAttribiv)host_gl_proc({"glGetVertexAttribiv"});
+    static PFGetUf guf = (PFGetUf)host_gl_proc({"glGetUniformfv"});
+    static PFGetProgiv gpi = (PFGetProgiv)host_gl_proc({"glGetProgramiv"});
+    static PFGetFloatv gfv = (PFGetFloatv)host_gl_proc({"glGetFloatv"});
+    GLint prog = 0;
+    pfn_glGetIntegerv(0x8B8D, &prog);
+    GLint linked = -1, nattr = -1, nuni = -1;
+    if (gpi && prog) {
+        gpi((GLuint)prog, 0x8B82, &linked);
+        gpi((GLuint)prog, 0x8B89, &nattr);
+        gpi((GLuint)prog, 0x8B86, &nuni);
+    }
+    fprintf(stderr, "[dbgdraw] #%ld mode=0x%x count=%d type=0x%x prog=%d linked=%d attrs=%d uniforms=%d\n",
+            n, mode, (int)count, type, prog, linked, nattr, nuni);
+    for (GLint i = 0; act && aloc && i < nattr && i < 16; ++i) {
+        char nm[64] = {0}; GLsizei len = 0; GLint sz = 0; GLenum ty = 0;
+        act((GLuint)prog, (GLuint)i, sizeof nm, &len, &sz, &ty, nm);
+        fprintf(stderr, "[dbgdraw]   attr %s loc=%d type=0x%x\n", nm, aloc((GLuint)prog, nm), ty);
+    }
+    for (GLint i = 0; actu && uloc && i < nuni && i < 16; ++i) {
+        char nm[64] = {0}; GLsizei len = 0; GLint sz = 0; GLenum ty = 0;
+        actu((GLuint)prog, (GLuint)i, sizeof nm, &len, &sz, &ty, nm);
+        GLint l = uloc((GLuint)prog, nm);
+        GLfloat v[16] = {0};
+        if (guf && l >= 0 && (ty == 0x8B5C || ty == 0x8B52 || ty == 0x1406))
+            guf((GLuint)prog, l, v);
+        if (ty == 0x8B5C)
+            fprintf(stderr, "[dbgdraw]   uniform %s loc=%d mat4 [%g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g]\n",
+                    nm, l, v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8],v[9],v[10],v[11],v[12],v[13],v[14],v[15]);
+        else
+            fprintf(stderr, "[dbgdraw]   uniform %s loc=%d type=0x%x v=[%g %g %g %g]\n",
+                    nm, l, ty, v[0], v[1], v[2], v[3]);
+    }
+    for (GLuint a = 0; gav && gptr && a < 4; ++a) {
+        GLint en = 0, sz = 0, st = 0, ty = 0, buf = 0;
+        gav(a, 0x8622, &en); gav(a, 0x8623, &sz); gav(a, 0x8624, &st);
+        gav(a, 0x8625, &ty); gav(a, 0x889F, &buf);
+        void *ptr = nullptr; gptr(a, 0x8645, &ptr);
+        fprintf(stderr, "[dbgdraw]   va%u en=%d sz=%d stride=%d type=0x%x buf=%d ptr=%p\n",
+                a, en, sz, st, ty, buf, ptr);
+        if (a == 0 && en && !buf && ptr && ty == 0x1406 && idx && type == 0x1403) {
+            const uint16_t *ix = (const uint16_t *)idx;
+            for (int k = 0; k < 4 && k < count; ++k) {
+                const float *v = (const float *)((const char *)ptr + (size_t)ix[k] * (size_t)(st ? st : sz * 4));
+                fprintf(stderr, "[dbgdraw]     idx[%d]=%u pos=(%g, %g, %g)\n", k, ix[k], v[0], v[1], sz > 2 ? v[2] : 0.f);
+            }
+        }
+    }
+    GLint b[8] = {0}, cm[4] = {0}, vp[4] = {0}, sc[4] = {0};
+    GLint blend = 0, depth = 0, cull = 0, scis = 0, sten = 0, dmask = 0, dfunc = 0, ff = 0, cface = 0;
+    pfn_glGetIntegerv(0x0BE2, &blend); pfn_glGetIntegerv(0x0B71, &depth);
+    pfn_glGetIntegerv(0x0B44, &cull);  pfn_glGetIntegerv(0x0C11, &scis);
+    pfn_glGetIntegerv(0x0B90, &sten);  pfn_glGetIntegerv(0x0B72, &dmask);
+    pfn_glGetIntegerv(0x0B74, &dfunc); pfn_glGetIntegerv(0x0B46, &ff);
+    pfn_glGetIntegerv(0x0B45, &cface);
+    pfn_glGetIntegerv(0x80C9, &b[0]); pfn_glGetIntegerv(0x80C8, &b[1]);
+    pfn_glGetIntegerv(0x80CB, &b[2]); pfn_glGetIntegerv(0x80CA, &b[3]);
+    pfn_glGetIntegerv(0x8009, &b[4]); pfn_glGetIntegerv(0x883D, &b[5]);
+    pfn_glGetIntegerv(0x0C23, cm); pfn_glGetIntegerv(0x0BA2, vp); pfn_glGetIntegerv(0x0C10, sc);
+    GLfloat dr[2] = {0, 0};
+    if (gfv) gfv(0x0B70, dr);
+    fprintf(stderr, "[dbgdraw]   blend=%d src=0x%x dst=0x%x srcA=0x%x dstA=0x%x eq=0x%x/0x%x cmask=%d%d%d%d\n",
+            blend, b[0], b[1], b[2], b[3], b[4], b[5], cm[0], cm[1], cm[2], cm[3]);
+    fprintf(stderr, "[dbgdraw]   depth=%d func=0x%x mask=%d range=%g..%g cull=%d face=0x%x front=0x%x stencil=%d scissor=%d [%d %d %d %d] vp=[%d %d %d %d]\n",
+            depth, dfunc, dmask, dr[0], dr[1], cull, cface, ff, sten, scis, sc[0], sc[1], sc[2], sc[3], vp[0], vp[1], vp[2], vp[3]);
+}
+
 static void gldraw_dump_state() {
   if (!pfn_glGetIntegerv) return;
   GLint prog = 0, vbo = 0, ibo = 0, fbo = 0, tex = 0, vp[4] = {0,0,0,0};
@@ -16041,6 +16986,362 @@ static void gl_sample_fbos_at_present(void) {
       while (pfn_glGetError() != 0) {}
   }
   pfn_glBindFramebuffer(0x8D40, (GLuint)prev);
+}
+
+/* ETC1/ETC2/EAC on a host that cannot sample them (D3D11 under ANGLE, most
+ * desktop GPUs): ANGLE unpacks each one to plain RGBA on the CPU, 4-8x the
+ * VRAM of the compressed data.  ANGLE_lossy_etc_decode instead transcodes it
+ * to a format the GPU reads compressed (BC1/BC3/BC4/BC5), at a small loss of
+ * precision.  Used when the host offers it; LUNARIA_ETC_LOSSY=0 turns it off.
+ * The first few uploads of each format are checked with glGetError and a
+ * format ANGLE refuses goes back to the normal path for good. */
+static int g_etc_lossy = -1;
+static uint8_t g_etc_lossy_bad[16];     /* indexed by format - 0x9690 */
+static unsigned g_etc_lossy_checks[16];
+static std::unordered_set<GLuint> g_etc_lossy_tex;
+static unsigned long long g_etc_lossy_n, g_etc_lossy_bytes;
+
+static GLenum etc_lossy_format(GLenum f) {
+    if (g_etc_lossy < 0) {
+        const char *env = lunaria_env("LUNARIA_ETC_LOSSY");
+        const char *ext = pfn_glGetString ? (const char *)pfn_glGetString(0x1F03) : nullptr;
+        if (!ext) return 0;                       /* no current context yet: ask later */
+        g_etc_lossy = !(env && env[0] == '0') && strstr(ext, "GL_ANGLE_lossy_etc_decode");
+        fprintf(stderr, "[gl] ETC textures: %s\n", g_etc_lossy
+                ? "kept compressed on the GPU (ANGLE_lossy_etc_decode)"
+                : env && env[0] == '0' ? "unpacked by the host (LUNARIA_ETC_LOSSY=0)"
+                                       : "unpacked by the host (no ANGLE_lossy_etc_decode)");
+    }
+    if (!g_etc_lossy) return 0;
+    GLenum to = 0;
+    switch (f) {
+    case 0x8D64: to = 0x9690; break;            /* ETC1_RGB8_OES */
+    case 0x9270: to = 0x9691; break;            /* R11_EAC */
+    case 0x9271: to = 0x9692; break;            /* SIGNED_R11_EAC */
+    case 0x9272: to = 0x9693; break;            /* RG11_EAC */
+    case 0x9273: to = 0x9694; break;            /* SIGNED_RG11_EAC */
+    case 0x9274: to = 0x9695; break;            /* RGB8_ETC2 */
+    case 0x9275: to = 0x9696; break;            /* SRGB8_ETC2 */
+    case 0x9276: to = 0x9697; break;            /* RGB8_PUNCHTHROUGH_ALPHA1_ETC2 */
+    case 0x9277: to = 0x9698; break;            /* SRGB8_PUNCHTHROUGH_ALPHA1_ETC2 */
+    case 0x9278: to = 0x9699; break;            /* RGBA8_ETC2_EAC */
+    case 0x9279: to = 0x969A; break;            /* SRGB8_ALPHA8_ETC2_EAC */
+    default: return 0;
+    }
+    return g_etc_lossy_bad[to - 0x9690] ? 0 : to;
+}
+
+static GLuint etc_bound_texture(GLenum target) {
+    GLint t = 0;
+    const GLenum binding = (target >= 0x8515 && target <= 0x851A) ? 0x8514 /* CUBE_MAP */
+                                                                  : 0x8069 /* TEXTURE_2D */;
+    if (pfn_glGetIntegerv) pfn_glGetIntegerv(binding, &t);
+    return (GLuint)t;
+}
+
+/* While a format is still being checked, clear older errors first so a
+ * guest's earlier mistake is not blamed on the lossy upload. */
+static void etc_lossy_pre(GLenum to) {
+    if (g_etc_lossy_checks[to - 0x9690] < 8 && pfn_glGetError)
+        for (int i = 0; i < 8 && pfn_glGetError(); ++i) {}
+}
+
+/* True when the lossy call went through; false: the caller makes the normal call. */
+static bool etc_lossy_check(GLenum to, const char *what, GLenum from) {
+    unsigned &n = g_etc_lossy_checks[to - 0x9690];
+    if (n >= 8 || !pfn_glGetError) return true;
+    ++n;
+    const GLenum e = pfn_glGetError();
+    if (e == 0) return true;
+    g_etc_lossy_bad[to - 0x9690] = 1;
+    fprintf(stderr, "[gl] ETC lossy %s 0x%x -> 0x%x refused (0x%x); that format goes the normal way\n",
+            what, from, to, e);
+    return false;
+}
+
+/* LUNARIA_DBG_ETC=1: once, at the guest's first DrawElements, upload one
+ * known 4x4 ETC2 block (decodes to 255,2,2) through the lossy path and
+ * through the plain one, draw each into a 4x4 target and read it back.
+ * Proves the remap and the transcode without needing a game that ships ETC. */
+static bool astc_upload(bool sub, GLenum target, GLint level, GLint x, GLint y,
+                        GLsizei w, GLsizei h, GLenum fmt, GLsizei size, const void *data);
+static void dbg_etc_selftest() {
+    static int done = 0;
+    if (done || !lunaria_env("LUNARIA_DBG_ETC")) return;
+    done = 1;
+    typedef GLuint (*PFCreateShader)(GLenum);
+    typedef void (*PFShaderSource)(GLuint, GLsizei, const char *const *, const GLint *);
+    typedef void (*PFU1)(GLuint);
+    typedef GLuint (*PFCreateProgram)(void);
+    typedef void (*PFAttach)(GLuint, GLuint);
+    typedef void (*PFBindAttrib)(GLuint, GLuint, const char *);
+    typedef void (*PFGetiv)(GLuint, GLenum, GLint *);
+    typedef void (*PFGen)(GLsizei, GLuint *);
+    typedef void (*PFBind)(GLenum, GLuint);
+    typedef void (*PFFBTex)(GLenum, GLenum, GLenum, GLuint, GLint);
+    typedef void (*PFTexImage)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
+    typedef void (*PFTexParam)(GLenum, GLenum, GLint);
+    typedef void (*PFDrawArrays)(GLenum, GLint, GLsizei);
+    typedef void (*PFActive)(GLenum);
+    typedef void (*PFAttribPtr)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void *);
+    PFCreateShader cs = (PFCreateShader)host_gl_proc({"glCreateShader"});
+    PFShaderSource ss = (PFShaderSource)host_gl_proc({"glShaderSource"});
+    PFU1 comp = (PFU1)host_gl_proc({"glCompileShader"});
+    PFCreateProgram cp = (PFCreateProgram)host_gl_proc({"glCreateProgram"});
+    PFAttach at = (PFAttach)host_gl_proc({"glAttachShader"});
+    PFBindAttrib ba = (PFBindAttrib)host_gl_proc({"glBindAttribLocation"});
+    PFU1 link = (PFU1)host_gl_proc({"glLinkProgram"});
+    PFU1 use = (PFU1)host_gl_proc({"glUseProgram"});
+    PFGetiv gpi = (PFGetiv)host_gl_proc({"glGetProgramiv"});
+    PFGen gfb = (PFGen)host_gl_proc({"glGenFramebuffers"});
+    PFBind bfb = (PFBind)host_gl_proc({"glBindFramebuffer"});
+    PFFBTex fbt = (PFFBTex)host_gl_proc({"glFramebufferTexture2D"});
+    PFGen gt = (PFGen)host_gl_proc({"glGenTextures"});
+    PFBind bt = (PFBind)host_gl_proc({"glBindTexture"});
+    PFTexImage ti = (PFTexImage)host_gl_proc({"glTexImage2D"});
+    PFTexParam tp = (PFTexParam)host_gl_proc({"glTexParameteri"});
+    PFDrawArrays da = (PFDrawArrays)host_gl_proc({"glDrawArrays"});
+    PFActive act = (PFActive)host_gl_proc({"glActiveTexture"});
+    PFBind bbuf = (PFBind)host_gl_proc({"glBindBuffer"});
+    PFAttribPtr ap = (PFAttribPtr)host_gl_proc({"glVertexAttribPointer"});
+    PFU1 ena = (PFU1)host_gl_proc({"glEnableVertexAttribArray"});
+    if (!cs || !ss || !comp || !cp || !at || !ba || !link || !use || !gpi || !gfb || !bfb ||
+        !fbt || !gt || !bt || !ti || !tp || !da || !act || !bbuf || !ap || !ena ||
+        !pfn_glCompressedTexImage2D || !pfn_glReadPixels || !pfn_glGetIntegerv || !pfn_glGetError) {
+        fprintf(stderr, "[etctest] missing GL entry points\n");
+        return;
+    }
+    GLint prog0 = 0, fb0 = 0, tex0 = 0, abuf0 = 0, active0 = 0, vp[4] = {0};
+    pfn_glGetIntegerv(0x8B8D, &prog0);
+    pfn_glGetIntegerv(0x8CA6, &fb0);
+    pfn_glGetIntegerv(0x84E0, &active0);
+    pfn_glGetIntegerv(0x8894, &abuf0);
+    pfn_glGetIntegerv(0x0BA2, vp);
+    act(0x84C0);
+    pfn_glGetIntegerv(0x8069, &tex0);
+    typedef void (*PFGetPtr)(GLuint, GLenum, void **);
+    typedef void (*PFGetAttribiv)(GLuint, GLenum, GLint *);
+    PFGetPtr gptr = (PFGetPtr)host_gl_proc({"glGetVertexAttribPointerv"});
+    PFGetAttribiv gav = (PFGetAttribiv)host_gl_proc({"glGetVertexAttribiv"});
+    GLint a0sz = 4, a0ty = 0x1406, a0norm = 0, a0st = 0, a0en = 0, a0buf = 0; void *a0ptr = nullptr;
+    if (gav && gptr) {
+        gav(0, 0x8623, &a0sz); gav(0, 0x8625, &a0ty); gav(0, 0x886A, &a0norm);
+        gav(0, 0x8624, &a0st); gav(0, 0x8622, &a0en); gav(0, 0x889F, &a0buf); gptr(0, 0x8645, &a0ptr);
+    }
+    const GLboolean blend0 = pfn_glIsEnabled ? pfn_glIsEnabled(0x0BE2) : 0;
+    const GLboolean depth0 = pfn_glIsEnabled ? pfn_glIsEnabled(0x0B71) : 0;
+    const GLboolean sciss0 = pfn_glIsEnabled ? pfn_glIsEnabled(0x0C11) : 0;
+    static const char *vs = "attribute vec2 p;\nvarying vec2 uv;\n"
+        "void main(){ uv = p * 0.5 + 0.5; gl_Position = vec4(p, 0.0, 1.0); }\n";
+    static const char *fs = "precision mediump float;\nvarying vec2 uv;\nuniform sampler2D t;\n"
+        "void main(){ gl_FragColor = texture2D(t, uv); }\n";
+    GLuint v = cs(0x8B31), f = cs(0x8B30);
+    ss(v, 1, &vs, nullptr); comp(v);
+    ss(f, 1, &fs, nullptr); comp(f);
+    GLuint pr = cp(); at(pr, v); at(pr, f); ba(pr, 0, "p"); link(pr);
+    GLint ok = 0; gpi(pr, 0x8B82, &ok);
+    if (!ok) { fprintf(stderr, "[etctest] program did not link\n"); return; }
+    /* ETC2 RGB8 differential block: base 31,0,0 (5-bit), table 0, all indices 0 (+2). */
+    static const unsigned char block[8] = { 0xF8, 0x00, 0x00, 0x02, 0, 0, 0, 0 };
+    static const GLfloat tri[] = { -1.f, -1.f, 3.f, -1.f, -1.f, 3.f };
+    /* ASTC 4x4 void-extent block: constant colour, RGBA as UNORM16 = 1,0,0,1. */
+    static const unsigned char astc_block[16] = { 0xFC, 0xFD, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                                                  0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF };
+    GLuint fb = 0, target = 0, src[3] = {0, 0, 0};
+    gfb(1, &fb); gt(1, &target); gt(3, src);
+    bt(0x0DE1, target);
+    ti(0x0DE1, 0, 0x1908, 4, 4, 0, 0x1908, 0x1401, nullptr);
+    bfb(0x8D40, fb);
+    fbt(0x8D40, 0x8CE0, 0x0DE1, target, 0);
+    while (pfn_glGetError()) {}
+    for (int pass = 0; pass < 3; ++pass) {
+        GLenum fmt = pass == 2 ? 0x93B0 : 0x9274;
+        if (pass == 0) {
+            const GLenum lossy = etc_lossy_format(0x9274);
+            if (!lossy) { fprintf(stderr, "[etctest] lossy path not available here\n"); continue; }
+            fmt = lossy;
+        }
+        bt(0x0DE1, src[pass]);
+        if (pass == 2) {
+            if (!astc_upload(false, 0x0DE1, 0, 0, 0, 4, 4, fmt, 16, astc_block)) {
+                fprintf(stderr, "[etctest] ASTC path not active here (host has ASTC or LUNARIA_ASTC=0)\n");
+                continue;
+            }
+        } else {
+            pfn_glCompressedTexImage2D(0x0DE1, 0, fmt, 4, 4, 0, 8, block);
+        }
+        const GLenum e1 = pfn_glGetError();
+        tp(0x0DE1, 0x2801, 0x2600); tp(0x0DE1, 0x2800, 0x2600);
+        use(pr);
+        bbuf(0x8892, 0);
+        ap(0, 2, 0x1406, 0, 0, tri);
+        ena(0);
+        if (pfn_glViewport) pfn_glViewport(0, 0, 4, 4);
+        pfn_glDisable(0x0BE2); pfn_glDisable(0x0B71); pfn_glDisable(0x0C11);
+        da(0x0004, 0, 3);
+        unsigned char px[4] = {0};
+        pfn_glReadPixels(1, 1, 1, 1, 0x1908, 0x1401, px);
+        const GLenum e2 = pfn_glGetError();
+        fprintf(stderr, "[etctest] %s (0x%x): upload err=0x%x, drawn %u,%u,%u err=0x%x  (expect ~255,2,2)\n",
+                pass == 0 ? "lossy" : pass == 1 ? "plain" : "astc", fmt, e1, px[0], px[1], px[2], e2);
+    }
+    bfb(0x8D40, (GLuint)fb0);
+    bt(0x0DE1, (GLuint)tex0);
+    act((GLenum)active0);
+    use((GLuint)prog0);
+    bbuf(0x8892, (GLuint)a0buf);
+    ap(0, a0sz, (GLenum)a0ty, (GLboolean)a0norm, a0st, a0ptr);
+    if (!a0en && pfn_glDisableVertexAttribArray) pfn_glDisableVertexAttribArray(0);
+    bbuf(0x8892, (GLuint)abuf0);
+    if (blend0) pfn_glEnable(0x0BE2);
+    if (depth0) pfn_glEnable(0x0B71);
+    if (sciss0) pfn_glEnable(0x0C11);
+    if (pfn_glViewport) pfn_glViewport(vp[0], vp[1], vp[2], vp[3]);
+}
+
+/* ASTC on a host without it (D3D11 under ANGLE, most desktop GPUs): the
+ * guest is told ASTC works, and each ASTC upload is decoded and repacked here
+ * (luna_texcache.cpp: BC3 where the host has it and the level is a multiple
+ * of 4, else RGBA8), with the result cached on disk by content.
+ * LUNARIA_ASTC=0 turns it off, LUNARIA_ASTC=rgba skips the BC3 repack. */
+static int g_astc_emul = -1;
+static bool g_astc_bc3, g_astc_bc3_srgb;
+static std::unordered_map<GLuint, uint8_t> g_astc_tex_mode;   /* texture -> LUNA_TEX_* */
+static unsigned long long g_astc_n, g_astc_in, g_astc_out;
+
+static bool astc_emulated(void) {
+    if (g_astc_emul >= 0) return g_astc_emul != 0;
+    const char *ext = pfn_glGetString ? (const char *)pfn_glGetString(0x1F03) : nullptr;
+    if (!ext) return false;                      /* no current context yet: ask later */
+    const char *env = lunaria_env("LUNARIA_ASTC");
+    g_astc_emul = !(env && env[0] == '0') && !strstr(ext, "GL_KHR_texture_compression_astc_ldr");
+    g_astc_bc3 = strstr(ext, "GL_ANGLE_texture_compression_dxt5") ||
+                 strstr(ext, "GL_EXT_texture_compression_s3tc");
+    g_astc_bc3_srgb = strstr(ext, "GL_EXT_texture_compression_s3tc_srgb") != nullptr;
+    if (env && !strcmp(env, "rgba")) g_astc_bc3 = g_astc_bc3_srgb = false;
+    if (g_astc_emul)
+        fprintf(stderr, "[gl] ASTC: host has none; decoding to %s (sRGB: %s), cached on disk\n",
+                g_astc_bc3 ? "BC3" : "RGBA8", g_astc_bc3_srgb ? "BC3" : "RGBA8");
+    return g_astc_emul != 0;
+}
+
+static const GLenum kAstcFormats[28] = {
+    0x93B0, 0x93B1, 0x93B2, 0x93B3, 0x93B4, 0x93B5, 0x93B6, 0x93B7, 0x93B8, 0x93B9,
+    0x93BA, 0x93BB, 0x93BC, 0x93BD,
+    0x93D0, 0x93D1, 0x93D2, 0x93D3, 0x93D4, 0x93D5, 0x93D6, 0x93D7, 0x93D8, 0x93D9,
+    0x93DA, 0x93DB, 0x93DC, 0x93DD,
+};
+
+static GLuint astc_bound_texture(GLenum target) {
+    GLint t = 0;
+    const GLenum binding = (target >= 0x8515 && target <= 0x851A) ? 0x8514 /* CUBE_MAP */
+                                                                  : 0x8069 /* TEXTURE_2D */;
+    if (pfn_glGetIntegerv) pfn_glGetIntegerv(binding, &t);
+    return (GLuint)t;
+}
+
+/* The storage an ASTC texture of this size gets on this host. */
+static GLenum astc_storage_format(GLenum fmt, GLsizei w, GLsizei h, int *mode) {
+    int srgb = 0;
+    luna_astc_format(fmt, nullptr, nullptr, &srgb);
+    const bool bc3 = (srgb ? g_astc_bc3_srgb : g_astc_bc3) && w % 4 == 0 && h % 4 == 0;
+    *mode = bc3 ? LUNA_TEX_BC3 : LUNA_TEX_RGBA8;
+    if (bc3) return srgb ? 0x8C4F /* SRGB_ALPHA_S3TC_DXT5 */ : 0x83F3 /* RGBA_S3TC_DXT5 */;
+    return srgb ? 0x8C43 /* SRGB8_ALPHA8 */ : 0x8058 /* RGBA8 */;
+}
+
+/* One ASTC (sub-)image upload.  True when it was an ASTC format this path
+ * owns (handled, or dropped with a log line); false: not ours. */
+static bool astc_upload(bool sub, GLenum target, GLint level, GLint x, GLint y,
+                        GLsizei w, GLsizei h, GLenum fmt, GLsizei size, const void *data) {
+    int srgb = 0;
+    if (!luna_astc_format(fmt, nullptr, nullptr, &srgb) || !astc_emulated()) return false;
+    typedef void (*PFBind)(GLenum, GLuint);
+    typedef void *(*PFMap)(GLenum, GLintptr, GLsizeiptr, GLbitfield);
+    typedef GLboolean (*PFUnmap)(GLenum);
+    typedef void (*PFStore)(GLenum, GLint);
+    typedef void (*PFTexImage)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
+    typedef void (*PFTexSub)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void *);
+    static PFBind bind = (PFBind)host_gl_proc({"glBindBuffer"});
+    static PFMap map = (PFMap)host_gl_proc({"glMapBufferRange"});
+    static PFUnmap unmap = (PFUnmap)host_gl_proc({"glUnmapBuffer"});
+    static PFStore store = (PFStore)host_gl_proc({"glPixelStorei"});
+    static PFTexImage teximage = (PFTexImage)host_gl_proc({"glTexImage2D"});
+    static PFTexSub texsub = (PFTexSub)host_gl_proc({"glTexSubImage2D"});
+    if (size <= 0) return true;
+
+    /* With a pixel-unpack buffer bound, `data` is an offset into it. */
+    GLuint pbo = 0;
+    auto it = g_gl_bound_bufs.find(0x88ECu);
+    if (it != g_gl_bound_bufs.end()) pbo = it->second;
+    std::vector<uint8_t> copy;
+    const void *src = data;
+    if (pbo) {
+        if (!bind || !map || !unmap) return true;
+        void *m = map(0x88EC, (GLintptr)(uintptr_t)data, size, 0x0001 /* MAP_READ_BIT */);
+        if (!m) {
+            fprintf(stderr, "[gl] ASTC: could not read pixel-unpack buffer %u\n", pbo);
+            return true;
+        }
+        copy.assign((const uint8_t *)m, (const uint8_t *)m + size);
+        unmap(0x88EC);
+        src = copy.data();
+    }
+    if (!src) return true;
+
+    const GLuint tex = astc_bound_texture(target);
+    int mode = LUNA_TEX_RGBA8;
+    auto known = g_astc_tex_mode.find(tex);
+    if (known != g_astc_tex_mode.end() && (sub || level > 0)) {
+        mode = known->second;
+    } else if (sub) {
+        mode = LUNA_TEX_RGBA8;                  /* storage this path never saw */
+    } else {
+        astc_storage_format(fmt, w, h, &mode);
+        if (level == 0) g_astc_tex_mode[tex] = (uint8_t)mode;
+    }
+    if (mode == LUNA_TEX_BC3 && sub && (x % 4 || y % 4)) {
+        static int n = 0;
+        if (n++ < 4)
+            fprintf(stderr, "[gl] ASTC: sub-image at %d,%d is not 4-aligned for BC3; dropped\n", x, y);
+        return true;
+    }
+
+    int got = 0; void *out = nullptr; size_t out_size = 0;
+    if (luna_astc_transcode(fmt, w, h, src, (size_t)size, mode == LUNA_TEX_BC3, &got, &out, &out_size)) {
+        static int n = 0;
+        if (n++ < 8)
+            fprintf(stderr, "[gl] ASTC: 0x%x %dx%d (%d bytes) could not be decoded; dropped\n",
+                    fmt, w, h, size);
+        return true;
+    }
+    if (pbo) bind(0x88EC, 0);
+    if (got == LUNA_TEX_BC3) {
+        const GLenum f = srgb ? 0x8C4F : 0x83F3;
+        if (sub) pfn_glCompressedTexSubImage2D(target, level, x, y, w, h, f, (GLsizei)out_size, out);
+        else pfn_glCompressedTexImage2D(target, level, f, w, h, 0, (GLsizei)out_size, out);
+    } else if (teximage && texsub && store && pfn_glGetIntegerv) {
+        GLint row = 0, skr = 0, skp = 0, al = 4;
+        pfn_glGetIntegerv(0x0CF2, &row); pfn_glGetIntegerv(0x0CF3, &skr);
+        pfn_glGetIntegerv(0x0CF4, &skp); pfn_glGetIntegerv(0x0CF5, &al);
+        store(0x0CF2, 0); store(0x0CF3, 0); store(0x0CF4, 0); store(0x0CF5, 4);
+        if (sub) texsub(target, level, x, y, w, h, 0x1908, 0x1401, out);
+        else teximage(target, level, srgb ? 0x8C43 : 0x8058, w, h, 0, 0x1908, 0x1401, out);
+        store(0x0CF2, row); store(0x0CF3, skr); store(0x0CF4, skp); store(0x0CF5, al);
+    }
+    if (pbo) bind(0x88EC, pbo);
+    free(out);
+    g_astc_in += (unsigned long long)size;
+    g_astc_out += out_size;
+    if (g_astc_n++ < 3 || (g_astc_n & 255) == 0) {
+        unsigned long long hits = 0, misses = 0;
+        luna_texcache_stats(&hits, &misses);
+        fprintf(stderr, "[gl] ASTC: %llu uploads (%llu from disk cache, %llu converted), "
+                "%llu KB ASTC -> %llu KB %s (last 0x%x %dx%d)\n", g_astc_n, hits, misses,
+                g_astc_in >> 10, g_astc_out >> 10, got == LUNA_TEX_BC3 ? "BC3" : "RGBA8",
+                fmt, w, h);
+    }
+    return true;
 }
 
 /* LUNARIA_TRACE_TEX: what actually reaches a texture, and where it came from.
@@ -17111,6 +18412,25 @@ static bool g_slide_active = false;
 static float g_slide_x, g_slide_y;
 static long long g_slide_until;
 static bool g_slide_overlay = false;   /* the slide is driving the overlay's pointer */
+/* Where the wheel wants the finger. The finger glides there over a few frames
+ * instead of jumping: a whole notch (80 px) in one move reads to a Unity
+ * ScrollRect or a camera as a velocity spike followed by a dead stop, which
+ * Aloa described as wheel scrolling being "so bad and hard" (17-11). */
+static float g_slide_tx, g_slide_ty;
+static float g_slide_sx, g_slide_sy;   /* where this slide went down */
+static void slide_step() {
+    if (!g_slide_active) return;
+    float ddx = g_slide_tx - g_slide_x, ddy = g_slide_ty - g_slide_y;
+    const float d = std::sqrt(ddx * ddx + ddy * ddy);
+    if (d < 0.5f) return;
+    const float most = 22.f;   /* px per frame: a notch takes about 4 frames */
+    if (d > most) { ddx *= most / d; ddy *= most / d; }
+    g_slide_x += ddx;
+    g_slide_y += ddy;
+    if (g_slide_overlay) luna_overlay_pointer(g_slide_x, g_slide_y, -1);
+    else touch_contact(29, 2, g_slide_x, g_slide_y);
+    g_slide_until = std::max<long long>(g_slide_until, (long long)touch_now_ms() + 120);
+}
 static void slide_finish() {
   if (!g_slide_active) return;
   if (g_slide_overlay) luna_overlay_pointer(g_slide_x, g_slide_y, 0);
@@ -17118,9 +18438,17 @@ static void slide_finish() {
   g_slide_active = false;
   g_slide_overlay = false;
 }
+static void drag_flush();
+static void look_poll();
 static void pinch_poll() {
+    drag_flush();
+    look_poll();
   if (g_pinch_active && touch_now_ms() >= g_pinch_until) pinch_finish();
-  if (g_slide_active && touch_now_ms() >= g_slide_until) slide_finish();
+    slide_step();
+    if (g_slide_active && touch_now_ms() >= g_slide_until &&
+        std::fabs(g_slide_tx - g_slide_x) < 0.5f &&
+        std::fabs(g_slide_ty - g_slide_y) < 0.5f)
+        slide_finish();
 }
 
 static void glfw_window_close_cb(GLFWwindow *w) {
@@ -17128,11 +18456,136 @@ static void glfw_window_close_cb(GLFWwindow *w) {
   arm_exec_request_quit();
 }
 
+/* Mouse look: the cursor is locked to the window and hidden, the way
+ * Minecraft holds it, and its motion becomes a finger held on the camera side
+ * of the screen.  A touch game turns the camera with a swipe, so a mouse that
+ * has to be pressed, dragged, released and carried back to swipe again cannot
+ * aim (Aloa 17-11, Exploration Craft).  On with F8, or by itself when the game
+ * asks Android for pointer capture (Unity's Cursor.lockState = Locked calls
+ * View.requestPointerCapture).  Off with F8 or Esc, or when the window loses
+ * focus; a click brings it back if the game asked for it.  Left click while
+ * locked is a tap held at the centre of the screen, where the crosshair is.
+ * The finger lifts and comes back down at its anchor when it has travelled
+ * far, or after a short rest, as a thumb does. */
+static std::atomic<int>  g_look_want{-1};      /* guest request, applied on poll */
+static std::atomic<bool> g_look{false};
+static bool   g_look_guest = false;            /* the game asked for the lock */
+static double g_look_lx, g_look_ly;            /* last cursor, surface units */
+static float  g_look_fx, g_look_fy, g_look_ax, g_look_ay;
+static float  g_look_pdx = 0, g_look_pdy = 0;  /* motion not yet delivered */
+static bool   g_look_down = false, g_look_click = false;
+static long long g_look_last_ms = 0;
+/* The thumb comes back down as a NEW finger (28 and 26 alternate) and only
+ * after a two-frame rest. Same id straight away let a game whose frame took
+ * both the lift and the new press see one finger jump back to the anchor:
+ * the head snapped for a moment (Aloa 17-11, Exploration Craft). */
+static int g_look_id = 28;
+static long long g_look_rest_until = 0;
+extern "C" void arm_exec_pointer_capture(int on) {
+    g_look_want.store(on ? 1 : 0, std::memory_order_release);
+}
+extern "C" int arm_exec_pointer_captured(void) {
+    return g_look.load(std::memory_order_acquire) ? 1 : 0;
+}
+static void look_lift() {
+    if (g_look_down) {
+        touch_contact(g_look_id, 1, g_look_fx, g_look_fy);
+        g_look_id = g_look_id == 28 ? 26 : 28;
+        g_look_rest_until = (long long)touch_now_ms() + 34;
+    }
+    g_look_down = false;
+}
+static void look_set(bool on, const char *why) {
+    if (!g_glfw || on == g_look.load()) return;
+    if (on) {
+        glfwSetInputMode(g_glfw, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+#ifdef GLFW_RAW_MOUSE_MOTION
+        if (glfwRawMouseMotionSupported())
+            glfwSetInputMode(g_glfw, GLFW_RAW_MOUSE_MOTION, GLFW_TRUE);
+#endif
+        glfwGetCursorPos(g_glfw, &g_look_lx, &g_look_ly);
+        window_to_surface(&g_look_lx, &g_look_ly);
+        g_look_ax = g_fb_w * 0.72f;
+        g_look_ay = g_fb_h * 0.5f;
+        g_look_pdx = g_look_pdy = 0;
+    } else {
+        look_lift();
+        if (g_look_click) touch_contact(27, 1, g_fb_w * 0.5f, g_fb_h * 0.5f);
+        g_look_click = false;
+#ifdef GLFW_RAW_MOUSE_MOTION
+        if (glfwRawMouseMotionSupported())
+            glfwSetInputMode(g_glfw, GLFW_RAW_MOUSE_MOTION, GLFW_FALSE);
+#endif
+        glfwSetInputMode(g_glfw, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+    }
+    g_look.store(on, std::memory_order_release);
+    fprintf(stderr, "[input] mouse look %s (%s)\n", on ? "ON" : "off", why);
+}
+static void look_motion(double cx, double cy) {
+    window_to_surface(&cx, &cy);
+    g_look_pdx += (float)(cx - g_look_lx);
+    g_look_pdy += (float)(cy - g_look_ly);
+    g_look_lx = cx;
+    g_look_ly = cy;
+}
+static void look_poll() {
+    const int want = g_look_want.exchange(-1, std::memory_order_acq_rel);
+    if (want >= 0) {
+        g_look_guest = want != 0;
+        look_set(g_look_guest && glfwGetWindowAttrib(g_glfw, GLFW_FOCUSED),
+                 "the game asked for pointer capture");
+    }
+    if (!g_look.load()) return;
+    const long long now = (long long)touch_now_ms();
+    if (g_look_pdx == 0 && g_look_pdy == 0) {
+        if (g_look_down && now - g_look_last_ms > 300) look_lift();
+        return;
+    }
+    g_look_last_ms = now;
+    if (!g_look_down && now < g_look_rest_until) return;   /* motion waits */
+    if (!g_look_down) {
+        /* Down this frame, moving from the next: a phone never reports a
+         * contact's first sample already displaced, and a camera that sees
+         * one treats it as a jump. The motion waits one frame. */
+        g_look_fx = g_look_ax;
+        g_look_fy = g_look_ay;
+        touch_contact(g_look_id, 0, g_look_fx, g_look_fy);
+        g_look_down = true;
+        return;
+    }
+    g_look_fx += g_look_pdx;
+    g_look_fy += g_look_pdy;
+    g_look_pdx = g_look_pdy = 0;
+    const float reach = 0.30f * (float)std::min(g_fb_w, g_fb_h);
+    if (std::fabs(g_look_fx - g_look_ax) > reach || std::fabs(g_look_fy - g_look_ay) > reach ||
+        g_look_fx < 1 || g_look_fy < 1 || g_look_fx > g_fb_w - 2 || g_look_fy > g_fb_h - 2) {
+        look_lift();   /* the thumb runs out of room and comes back */
+        return;
+    }
+    touch_contact(g_look_id, 2, g_look_fx, g_look_fy);
+}
+
+static void drag_flush();
+/* The mouse's buttons, and the first finger on a touchscreen (button 0):
+ * cx/cy in surface pixels. */
 extern "C" void arm_exec_pointer_button(int button, int down, float cx, float cy) {
   pinch_finish();
   slide_finish();
   /* Right click is the emulator's, never the guest's: a touchscreen has no
    * second button, so no app is waiting for one. */
+  if (g_look.load()) {
+    if (button == 0) {
+      g_look_click = down != 0;
+      touch_contact(27, g_look_click ? 0 : 1, g_fb_w * 0.5f, g_fb_h * 0.5f);
+      return;
+    }
+    if (button == 2 && down)
+      look_set(false, "right click opens the menu");
+    else return;
+  } else if (g_look_guest && button == 0 && down && !luna_overlay_menu_showing()) {
+    look_set(true, "click back into a game that holds the pointer");
+    return;
+  }
   if (button == 2) {
     if (down) {
       keymap_release();
@@ -17152,6 +18605,7 @@ extern "C" void arm_exec_pointer_button(int button, int down, float cx, float cy
 }
 
 static void glfw_mouse_button_cb(GLFWwindow *w, int button, int action, int) {
+  drag_flush();   /* the last position before the button changes */
   double x = 0, y = 0;
   glfwGetCursorPos(w, &x, &y);
   window_to_surface(&x, &y);
@@ -17162,17 +18616,42 @@ static void glfw_mouse_button_cb(GLFWwindow *w, int button, int action, int) {
     arm_exec_pointer_button(pointer_button, action == GLFW_PRESS, (float)x, (float)y);
 }
 
-/* The mouse, or the first finger on a touchscreen, moved (surface pixels). */
-static void pointer_move(double cx, double cy) {
+/* A drag is delivered once per frame, at the newest position, the way a
+ * phone batches a touchscreen's samples into one ACTION_MOVE per vsync.
+ * Sending every cursor callback (a gaming mouse reports up to 1000 a second)
+ * made one MotionEvent each, every one through the Java input path, and the
+ * game's camera fell behind and jumped as the backlog drained (Aloa 17-11,
+ * Exploration Craft: "moving the camera was not possible... it would glitch"). */
+static bool g_drag_pending = false;
+static float g_drag_x, g_drag_y;
+static void drag_flush() {
+  if (!g_drag_pending) return;
+  g_drag_pending = false;
+  if (g_touch_down) touch_contact(0, 2, g_drag_x, g_drag_y);
+}
+
+/* The mouse, or the first finger on a touchscreen, moved (surface pixels).
+ * `batch` holds the move for drag_flush() at the end of the frame. */
+static void pointer_move(double cx, double cy, bool batch) {
   if (g_touch_down && edge_back_pointer(-1, (float)cx, (float)cy)) return;
   if (luna_overlay_pointer(cx, cy, -1)) return;
   if (!g_touch_down) return;   /* touchscreen semantics: no hover events */
-  touch_contact(0, 2, (float)cx, (float)cy);
+  if (!batch) {
+    touch_contact(0, 2, (float)cx, (float)cy);
+    return;
+  }
+  g_drag_x = (float)cx;
+  g_drag_y = (float)cy;
+  g_drag_pending = true;
 }
 
 static void glfw_cursor_pos_cb(GLFWwindow *, double cx, double cy) {
+  if (g_look.load()) {
+    look_motion(cx, cy);
+    return;
+  }
   window_to_surface(&cx, &cy);
-  pointer_move(cx, cy);
+  pointer_move(cx, cy, true);
 }
 
 /* A real touchscreen (luna_os_touch_attach).  The first finger is the
@@ -17181,10 +18660,7 @@ static void glfw_cursor_pos_cb(GLFWwindow *, double cx, double cy) {
  * contacts LUNA_HOST_TOUCH_ID.. while the first finger's touch is the
  * guest's; a gesture the overlay took stays the overlay's. */
 enum { FINGER_NONE = -1, FINGER_SWALLOWED = -2 };
-static int g_finger_contact[LUNA_HOST_FINGERS] = {
-  FINGER_NONE, FINGER_NONE, FINGER_NONE, FINGER_NONE, FINGER_NONE,
-  FINGER_NONE, FINGER_NONE, FINGER_NONE, FINGER_NONE, FINGER_NONE
-};
+static int g_finger_contact[LUNA_HOST_FINGERS];
 static void fingers_reset(void) {
   for (int &c : g_finger_contact) c = FINGER_NONE;
 }
@@ -17194,6 +18670,8 @@ static bool guest_has_contact(int id) {
   return false;
 }
 static void host_touch(int finger, int action, double wx, double wy) {
+  static const bool ready = (fingers_reset(), true);
+  (void)ready;
   if (action == 3) {   /* the system took the gesture */
     if (g_touch_state.count) touch_contact(0, 3, 0, 0);
     g_touch_down = false;
@@ -17223,7 +18701,7 @@ static void host_touch(int finger, int action, double wx, double wy) {
     return;
   }
   if (action == 2) {
-    if (contact == 0) pointer_move(x, y);
+    if (contact == 0) pointer_move(x, y, false);
     else if (contact >= LUNA_HOST_TOUCH_ID) touch_contact(contact, 2, (float)x, (float)y);
     return;
   }
@@ -17246,7 +18724,7 @@ static void glfw_scroll_cb(GLFWwindow *w, double dx, double dy) {
       dx = -dy;
       dy = 0;
     }
-    double cx = g_slide_x, cy = g_slide_y;
+        double cx = g_slide_tx, cy = g_slide_ty;
     if (!g_slide_active) {
       glfwGetCursorPos(w, &cx, &cy);
       window_to_surface(&cx, &cy);
@@ -17263,10 +18741,17 @@ static void glfw_scroll_cb(GLFWwindow *w, double dx, double dy) {
     const float step = 80.f;   /* pixels of finger travel per wheel notch */
     float nx = (float)cx + (float)dx * step * -1.f;
     float ny = (float)cy + (float)dy * step;
-    /* Out of room: lift and put the finger down again where it is. */
-    if (g_slide_active && (nx < 8 || ny < 8 || nx > sw - 8 || ny > sh - 8))
+        /* Out of room: lift, and put the finger down again at the pointer, so
+         * a long scroll in one direction does not lift on every notch at the
+         * edge it has reached. */
+        if (g_slide_active && (nx < 8 || ny < 8 || nx > sw - 8 || ny > sh - 8)) {
       slide_finish();
+            glfwGetCursorPos(w, &cx, &cy);
+            window_to_surface(&cx, &cy);
+        }
+        bool fresh = false;
     if (!g_slide_active) {
+            fresh = true;
       cx = std::min<double>(std::max<double>(cx, 8), sw - 8);
       cy = std::min<double>(std::max<double>(cy, 8), sh - 8);
       /* A Java window can contain a native SurfaceView. Its document
@@ -17274,17 +18759,35 @@ static void glfw_scroll_cb(GLFWwindow *w, double dx, double dy) {
        * route the slide by acceptance, not document visibility. */
       g_slide_overlay = luna_overlay_pointer(cx, cy, 1);
       if (!g_slide_overlay) touch_contact(29, 0, (float)cx, (float)cy);
-      g_slide_x = (float)cx;
-      g_slide_y = (float)cy;
+            g_slide_x = g_slide_tx = (float)cx;
+            g_slide_y = g_slide_ty = (float)cy;
+            g_slide_sx = g_slide_x;
+            g_slide_sy = g_slide_y;
       g_slide_active = true;
       nx = g_slide_x + (float)dx * step * -1.f;
       ny = g_slide_y + (float)dy * step;
     }
-    g_slide_x = std::min(std::max(nx, 4.f), (float)sw - 4.f);
-    g_slide_y = std::min(std::max(ny, 4.f), (float)sh - 4.f);
-    if (g_slide_overlay) luna_overlay_pointer(g_slide_x, g_slide_y, -1);
-    else touch_contact(29, 2, g_slide_x, g_slide_y);
+        /* A slide shorter than a drag is a tap. Unity's EventSystem (and
+         * Android's touch slop) call anything under ~10-20 px between down and
+         * up a click, so a touchpad's or a high-resolution wheel's small ticks
+         * clicked whatever button was under the pointer (Aloa 17-11, 2 Player
+         * Games: "scrolling was causing clicks"). Every slide travels at least
+         * 32 px from where it went down. */
+        {
+            const float vx = nx - g_slide_sx, vy = ny - g_slide_sy;
+            const float len = std::sqrt(vx * vx + vy * vy);
+            const float least = 32.f;
+            if (len > 0.01f && len < least) {
+                nx = g_slide_sx + vx * least / len;
+                ny = g_slide_sy + vy * least / len;
+            }
+        }
+        g_slide_tx = std::min(std::max(nx, 4.f), (float)sw - 4.f);
+        g_slide_ty = std::min(std::max(ny, 4.f), (float)sh - 4.f);
     g_slide_until = touch_now_ms() + 120;
+        /* Not in the frame it went down: a first sample already displaced
+         * reads as a jump, and down+move in one frame merge into one. */
+        if (!fresh) slide_step();
     return;
   }
   if (!std::isfinite(dy) || dy == 0 || (!g_pinch_active && g_touch_state.count) ||
@@ -17429,6 +18932,7 @@ static void keymap_apply_pending(void) {
 }
 static void glfw_focus_cb(GLFWwindow *, int focused) {
   if (focused) return;
+    look_set(false, "the window lost focus");
   pinch_finish();
   keymap_release();
   if (g_touch_state.count) touch_contact(0, 3, 0, 0);
@@ -17489,12 +18993,14 @@ static void glfw_key_cb(GLFWwindow *, int key, int scancode, int action, int mod
     return;
   }
   if (action != GLFW_PRESS && action != GLFW_RELEASE) return;
-  if (action == GLFW_PRESS && key == GLFW_KEY_F9) {
-    luna_input_record_toggle();
-    return;
-  }
-  if (action == GLFW_PRESS && key == GLFW_KEY_F10) {
-    luna_input_play_toggle();
+    if (action == GLFW_PRESS && key == GLFW_KEY_F9) { luna_input_record_toggle(); return; }
+    if (action == GLFW_PRESS && key == GLFW_KEY_F10) { luna_input_play_toggle(); return; }
+    if (action == GLFW_PRESS && key == GLFW_KEY_F8) {
+        look_set(!g_look.load(), "F8");
+        return;
+    }
+    if (key == GLFW_KEY_ESCAPE && g_look.load()) {
+        if (action == GLFW_PRESS) look_set(false, "Esc");
     return;
   }
   keymap_apply_pending();
@@ -18498,11 +20004,51 @@ static bool anw_post_locked_buffer(ArmExecCtx &ctx) {
   }
   if (ok) {
     ++g_guest_egl_swap_count;
+        frame_time_note();
     luna_boot_guest_presented();
     egl_on_swap_complete();
   }
   return ok == EGL_TRUE;
 }
+
+#ifdef _WIN32
+/* Does this PC have a working Vulkan driver at all?  ANGLE's Vulkan backend
+ * does not fail cleanly without one: on a machine with no Vulkan driver it
+ * crashed inside eglInitialize (an access violation in a lock in ntdll),
+ * where D3D11 would simply have worked.  So ask the Vulkan loader first:
+ * load vulkan-1.dll, create a bare instance, count the GPUs.  Anything short
+ * of one GPU means Vulkan is not usable and Lunaria stays on D3D11. */
+static bool host_vulkan_usable(char *why, size_t cap) {
+    struct VkAppInfo { int sType; const void *pNext; const char *app; uint32_t appv;
+                       const char *eng; uint32_t engv; uint32_t api; };
+    struct VkInstInfo { int sType; const void *pNext; uint32_t flags; const VkAppInfo *app;
+                        uint32_t nl; const char *const *l; uint32_t ne; const char *const *e; };
+    typedef void *(*GIPA)(void *, const char *);
+    typedef int (*CreateI)(const VkInstInfo *, const void *, void **);
+    typedef int (*EnumPD)(void *, uint32_t *, void **);
+    typedef void (*DestroyI)(void *, const void *);
+    void *lib = luna_os_library_open_local("vulkan-1.dll");
+    if (!lib) { snprintf(why, cap, "no vulkan-1.dll"); return false; }
+    GIPA gipa = (GIPA)luna_os_library_symbol(lib, "vkGetInstanceProcAddr");
+    CreateI create = gipa ? (CreateI)gipa(nullptr, "vkCreateInstance") : nullptr;
+    if (!create) { snprintf(why, cap, "vulkan-1.dll has no vkCreateInstance"); return false; }
+    VkAppInfo app = { 0 /* APPLICATION_INFO */, nullptr, "lunaria-probe", 1, "lunaria", 1,
+                      (1u << 22) | (1u << 12) /* 1.1 */ };
+    VkInstInfo ci = { 1 /* INSTANCE_CREATE_INFO */, nullptr, 0, &app, 0, nullptr, 0, nullptr };
+    void *inst = nullptr;
+    const int r = create(&ci, nullptr, &inst);
+    if (r != 0 || !inst) { snprintf(why, cap, "vkCreateInstance failed (%d): no Vulkan driver", r); return false; }
+    EnumPD enumpd = (EnumPD)gipa(inst, "vkEnumeratePhysicalDevices");
+    DestroyI destroy = (DestroyI)gipa(inst, "vkDestroyInstance");
+    uint32_t n = 0;
+    const int e = enumpd ? enumpd(inst, &n, nullptr) : -1;
+    if (destroy) destroy(inst, nullptr);
+    /* The loader stays loaded: ANGLE is about to load it again anyway. */
+    if (e != 0 || n == 0) { snprintf(why, cap, "Vulkan has no GPU (%d, %u devices)", e, n); return false; }
+    snprintf(why, cap, "%u Vulkan GPU%s", n, n == 1 ? "" : "s");
+    return true;
+}
+#endif
 
 // Initialize host-side EGL + GLES2 context and make it current.
 static bool g_activity_host_window;
@@ -18559,12 +20105,31 @@ static bool init_host_egl() {
       const char *backend = lunaria_env("LUNARIA_ANGLE_BACKEND");
 #ifdef _WIN32
       if (backend && !strcmp(backend, "vulkan")) {
+                char why[96];
+                if (!host_vulkan_usable(why, sizeof why)) {
+                    fprintf(stderr, "[arm_exec] init_host_egl: Vulkan was chosen but is not "
+                            "usable on this PC (%s); using DirectX 11 instead\n", why);
+                    /* The compositor's display reads the same key: keep it on D3D11 too. */
+                    luna_os_setenv("LUNARIA_ANGLE_BACKEND", "d3d11", 1);
+                    lunaria_env_invalidate();
+                    backend = nullptr;
+                } else
+                    fprintf(stderr, "[arm_exec] init_host_egl: Vulkan check: %s\n", why);
+            }
+            if (backend && !strcmp(backend, "vulkan")) {
+                luna_os_angle_vulkan_prepare();
         if (!initialize_angle(EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE, "Vulkan"))
           g_egl_dpy = EGL_NO_DISPLAY;
-      } else if (!initialize_angle(EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE, "D3D11") &&
-                 !initialize_angle(EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE, "Vulkan")) {
+            } else if (!initialize_angle(EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE, "D3D11")) {
+                /* D3D11's own fallback must not take the same crash. */
+                char why[96];
+                if (!host_vulkan_usable(why, sizeof why) ||
+                    (luna_os_angle_vulkan_prepare(),
+                     !initialize_angle(EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE, "Vulkan"))) {
+                    fprintf(stderr, "[arm_exec] init_host_egl: no usable backend (Vulkan: %s)\n", why);
         g_egl_dpy = EGL_NO_DISPLAY;
       }
+            }
 #else
       if (backend && !strcmp(backend, "metal")) {
         if (!initialize_angle(EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE, "Metal"))
@@ -18954,6 +20519,9 @@ static const std::vector<std::string> &guest_gl_extension_list(void)
         i = j + 1;
       }
       built = true;   /* only cache once a context answered */
+            if (astc_emulated() &&
+                std::find(list.begin(), list.end(), "GL_KHR_texture_compression_astc_ldr") == list.end())
+                list.push_back("GL_KHR_texture_compression_astc_ldr");
     }
   }
   return list;
@@ -19257,6 +20825,8 @@ static int egl_host_make_current(uint32_t draw_h, uint32_t read_h,
     g_egl_tid_read_surf.erase(g_current_tid);
     gl_tid_unmark(g_current_tid);
     egl_note_bound(0u, EGL_NO_SURFACE);
+        if (!g_a64_is_pump)
+            g_egl_guest_owns_window.store(false, std::memory_order_release);
     return EGL_TRUE;
   }
   /* Guest threads share a host rendering thread. The host EGL cannot
@@ -19278,6 +20848,44 @@ static int egl_host_make_current(uint32_t draw_h, uint32_t read_h,
   }
   EGLBoolean ok = (g_egl_dpy != EGL_NO_DISPLAY)
                   ? eglMakeCurrent(g_egl_dpy, draw, read_s, ectx) : EGL_FALSE;
+    EGLint retry_err = EGL_SUCCESS;
+    if (!ok && !g_a64_is_pump && draw != EGL_NO_SURFACE &&
+        (retry_err = eglGetError()) == EGL_BAD_ACCESS) {
+        /* The pump holds the surface. Ask it to let go and wait for it: a
+         * thread that runs on without its context reads every GL limit as 0
+         * and never draws. 3 s is far past the pump's frame period. */
+        g_egl_guest_wants_window.store(true, std::memory_order_release);
+        /* Name the holder before retrying: the retries themselves would fill
+         * the ring (r49-3: 1202 of them pushed the holder's bind out). */
+        luna_egl_mc_dump("guest eglMakeCurrent refused, before retrying");
+        const uint64_t t0 = host_mono_ns();
+        int tries = 0;
+        while (!ok && host_mono_ns() - t0 < 3'000'000'000ull) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            ++tries;
+            ok = (eglMakeCurrent)(g_egl_dpy, draw, read_s, ectx);
+            if (!ok) retry_err = eglGetError();
+        }
+        fprintf(stderr, "[egl] guest eglMakeCurrent ctx=0x%x on host thread %llx "
+                "refused (pump held the window surface); %s after %d retries, "
+                "%.1f ms\n", ctx_h, (unsigned long long)luna_os_thread_token(),
+                ok ? "bound" : "STILL REFUSED", tries,
+                (host_mono_ns() - t0) / 1e6);
+        if (ok) g_egl_guest_wants_window.store(false, std::memory_order_release);
+    }
+    if (ok && !g_a64_is_pump && draw == g_egl_surf)
+        g_egl_guest_owns_window.store(true, std::memory_order_release);
+    if (!ok) {
+        const EGLint err = (retry_err != EGL_SUCCESS) ? retry_err : eglGetError();
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1, std::memory_order_relaxed) < 32)
+            fprintf(stderr, "[egl] guest eglMakeCurrent FAILED: tid=%u (%s) ctx=0x%x "
+                    "draw=0x%x on host thread %llx, err=0x%x, was ctx=0x%x lr=0x%08x\n",
+                    g_current_tid, thread_name_of(g_current_tid), ctx_h, draw_h,
+                    (unsigned long long)luna_os_thread_token(), (unsigned)err,
+                    old_ctx_h, lr);
+        luna_egl_mc_dump("guest eglMakeCurrent refused");
+    }
   if (ok) {
     g_egl_tid_ctx[g_current_tid] = ctx_h;
     g_egl_tid_surf[g_current_tid] = draw_h;
@@ -19556,6 +21164,7 @@ extern "C" int arm_exec_egl_present_surface(uint32_t handle) {
   eglQueryContext(g_egl_dpy, eglGetCurrentContext(), EGL_CONTEXT_CLIENT_VERSION, &version);
   if (width <= 0 || height <= 0) return EGL_FALSE;
   ++g_guest_egl_swap_count;
+    frame_time_note();
   luna_boot_guest_presented();
   if (luna_comp_active()) {
     if (version < 3) {
@@ -19734,9 +21343,47 @@ extern "C" int arm_exec_egl_query_context(uint32_t ctx, int attr, int32_t *value
   return (int)ok;
 }
 
+/* A config's attributes never change while its display lives, and Unity asks
+ * for the same few every other frame: measured 2,233 calls in a 150 s run at
+ * ~0.6 ms each on ANGLE (the call waits on ANGLE's display lock while the
+ * compositor presents), each followed by an eglGetError that waited the same
+ * way.  Successful answers are kept per display/config/attribute; a hit also
+ * leaves EGL_SUCCESS as the guest's pending error, which is what the host call
+ * would have left, so the eglGetError after it is answered without ANGLE.
+ * LUNARIA_EGL_CFG_CACHE=0 turns it off. */
+static std::mutex g_egl_cfg_attr_mu;
+static std::map<std::tuple<EGLDisplay, EGLConfig, int>, EGLint> g_egl_cfg_attr;
+static int arm_exec_egl_get_config_attrib_host(EGLConfig hc, int attr, int32_t *value);
+
 extern "C" int arm_exec_egl_get_config_attrib(uint32_t cfg, int attr,
     int32_t *value) {
+    static const bool cache_on = [] {
+        const char *e = lunaria_env("LUNARIA_EGL_CFG_CACHE");
+        return !(e && e[0] == '0');
+    }();
   EGLConfig hc = resolve_egl_config(cfg);
+    if (!cache_on) return arm_exec_egl_get_config_attrib_host(hc, attr, value);
+    const auto key = std::make_tuple(g_egl_dpy, hc, attr);
+    {
+        std::lock_guard<std::mutex> lock(g_egl_cfg_attr_mu);
+        auto it = g_egl_cfg_attr.find(key);
+        if (it != g_egl_cfg_attr.end()) {
+            if (value) *value = it->second;
+            egl_set_guest_error(EGL_SUCCESS);
+            return (int)EGL_TRUE;
+        }
+    }
+    int32_t v = 0;
+    const int ok = arm_exec_egl_get_config_attrib_host(hc, attr, &v);
+    if (ok == (int)EGL_TRUE && g_egl_dpy != EGL_NO_DISPLAY && hc) {
+        std::lock_guard<std::mutex> lock(g_egl_cfg_attr_mu);
+        g_egl_cfg_attr.emplace(key, v);
+    }
+    if (value) *value = v;
+    return ok;
+}
+
+static int arm_exec_egl_get_config_attrib_host(EGLConfig hc, int attr, int32_t *value) {
   EGLint v = 0;
   EGLBoolean ok = (g_egl_dpy != EGL_NO_DISPLAY && hc)
                   ? eglGetConfigAttrib(g_egl_dpy, hc, (EGLint)attr, &v) : EGL_FALSE;
@@ -19913,14 +21560,6 @@ static thread_local bool g_scheduling = false;
  * start a whole second pass while the pump was inside one, and the two would
  * spend their time handing the execution lock back and forth. */
 static std::atomic<bool> g_pass_active{false};
-/* True on the host threads the A64 engine pool dispatches slices to.  They run
- * guest code but never the scheduler itself. */
-static thread_local bool g_a64_is_worker = false;
-/* The host thread that drives the frame pump. It owns the GL context, so it
- * is the only thread allowed to run a guest thread that has touched GL. "Not
- * a worker" is not the same test: every dvm bytecode thread also passes it,
- * and each one that ran a slice would build an engine of its own. */
-static thread_local bool g_a64_is_pump = false;
 /* Set once the frame pump's host thread exists.  Before that, GL-owning
  * guest threads have nowhere to be handed to. */
 static std::atomic<bool> g_a64_pump_started{false};
@@ -20400,7 +22039,7 @@ static void arsc_ensure_loaded() {
       arsc_read_pool(g_arsc.data() + hs, g_arsc.size() - hs, g_arsc_strings);
   }
   arsc_index_build(g_arsc.data(), g_arsc.size(), &g_arsc_index);
-  const char *splits = lunaria_env("ANDROID_SPLIT_APKS");
+    const char *splits = luna_env_long("ANDROID_SPLIT_APKS");
   struct arsc_source **tail = &g_arsc_splits;
   for (const char *p = splits; p && *p;) {
     const char *end = strchr(p, ';');
@@ -21618,6 +23257,61 @@ extern "C" void arm_exec_apk_version(int32_t *code, const char **name) {
   if (code) *code = g_apk_version_code > 0 ? g_apk_version_code : 1;
   if (name) *name = g_apk_version_name.empty() ? "1.0"
                       : g_apk_version_name.c_str();
+}
+
+/* versionCode / versionName of another APK on disk (a system package the
+ * user installed, e.g. Play services), read from its <manifest> element.
+ * Returns a bit set: 1 = code found, 2 = name found. */
+extern "C" int arm_exec_apk_file_version(const char *apk, int32_t *code,
+                                         char *name, size_t name_size) {
+    size_t len = 0;
+    uint8_t *buf = apk ? arm_exec_zip_read(apk, "AndroidManifest.xml", &len) : nullptr;
+    if (!buf) return 0;
+    int found = 0;
+    std::vector<std::string> strings;
+    if (len >= 16 && axml_load_strings(buf, len, strings)) {
+        size_t i = 8;
+        while (i + 8 <= len) {
+            uint16_t ct; uint32_t cs;
+            memcpy(&ct, buf + i, 2);
+            memcpy(&cs, buf + i + 4, 4);
+            if (cs < 8 || i + cs > len) break;
+            if (ct == 0x0102u && i + 30 <= len) {
+                int32_t name_idx; uint16_t attr_start, attr_size, attr_count;
+                memcpy(&name_idx, buf + i + 20, 4);
+                memcpy(&attr_start, buf + i + 24, 2);
+                memcpy(&attr_size, buf + i + 26, 2);
+                memcpy(&attr_count, buf + i + 28, 2);
+                const bool manifest = name_idx >= 0 && (size_t)name_idx < strings.size() &&
+                                      strings[(size_t)name_idx] == "manifest";
+                if (manifest && attr_size >= 20) {
+                    const size_t base = i + 16 + attr_start;
+                    for (uint16_t a = 0; a < attr_count; ++a) {
+                        const size_t ao = base + (size_t)a * attr_size;
+                        if (ao + 20 > len) break;
+                        int32_t an_idx; uint32_t dval;
+                        memcpy(&an_idx, buf + ao + 4, 4);
+                        const uint8_t typ = buf[ao + 15];
+                        memcpy(&dval, buf + ao + 16, 4);
+                        if (an_idx < 0 || (size_t)an_idx >= strings.size()) continue;
+                        const std::string &an = strings[(size_t)an_idx];
+                        if (an == "versionCode" && typ == 0x10) {
+                            if (code) *code = (int32_t)dval;
+                            found |= 1;
+                        } else if (an == "versionName" && typ == 0x03 &&
+                                   dval < strings.size() && name && name_size) {
+                            snprintf(name, name_size, "%s", strings[dval].c_str());
+                            found |= 2;
+                        }
+                    }
+                }
+                break; /* <manifest> is the root element */
+            }
+            i += cs;
+        }
+    }
+    free(buf);
+    return found;
 }
 
 /* The audio output the emulator presents.  AudioManager.getProperty() in the
@@ -22931,7 +24625,7 @@ static const char *map_guest_path_raw(const char *path, char *buf, size_t bufsz)
           const char *want = fname + 6;
           size_t wlen = strlen(want);
           if (wlen > 4 && !strcmp(want + wlen - 4, ".apk")) wlen -= 4;
-          const char *list = lunaria_env("ANDROID_SPLIT_APKS");
+                    const char *list = luna_env_long("ANDROID_SPLIT_APKS");
           for (const char *e = list; e && *e; ) {
             const char *bar = strchr(e, '|');
             const char *sep = strchr(e, ';');
@@ -23473,6 +25167,15 @@ static const char *map_guest_path(const char *path,char *buf,size_t capacity)
     return nullptr;
   }
   if (!*path || path_is_host_staging(path)) return guest_path_result(map_guest_path_raw(path,buf,capacity),buf,capacity);
+#ifdef _WIN32
+    /* A host drive path of ours that Java made "absolute" against user.dir
+     * "/" ("/C:/.../files/x") is still ours, not a guest path to confine
+     * under device-root (Play services' module config, 17-11). Only staged
+     * roots pass; any other drive path stays confined. */
+    if (path[0]=='/' && isalpha((unsigned char)path[1]) && path[2]==':' &&
+        (path[3]=='/' || path[3]=='\\') && path_is_host_staging(path+1))
+        return guest_path_result(map_guest_path_raw(path+1,buf,capacity),buf,capacity);
+#endif
   char apk_host[PATH_MAX];
   const char *apk_inner=nullptr;
   if (apk_path_locate(path,apk_host,sizeof apk_host,&apk_inner)) return guest_path_result(map_guest_path_raw(path,buf,capacity),buf,capacity);
@@ -30750,8 +32453,10 @@ static uint32_t posix_timer_signal_target(const struct luna_posix_timer *timer)
 }
 static void posix_timer_raise(ArmExecCtx &ctx,uint32_t tid,int sig)
 {
-  if(tid<4096 && tid>=256 && g_dvm_native_stacks[tid].attached)
+    if(tid<4096 && tid>=256 && g_dvm_native_stacks[tid].attached) {
     g_dvm_pending_signals[tid].fetch_or(UINT64_C(1)<<(sig-1),std::memory_order_release);
+        dvm_signal_kick();
+    }
   else guest_raise_signal(ctx,tid,sig);
 }
 static void posix_timer_poll(ArmExecCtx &ctx)
@@ -31402,9 +33107,13 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
           !last_report.compare_exchange_strong(prev, now)) return;
       fprintf(stderr, "[svctime] top by total time:\n");
       bool used[1024] = {};
-      for (int pass = 0; pass < 10; ++pass) {
-        int best = -1;
-        uint64_t bv = 0;
+            {
+                uint64_t all_ns = 0, all_calls = 0;
+                for (int i = 0; i < 1024; ++i) { all_ns += ns[i].load(); all_calls += calls[i].load(); }
+                fprintf(stderr, "[svctime] all: %llu calls, %.1f ms\n", (unsigned long long)all_calls, all_ns / 1e6);
+            }
+            for (int pass = 0; pass < 15; ++pass) {
+                int best = -1; uint64_t bv = 0;
         for (int i = 0; i < 1024; ++i)
           if (!used[i] && ns[i].load() > bv) {
             bv = ns[i].load();
@@ -31412,7 +33121,8 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
           }
         if (best < 0) break;
         used[best] = true;
-        fprintf(stderr, "[svctime]   svc=%d calls=%llu total=%.1fms avg=%.1fus\n", best,
+                fprintf(stderr, "[svctime]   svc=%d %-24s calls=%llu total=%.1fms avg=%.2fus\n", best,
+                        svc_symbol_name((uint32_t)best),
                 (unsigned long long)calls[best].load(), bv / 1e6,
                 bv / 1e3 / (double)std::max<uint64_t>(1, calls[best].load()));
       }
@@ -33488,6 +35198,10 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
         }
       } else if (g_svc_args64[0] == kPrGetNoNewPrivs) {
         ret64(g_guest_no_new_privs ? 1u : 0u);
+            } else if (g_svc_args64[0] == 0x59616d61ull /* PR_SET_PTRACER */) {
+                /* Android kernels build Yama in, so this succeeds there.
+                 * pairip sets it before forking its watchdog. */
+                ret64(0);
       } else {
         ret64((uint64_t)-(int64_t)EINVAL);
       }
@@ -34654,6 +36368,7 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
       ret32(guest_tid_of(g_current_tid));
       break;
     case 139: /* __NR_rt_sigreturn */
+            if (ctx.is_arm64) gc_ev_note('R', 0, 0);
       if (ctx.is_arm64 && a64_rt_sigreturn(ctx, g_current_tid)) {
         g_yield_requested = true;
         break;
@@ -35457,6 +37172,85 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
                           "0x%llx is not mapped\n",(unsigned long long)address);
         }
       }
+            /* DexClassLoader / PathClassLoader / BaseDexClassLoader /
+             * DelegateLastClassLoader(String dexPath, ...) built from native
+             * code: this NewObject reaches the jvm wrapper, never the dvm's
+             * own <init> (dexcl_init), so the dex the guest just wrote was
+             * never opened and every loadClass on it threw.  Firebase C++
+             * writes cache/app_resources_lib.jar and loads
+             * com/google/firebase/app/internal/cpp/Log from it; without it
+             * Firebase App never initialises (Aloa's LDoE, 14-11). */
+            if (cn && ctor_args[0].l &&
+                (!strcmp(cn, "dalvik/system/DexClassLoader") ||
+                 !strcmp(cn, "dalvik.system.DexClassLoader") ||
+                 !strcmp(cn, "dalvik/system/PathClassLoader") ||
+                 !strcmp(cn, "dalvik.system.PathClassLoader") ||
+                 !strcmp(cn, "dalvik/system/BaseDexClassLoader") ||
+                 !strcmp(cn, "dalvik.system.BaseDexClassLoader") ||
+                 !strcmp(cn, "dalvik/system/DelegateLastClassLoader") ||
+                 !strcmp(cn, "dalvik.system.DelegateLastClassLoader"))) {
+                const char *dp = jvm->native.GetStringUTFChars(
+                    env, (jstring)ctor_args[0].l, nullptr);
+                if (dp && *dp) {
+                    static std::mutex loaded_mx;
+                    static std::set<std::string> loaded;
+                    const char *apk = lunaria_env("ANDROID_APK_FILE");
+                    const char *code = lunaria_env("ANDROID_PACKAGE_CODE_PATH");
+                    std::string all(dp);
+                    size_t at = 0;
+                    while (at <= all.size()) {
+                        size_t end = all.find(':', at);
+                        if (end == std::string::npos) end = all.size();
+                        std::string one = all.substr(at, end - at);
+                        at = end + 1;
+                        if (one.empty() ||
+                            (apk && one == apk) || (code && one == code))
+                            continue;
+                        char mapped[PATH_MAX];
+                        const char *host = arm_exec_map_guest_path(
+                            one.c_str(), mapped, sizeof mapped);
+                        if (!host) continue;
+                        {
+                            std::lock_guard<std::mutex> lk(loaded_mx);
+                            if (!loaded.insert(host).second) continue;
+                        }
+                        unsigned char magic[4] = {0};
+                        if (FILE *f = luna_file_fopen(host, "rb")) {
+                            (void)!fread(magic, 1, sizeof magic, f);
+                            fclose(f);
+                        }
+                        int added = 0;
+                        if (magic[0] == 'P' && magic[1] == 'K') {
+                            for (int n = 1; n < 100; ++n) {
+                                char entry[32];
+                                if (n == 1) snprintf(entry, sizeof entry, "classes.dex");
+                                else snprintf(entry, sizeof entry, "classes%d.dex", n);
+                                size_t len = 0;
+                                unsigned char *d = arm_exec_zip_read(host, entry, &len);
+                                if (!d) break;
+                                if (dvm_jni_add_dex_memory(d, len, host)) ++added;
+                                free(d);
+                            }
+                        } else if (!memcmp(magic, "dex\n", 4)) {
+                            std::vector<uint8_t> bytes;
+                            if (FILE *f = luna_file_fopen(host, "rb")) {
+                                uint8_t buf[65536];
+                                size_t got;
+                                while ((got = fread(buf, 1, sizeof buf, f)) > 0)
+                                    bytes.insert(bytes.end(), buf, buf + got);
+                                fclose(f);
+                            }
+                            if (!bytes.empty() &&
+                                dvm_jni_add_dex_memory(bytes.data(), bytes.size(), host))
+                                ++added;
+                        }
+                        fprintf(stderr, "[arm_jni] %s: %s -> %d dex file(s) loaded\n",
+                                cn, host, added);
+                    }
+                }
+                if (dp)
+                    jvm->native.ReleaseStringUTFChars(env, (jstring)ctor_args[0].l, dp);
+            }
     }
     {
       const char *cn = ((uintptr_t)AS_CLASS(r1) <= 65536u && r1)
@@ -35733,7 +37527,10 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
       luna_file_mkdir(path, 0755);
       jobject file = jvm->native.AllocObject(env,
                                              jvm->native.FindClass(env, "java/io/File"));
-      jni_file_set_path(file, path);
+            /* Guest spelling, as getFilesDir() publishes (see jni_stubs.c getDir). */
+            char guest_dir[PATH_MAX];
+            const char *published = arm_exec_unmap_host_path(path, guest_dir, sizeof guest_dir);
+            jni_file_set_path(file, published ? published : path);
       fprintf(stderr, "[arm_jni] getDir(\"%s\") -> %s (0x%x)\n",
               utf ? utf : "", path, (uint32_t)(uintptr_t)file);
       if (utf)
@@ -37358,6 +39155,8 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
         if (is_copy)
           if (auto *q = ctx.mem.ptr(is_copy)) *q = 1;  /* JNI_TRUE */
         g_array_copies[addr] = bytes;
+                /* A heap offset: a64 needs the guest base on it, like GetStringUTFChars. */
+                g_svc_retptr = true;
         ret32(addr);
       } else {
         GuestVA buf = (GuestVA)r2;   /* the token arm_malloc handed out */
@@ -37500,6 +39299,7 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
     if (is_copy)
       if (auto *q = ctx.mem.ptr(is_copy)) *q = 1;   /* JNI_TRUE */
     g_array_copies[addr] = bytes;
+        g_svc_retptr = true;   /* a64: rebase the heap offset */
     ret32(addr);
     break;
   }
@@ -38355,6 +40155,13 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
   case SVC_SEM_POST: {
     GuestVA sva = argp(0);
     ++g_sems[sva];
+        {
+            /* Posted from inside a signal handler: a stop-the-world ack. */
+            const ArmThread *self = thread_slot_by_tid(g_current_tid);
+            if ((self && self->signal_depth) || g_main_signal_depth)
+                g_sem_signal_acked.insert(sva);
+        }
+        sem_history_note(sva, 1, g_sems[sva], lr);
     sem_wake_parked(sva, 1u);
     sched_pass_notify();
     if (lunaria_env("LUNARIA_TRACE_SEM")) {
@@ -38372,17 +40179,15 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
     break;
   case SVC_SEM_GETVALUE: {
     GuestVA sva = argp(0);
-    if (argp(1)) ctx.mem.write32(argp(1), (uint32_t)(g_sems.count(sva) ? g_sems[sva] : 0));
-    ret32(0);
-    break;
-  }
-  case SVC_SEM_TRYWAIT: {
-    int32_t &c = g_sems[argp(0)];
-    if (c > 0) {
-      --c;
-      ret32(0);
-      break;
+        int32_t value = g_sems.count(sva) ? g_sems[sva] : 0;
+        (void)sem_stale_token_repair(sva, value);
+        if (argp(1)) ctx.mem.write32(argp(1), (uint32_t)value);
+        sem_poll_note(sva, value, lr);
+        ret32(0); break;
     }
+    case SVC_SEM_TRYWAIT: {
+        int32_t &c = g_sems[argp(0)];
+        if (c > 0) { --c; sem_history_note(argp(0), -1, c, lr); ret32(0); break; }
     uint32_t eva = errno_va(ctx, g_current_tid);
     if (eva) ctx.mem.write32(eva, 11 /* EAGAIN */);
     ret32(~0u);
@@ -38422,11 +40227,7 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
     }
     if (ctx_innermost_is_cb()) {
       int32_t &count = g_sems[sva];
-      if (count > 0) {
-        --count;
-        ret32(0);
-        break;
-      }
+            if (count > 0) { --count; sem_history_note(sva, -1, count, lr); ret32(0); break; }
       /* A callback owns a separate JIT/stack. Halt that context until
        * a post supplies a token, without parking its borrowed tid. */
       g_cb_lock_wait.kind = CbLockWait::Sem;
@@ -38462,11 +40263,7 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
       }
     }
     int32_t &c = g_sems[sva];
-    if (c > 0) {
-      --c;
-      ret32(0);
-      break;
-    }
+        if (c > 0) { --c; sem_history_note(argp(0), -1, c, lr); ret32(0); break; }
     if (g_current_tid != 0) {
       if (timed && host_mono_ns() >= sem_until_ns) {
         if (uint32_t eva = errno_va(ctx, g_current_tid))
@@ -40455,6 +42252,7 @@ aaudio_write_retry:
     // Damage rectangles are a compositor hint; presenting the whole
     // surface satisfies the call (and is what a single-buffered host does).
     ++g_guest_egl_swap_count;
+        frame_time_note();
     /* The guest has a frame of its own now.  Whether the card comes down
      * is decided in luna_boot: the first swap is often blank while JIT is
      * still busy. */
@@ -41257,6 +43055,21 @@ aaudio_write_retry:
       ctx.mem.write32(r1, (uint32_t)guest_gl_extension_list().size());
       break;
     }
+        /* The ASTC this bridge decodes counts as a supported format. */
+        if ((r0 == 0x86A2 || r0 == 0x86A3) && r1 && pfn_glGetIntegerv && astc_emulated()) {
+            GLint n = 0;
+            pfn_glGetIntegerv(0x86A2, &n);
+            if (r0 == 0x86A2) {
+                ctx.mem.write32(r1, (uint32_t)(n + 28));
+            } else {
+                std::vector<GLint> host((size_t)(n > 0 ? n : 0) + 1);
+                if (n > 0) pfn_glGetIntegerv(0x86A3, host.data());
+                for (GLint i = 0; i < n; ++i) ctx.mem.write32(r1 + 4u * (uint32_t)i, (uint32_t)host[(size_t)i]);
+                for (int i = 0; i < 28; ++i)
+                    ctx.mem.write32(r1 + 4u * (uint32_t)(n + i), kAstcFormats[i]);
+            }
+            break;
+        }
     if (pfn_glGetIntegerv && r1) {
       GLint *out = (GLint *)ctx.mem.ptr(r1);
       pfn_glGetIntegerv((GLenum)r0, out);
@@ -41722,6 +43535,18 @@ aaudio_write_retry:
     const GuestVA p = argp_n(2);
     GLint v = 0;
     if (f) f((GLenum)r0, (GLenum)r1, &v);
+        /* A deferred map is invisible to the host: answer the map state the
+         * guest would see on a device. */
+        {
+            auto it = g_gl_mapped.find(gl_mapping_buffer((GLenum)r0));
+            if (it != g_gl_mapped.end() && it->second.deferred) {
+                const GlMappedBuf &m = it->second;
+                if (r1 == 0x88BCu) v = 1;                       /* GL_BUFFER_MAPPED */
+                else if (r1 == 0x911Fu) v = (GLint)m.access;    /* GL_BUFFER_ACCESS_FLAGS */
+                else if (r1 == 0x9120u) v = (GLint)m.len;       /* GL_BUFFER_MAP_LENGTH */
+                else if (r1 == 0x9121u) v = (GLint)m.off;       /* GL_BUFFER_MAP_OFFSET */
+            }
+        }
     if (p) ctx.mem.write32(p, (uint32_t)v);
     break;
   }
@@ -41832,6 +43657,23 @@ aaudio_write_retry:
       gl_trace_upload("CompressedImage", r0, r1, (int)r3, (int)h, 0, 0, r2,
                       0, data, (size_t)(sz > 0 ? sz : 0));
       ArmLockDropped unlocked; /* see the sub-image case */
+            if (astc_upload(false, (GLenum)r0, (GLint)r1, 0, 0, (GLsizei)r3, h, (GLenum)r2, sz, data))
+                break;
+            const GLenum lossy = etc_lossy_format((GLenum)r2);
+            if (lossy) {
+                etc_lossy_pre(lossy);
+                pfn_glCompressedTexImage2D((GLenum)r0,(GLint)r1,lossy,(GLsizei)r3,h,brd,sz,data);
+                if (etc_lossy_check(lossy, "image", (GLenum)r2)) {
+                    g_etc_lossy_tex.insert(etc_bound_texture((GLenum)r0));
+                    g_etc_lossy_bytes += (unsigned long long)(sz > 0 ? sz : 0);
+                    if (g_etc_lossy_n++ < 3 || (g_etc_lossy_n & 255) == 0)
+                        fprintf(stderr, "[gl] ETC lossy: %llu uploads, %llu KB kept compressed "
+                                "(last 0x%x %dx%d)\n", g_etc_lossy_n, g_etc_lossy_bytes >> 10,
+                                (unsigned)r2, (int)r3, (int)h);
+                    break;
+                }
+            }
+            if (!g_etc_lossy_tex.empty()) g_etc_lossy_tex.erase(etc_bound_texture((GLenum)r0));
       pfn_glCompressedTexImage2D((GLenum)r0,(GLint)r1,(GLenum)r2,(GLsizei)r3,h,brd,sz,data);
     }
     break;
@@ -41868,6 +43710,15 @@ aaudio_write_retry:
        * sleeper, so guest sleeps overshot by as much as 38 ms against a 37.9 ms
        * worst-case lock wait. Those are the same milliseconds. */
       ArmLockDropped unlocked;
+            if (astc_upload(true, (GLenum)r0, (GLint)r1, (GLint)r2, (GLint)r3, w, h, fmt, sz, data))
+                break;
+            /* Only into a level this path created: the format must match. */
+            const GLenum lossy = etc_lossy_format(fmt);
+            if (lossy && g_etc_lossy_tex.count(etc_bound_texture((GLenum)r0))) {
+                etc_lossy_pre(lossy);
+                pfn_glCompressedTexSubImage2D((GLenum)r0,(GLint)r1,(GLint)r2,(GLint)r3,w,h,lossy,sz,data);
+                if (etc_lossy_check(lossy, "sub-image", fmt)) break;
+            }
       pfn_glCompressedTexSubImage2D((GLenum)r0,(GLint)r1,(GLint)r2,(GLint)r3,w,h,fmt,sz,data);
     }
     break;
@@ -42037,6 +43888,7 @@ aaudio_write_retry:
           fclose(fp);
         }
       }
+            compat_check_shader_source(r0, src);
       /* Finish the GL_TEXTURE_EXTERNAL_OES -> GL_TEXTURE_2D mapping. Binding is
        * redirected (gl_map_target), and the shader side has to follow: an external
        * sampler reads the EXTERNAL_OES binding point, which nothing here ever
@@ -42117,6 +43969,12 @@ aaudio_write_retry:
       GLint *value = (GLint*)ctx.mem.ptr(r2);
       ArmLockDropped gl_unlocked;
       pfn_glGetShaderiv((GLuint)r0, (GLenum)r1, value);
+            if (r1 == 0x8B81u /* COMPILE_STATUS */ && value && !*value && pfn_glGetShaderInfoLog) {
+                char log[512] = {0};
+                GLsizei n = 0;
+                pfn_glGetShaderInfoLog((GLuint)r0, (GLsizei)sizeof log - 1, &n, log);
+                compat_report_failure("shader compile", (unsigned)r0, log);
+            }
       if (lunaria_env("LUNARIA_TRACE_GLSHADER") && value)
         fprintf(stderr, "[glsh] GetShaderiv(%u,0x%x)=%d tid=%u context=%p\n",
                 (unsigned)r0, (unsigned)r1, (int)*value,
@@ -42221,6 +44079,12 @@ aaudio_write_retry:
       GLint *value = (GLint*)ctx.mem.ptr(r2);
       ArmLockDropped gl_unlocked;
       pfn_glGetProgramiv((GLuint)r0, (GLenum)r1, value);
+            if (r1 == 0x8B82u /* LINK_STATUS */ && value && !*value && pfn_glGetProgramInfoLog) {
+                char log[512] = {0};
+                GLsizei n = 0;
+                pfn_glGetProgramInfoLog((GLuint)r0, (GLsizei)sizeof log - 1, &n, log);
+                compat_report_failure("program link", (unsigned)r0, log);
+            }
     }
     break;
   case SVC_GL_GetProgramInfoLog: {
@@ -42579,7 +44443,11 @@ aaudio_write_retry:
         const void *idx = gl_index_source(r3);
         if (pfn_glDrawElements && gl_index_valid)
         {
+                        dbg_selftest();
+                        dbg_etc_selftest();
+                        dbg_draw_probe((GLenum)r0, (GLsizei)r1, (GLenum)r2, idx);
           ArmLockDropped gl_unlocked;  /* see SVC_GL_Flush */
+                        if (!dbg_vbo_draw((GLenum)r0, (GLsizei)r1, (GLenum)r2, idx))
           pfn_glDrawElements((GLenum)r0,(GLsizei)r1,(GLenum)r2,
                              idx);
         }
@@ -50139,6 +52007,43 @@ fputws_done:
     uint32_t off = r1, len = r2, access = r3;
     uint32_t buf = gl_mapping_buffer((GLenum)r0);
     void *host = nullptr;
+        /* A write-only map never needs the host pointer: the guest only ever
+         * sees the shadow, and the bytes reach the buffer at unmap or flush.
+         * So skip the host map entirely and upload then.  Unity maps every
+         * dynamic vertex buffer this way each frame (WRITE|INVALIDATE_BUFFER,
+         * ~20 KB): measured ~0.4 ms a call through ANGLE's map/unmap, most of
+         * it dropping and retaking the execution lock around two host calls.
+         * Anything else (a read, a range past the end, no buffer bound) keeps
+         * the real map so GL raises the same errors.
+         * LUNARIA_GL_MAP_DEFER=0 turns it off. */
+        static const bool defer_on = [] {
+            const char *e = lunaria_env("LUNARIA_GL_MAP_DEFER");
+            return !(e && e[0] == '0');
+        }();
+        static auto gbi = (void (*)(GLenum, GLenum, GLint *))host_gl_proc({ "glGetBufferParameteriv" });
+        if (defer_on && buf && len && gbi && pfn_glBufferSubData && pfn_glBufferData &&
+            !(access & 0x0001u) /* READ */ && (access & 0x0002u) /* WRITE */ &&
+            !g_gl_mapped.count(buf)) {
+            GLint size = 0, usage = 0, mapped = 0;
+            gbi((GLenum)r0, 0x8764u /* GL_BUFFER_SIZE */, &size);
+            gbi((GLenum)r0, 0x8765u /* GL_BUFFER_USAGE */, &usage);
+            gbi((GLenum)r0, 0x88BCu /* GL_BUFFER_MAPPED */, &mapped);
+            if (size > 0 && !mapped && (uint64_t)off + len <= (uint64_t)size) {
+                uint32_t gva = arm_malloc(ctx, len);
+                if (gva) {
+                    GlMappedBuf m{ nullptr, gva, len, access };
+                    m.off = off; m.size = (uint32_t)size; m.usage = (GLenum)usage;
+                    m.deferred = true;
+                    g_gl_mapped[buf] = m;
+                    static int n = 0;
+                    if (n++ < 4)
+                        fprintf(stderr, "[gl] MapBufferRange deferred buf=%u off=%u len=%u "
+                                "access=0x%x size=%d\n", buf, off, len, access, size);
+                    if (ctx.is_arm64) retptr(gva); else ret32(gva);
+                    break;
+                }
+            }
+        }
     if (pfn_glMapBufferRange) {
       ArmLockDropped gl_unlocked;
       host = pfn_glMapBufferRange((GLenum)r0,(intptr_t)off,(intptr_t)len,
@@ -50257,6 +52162,23 @@ fputws_done:
   case SVC_GL_UnmapBufferOES:
   case SVC_GL3_UnmapBuffer: {
     auto it = g_gl_mapped.find(gl_mapping_buffer((GLenum)r0));
+        if (it != g_gl_mapped.end() && it->second.deferred) {
+            GlMappedBuf m = it->second;
+            g_gl_mapped.erase(it);
+            if (!(m.access & 0x0010u) /* FLUSH_EXPLICIT: the flushes already uploaded */) {
+                const void *src = ctx.mem.ptr(m.gva);
+                /* Replacing the whole buffer as INVALIDATE_BUFFER asked: one
+                 * glBufferData, which lets the driver orphan instead of wait. */
+                if ((m.access & 0x0008u) && m.off == 0 && m.len == m.size)
+                    pfn_glBufferData((GLenum)r0, (GLsizeiptr)m.len, src,
+                                     m.usage ? m.usage : 0x88E8u /* DYNAMIC_DRAW */);
+                else
+                    pfn_glBufferSubData((GLenum)r0, (GLintptr)m.off, (GLsizeiptr)m.len, src);
+            }
+            arm_free(ctx, m.gva);
+            ret32(1u);
+            break;
+        }
     if (it != g_gl_mapped.end()) {
       auto &m = it->second;
       // GL_MAP_WRITE_BIT without GL_MAP_FLUSH_EXPLICIT_BIT
@@ -50279,6 +52201,16 @@ fputws_done:
   }
   case SVC_GL3_FlushMappedBufferRange: {
     auto it = g_gl_mapped.find(gl_mapping_buffer((GLenum)r0));
+        if (it != g_gl_mapped.end() && it->second.deferred) {
+            const GlMappedBuf &m = it->second;
+            const uint32_t off = r1, len = r2;
+            if ((m.access & 0x0010u) && len && (uint64_t)off + len <= m.len)
+                pfn_glBufferSubData((GLenum)r0, (GLintptr)(m.off + off), (GLsizeiptr)len,
+                                    ctx.mem.ptr(m.gva + off));
+            else if (!(m.access & 0x0010u) || (uint64_t)off + len > m.len)
+                guest_gl_set_error(0x0502u /* GL_INVALID_OPERATION / VALUE, as the host would */);
+            break;
+        }
     if (it != g_gl_mapped.end()) {
       auto &m = it->second;
       uint32_t off = r1, len = r2;
@@ -50319,7 +52251,13 @@ fputws_done:
                       "%" PRIu64 "x%u\n", bound_tex, r0, r1, r2, r3, h);
     if (pfn_glTexStorage2D) {
       ArmLockDropped gl_unlocked;
-      pfn_glTexStorage2D((GLenum)r0,(GLsizei)r1,(GLenum)r2,(GLsizei)r3,
+            GLenum ifmt = (GLenum)r2;
+            if (luna_astc_format(ifmt, nullptr, nullptr, nullptr) && astc_emulated()) {
+                int mode = LUNA_TEX_RGBA8;
+                ifmt = astc_storage_format(ifmt, (GLsizei)r3, (GLsizei)h, &mode);
+                g_astc_tex_mode[astc_bound_texture((GLenum)r0)] = (uint8_t)mode;
+            }
+            pfn_glTexStorage2D((GLenum)r0,(GLsizei)r1,ifmt,(GLsizei)r3,
                          (GLsizei)h);
     }
     break;
@@ -52266,10 +54204,22 @@ fputws_done:
     uint32_t target_tid = guest_pthread_tid(argp(0));
     if (target_tid == UINT32_MAX) { ret32(ESRCH); break; }
     int      sig        = (int)r1;
+        gc_ev_note('K', target_tid, sig);
+        if (sig) g_last_kill_ns.store(host_mono_ns(), std::memory_order_relaxed);
     static int pkill_log = 0;
-    if (pkill_log++ < 20 || lunaria_env("LUNARIA_TRACE_SIG"))
-      fprintf(stderr, "[pthread_kill] target=0x%08x sig=%d lr=0x%08x sender=%u\n",
-              target_tid, sig, lr, g_current_tid);
+        if (pkill_log++ < 400) {
+            /* Who the sender is by every measure: the scheduler's tid, this
+             * host thread's Java identity, the callback depth, and the
+             * pthread_self() word the guest reads from its TLS.  A collector
+             * that signals its own thread under another identity waits for
+             * itself forever (Kefir logo freeze, 14-11). */
+            uint32_t self_word = 0;
+            if (ctx.is_arm64 && a64_has_private_tls(g_tpidr_el0_val))
+                self_word = ctx.mem.read32((GuestVA)(g_tpidr_el0_val + TLS64_SELF_OFF));
+            fprintf(stderr, "[pthread_kill] target=%u sig=%d sender=%u java-host=%u "
+                    "cb=%d self=%u lr=0x%08x\n", target_tid, sig, g_current_tid,
+                    g_dvm_guest_tid, g_cb_depth, self_word, lr);
+        }
 
     /* A pthread-directed signal belongs to the target's architectural
      * context.  Calling its handler here, on the sender's SVC stack, is a
@@ -52293,8 +54243,16 @@ fputws_done:
         break;
       }
       if (target_tid < 4096 && g_dvm_native_stacks[target_tid].attached) {
-        if (sig) g_dvm_pending_signals[target_tid].fetch_or(
+                if (sig) {
+                    g_dvm_pending_signals[target_tid].fetch_or(
             1ull << (unsigned)(sig - 1), std::memory_order_release);
+                    static unsigned dvm_kill_log;
+                    if (dvm_kill_log++ < 24u)
+                        fprintf(stderr, "[pthread_kill] Java thread target=%u sig=%d "
+                                "sender=%u\n", target_tid, sig, g_current_tid);
+                    /* A parked Java thread takes it in its wait loop. */
+                    dvm_signal_kick();
+                }
         ret32(0);
         break;
       }
@@ -52344,12 +54302,23 @@ fputws_done:
      * Share file I/O and kernel signal operations with raw svc#0, then
      * translate the kernel's -errno to libc -1/errno. In particular the
      * action/mask here use the kernel structure, not libc's sigaction. */
+        /* getrandom (A64 278, A32 384) too: BoringSSL (Conscrypt, inside Play
+         * services' ProviderInstaller) calls it through syscall(), and on
+         * ENOSYS falls back to open("/dev/urandom"), which a Windows host does
+         * not have -- it then perror()s and abort()s the calling thread. */
+        /* prctl (167) and clone (220) too: pairip (Google Play's anti-tamper,
+         * Shadow Fight Shades) calls prctl(PR_GET_DUMPABLE), prctl(PR_SET_PTRACER)
+         * and a bare fork through syscall(). Before 17-11 prctl fell to the
+         * default below and came back as 0xffffffff (a 32-bit -1 in a 64-bit
+         * long, so "dumpable = 4294967295"), and clone came back as a raw -38
+         * with no -1. The raw svc#0 handlers answer both properly. */
     if ((ctx.is_arm64 && (nr==19u || nr==20u || nr==21u || nr==22u ||
                           nr==47u || nr==50u || nr==55u || nr==129u || nr==63u || nr==64u || nr==57u || nr==90u ||
-                          nr==131u || nr==134u || nr==135u || nr==232u || nr==233u || nr==34u || nr==38u)) ||
+                          nr==131u || nr==134u || nr==135u || nr==232u || nr==233u || nr==34u || nr==38u ||
+                          nr==278u || nr==167u || nr==220u)) ||
         (!ctx.is_arm64 && (nr==352u || nr==95u || nr==133u || nr==207u || nr==3u || nr==4u || nr==6u || nr==184u ||
                            nr==90u || nr==91u || nr==125u || nr==192u || nr==219u || nr==220u || nr==323u || nr==329u ||
-                           nr==37u || nr==174u || nr==175u || nr==268u))) {
+                           nr==37u || nr==174u || nr==175u || nr==268u || nr==384u))) {
       const auto saved_args=g_svc_args64;
       auto kernel_regs=regs;
       GuestVA arguments[6];
@@ -52745,6 +54714,14 @@ fputws_done:
     default:
       if (uint32_t eva = errno_va(ctx, g_current_tid))
         ctx.mem.write32(eva, guest_errno_word(ENOSYS));
+            if (ctx.is_arm64) {
+                /* A 64-bit long: ret32(~0u) would be 4294967295, not -1. */
+                static std::atomic<uint32_t> n_unk{0};
+                if (n_unk.fetch_add(1, std::memory_order_relaxed) < 16)
+                    fprintf(stderr, "[syscall] syscall(%u) is not handled; returning -1/ENOSYS "
+                            "(tid=%u)\n", nr, g_current_tid);
+                ret64(UINT64_MAX);
+            } else
       ret32(~0u);
       break;
     }
@@ -62988,6 +64965,7 @@ static void schedule_threads(uint64_t slice) {
         t.sem_timed && host_mono_ns() >= t.sem_until_ns;
       if (it != g_sems.end() && it->second > 0) {
         --it->second;
+                sem_history_note(sva, -1, it->second, 0);
         t.regs[0]   = 0;
         t.regs64[0] = 0;
       } else if (sem_timed_out) {
@@ -63007,8 +64985,11 @@ static void schedule_threads(uint64_t slice) {
     if (t.waiting_futex) {
       GuestVA uaddr = t.waiting_futex;
       auto tok = g_futex_wake_tokens.find(uaddr);
+            /* A token on an address a starving callback has marked is that
+             * callback's (see g_cb_futex_starving). */
       const bool woken =
-        (tok != g_futex_wake_tokens.end() && tok->second > 0u);
+                (tok != g_futex_wake_tokens.end() && tok->second > 0u) &&
+                !cb_futex_starving(uaddr);
       const bool changed = (ctx.mem.read32(uaddr) != t.futex_val);
       const bool timed_out = t.futex_timed &&
                              host_mono_ns() >= t.futex_until_ns;
@@ -63906,6 +65887,96 @@ extern "C" void arm_exec_dvm_thread_detach(void)
   }
 }
 
+/* A signal sent to a DVM worker's Android identity.  The sender only sets a
+ * bit (SVC_PTHREAD_KILL); the worker takes it at its next SVC boundary
+ * (take_main_signal).  A Java thread parked in the VM -- Object.wait, a
+ * Looper poll, Thread.sleep -- runs no guest code and so never reaches one,
+ * while on Android the kernel would interrupt that wait and run the handler.
+ * Boehm's stop-the-world (il2cpp) is the case that matters: it sends its
+ * suspend signal to every thread that ever entered managed code, Java
+ * callback threads included, then polls its ack semaphore until each one
+ * answers.  One parked Java thread froze the game on the Kefir logo.
+ *
+ * So the VM's blocking waits call this when woken (dvm_signal_kick) and run
+ * the handler here, on the parked thread's own identity and stack, as a
+ * callback.  The handler's sigsuspend returns EINTR at once for a DVM
+ * identity, and Boehm loops on it until the restart signal, so the thread
+ * stays inside the handler for exactly the stop-the-world window. */
+extern "C" int arm_exec_dvm_signal_pending(void)
+{
+    const uint32_t tid = g_dvm_guest_tid;
+    if (!g_ctx || !g_ctx->is_arm64 || !tid || tid >= 256) return 0;
+    if (!g_dvm_native_stacks[tid].attached) return 0;
+    const uint64_t pend = g_dvm_pending_signals[tid].load(std::memory_order_acquire);
+    return (pend & ~signal_mask_load(tid)) ? 1 : 0;
+}
+
+extern "C" int arm_exec_dvm_take_signals(void)
+{
+    static thread_local bool busy = false;
+    static thread_local GuestVA si = 0, uc = 0;
+    if (busy || !arm_exec_dvm_signal_pending()) return 0;
+    const uint32_t tid = g_dvm_guest_tid;
+    auto &pending = g_dvm_pending_signals[tid];
+    int taken = 0;
+    for (int guard = 0; guard < 8 && !g_process_stopping.load(std::memory_order_relaxed); ++guard) {
+        GuestVA handler = 0;
+        int sig = 0;
+        uint64_t old_mask = 0;
+        {
+            ArmLockGuard g;
+            old_mask = signal_mask_load(tid);
+            const uint64_t bits = pending.load(std::memory_order_acquire) & ~old_mask;
+            if (!bits) break;
+            sig = (int)__builtin_ctzll(bits) + 1;
+            const uint64_t bit = 1ull << (unsigned)(sig - 1);
+            pending.fetch_and(~bit, std::memory_order_acq_rel);
+            handler = signal_handler_load(guest_pid(), sig);
+            if (handler == 0u) {            /* SIG_DFL */
+                if (guest_signal_default(sig) == SIGDEF_TERM ||
+                    guest_signal_default(sig) == SIGDEF_CORE) {
+                    fprintf(stderr, "Fatal signal %d (%s), code 0 (SI_USER) in "
+                            "tid %u (parked Java thread) - default action is "
+                            "to terminate\n", sig, guest_signal_name(sig), tid);
+                    arm_exec_request_quit();
+                }
+                continue;
+            }
+            if (handler == 1u) continue;    /* SIG_IGN */
+            const GuestSigAction sa = signal_action_load(guest_pid(), sig);
+            uint64_t mask = old_mask | sa.mask;
+            if (!(sa.flags & GUEST_SA_NODEFER)) mask |= bit;
+            signal_mask_store(tid, mask);
+            if (!si || !uc) {
+                const uint32_t sib = arm_malloc(*g_ctx, (uint32_t)A64_SIGINFO_SIZE);
+                const uint32_t ucb = arm_malloc(*g_ctx, (uint32_t)A64_UCONTEXT_SIZE);
+                if (!sib || !ucb) { signal_mask_store(tid, old_mask); break; }
+                si = a64_guest_va(sib);
+                uc = a64_guest_va(ucb);
+            }
+            a64_guest_memset(g_ctx->mem, si, 0, A64_SIGINFO_SIZE);
+            a64_guest_memset(g_ctx->mem, uc, 0, A64_UCONTEXT_SIZE);
+            g_ctx->mem.write32(si, (uint32_t)sig);          /* si_signo */
+            g_ctx->mem.write32(si + 8u, (uint32_t)-6);      /* SI_TKILL */
+            g_ctx->mem.write32(si + 16u, guest_pid());      /* si_pid */
+        }
+        if (handler < 0x100000000ull && !a64_is_guest_va(handler))
+            handler = a64_guest_va((BackingOffset)(uint32_t)handler);
+        static std::atomic<unsigned> said{0};
+        if (said.fetch_add(1, std::memory_order_relaxed) < 24u)
+            fprintf(stderr, "[signal] parked Java thread tid=%u takes sig %d "
+                    "(handler 0x%llx)\n", tid, sig, (unsigned long long)handler);
+        GuestArg args[3] = { guest_arg_j((uint64_t)sig), guest_arg_j(si), guest_arg_j(uc) };
+        gc_ev_note('E', tid, sig);
+        busy = true;
+        call_guest_abi64(*g_ctx, handler, args, 3, 'v', nullptr);
+        busy = false;
+        { ArmLockGuard g; signal_mask_store(tid, old_mask); }
+        ++taken;
+    }
+    return taken;
+}
+
 /* One emulated audio callback thread cannot execute two callbacks at once.
  * Guest callbacks release the execution lock while running/waiting, so a
  * second pump path may enter on another host thread. The active flag is
@@ -63930,7 +66001,37 @@ static void drive_opensles_callbacks(ArmExecCtx &ctx) {
                                  now % 1'000'000'000ull * rate / 1'000'000'000ull;
   static uint64_t silent_end = 0;
   if (silent_end < silent_played) silent_end = silent_played;
-  const unsigned target = rate / 10u; // bound output latency to 100 ms
+    /* How much to keep queued.  The pump runs from the frame loop and the
+     * scheduler, not from a timer, so the queue must outlast the longest gap
+     * between two pumps or the device runs dry.  It used to be a flat 100 ms,
+     * which is also 100 ms between a sound starting in the game and the
+     * speaker.  Now it follows the recent worst gap: 1.5x that plus 10 ms,
+     * kept between 40 and 100 ms.  The peak halves every 5 s of wall time,
+     * so one hitch raises the queue at once and it comes back down over
+     * several seconds.  LUNARIA_AUDIO_MS pins it. */
+    static int fixed_ms = -1;
+    static uint64_t last_pump_ns;
+    static double gap_peak_ms = 100.0;
+    static uint64_t next_log_ns;
+    if (fixed_ms < 0) {
+        const char *e = lunaria_env("LUNARIA_AUDIO_MS");
+        fixed_ms = e && *e ? atoi(e) : 0;
+        if (fixed_ms < 0 || fixed_ms > 500) fixed_ms = 0;
+    }
+    if (last_pump_ns) {
+        const double gap_ms = (double)(now - last_pump_ns) / 1e6;
+        gap_peak_ms *= std::exp2(-gap_ms / 5000.0);
+        if (gap_ms < 1000.0 && gap_ms > gap_peak_ms) gap_peak_ms = gap_ms;
+    }
+    last_pump_ns = now;
+    double target_ms = fixed_ms ? (double)fixed_ms : gap_peak_ms * 1.5 + 10.0;
+    if (!fixed_ms) target_ms = target_ms < 40.0 ? 40.0 : target_ms > 100.0 ? 100.0 : target_ms;
+    const unsigned target = (unsigned)((double)rate * target_ms / 1000.0);
+    if (now >= next_log_ns) {
+        next_log_ns = now + 10'000'000'000ull;
+        fprintf(stderr, "[audio] queue target %.0f ms (pump gap peak %.1f ms)%s\n",
+                target_ms, gap_peak_ms, fixed_ms ? " pinned by LUNARIA_AUDIO_MS" : "");
+    }
   unsigned callbacks = 0;
   for (unsigned pass = 0; pass < 64u; ++pass) {
     /* Restart the scan after guest code: a callback can destroy a player,
@@ -67182,6 +69283,9 @@ static bool guest_window_present_frame(void)
   if (g_egl_dpy == EGL_NO_DISPLAY || g_egl_surf == EGL_NO_SURFACE ||
       g_egl_ctx == EGL_NO_CONTEXT)
     return false;
+    /* The game holds (or is about to take) the window surface on its own
+     * host thread: binding it here would be refused, or would refuse it. */
+    if (egl_pump_must_yield_window()) return false;
 
   const uint64_t now = host_mono_ns();
   /* "The guest has stopped drawing": its swap counter has not moved for
@@ -70563,6 +72667,7 @@ a64_hooks_done:
      * normalises it into the A32 numbering the dispatcher switches on. */
     svc_ring_record(svc_no, (uint32_t)x30, (uint32_t)x0,
                     svc_no ? 0u : (uint32_t)jit64->GetRegister(8));
+        egl_poll_ctx_release();
 
     /* Detect loss of a TLS copy held in x23 (libyuanshen SSP prologue:
      * `mrs x23,tpidr_el0`).  Most frames never put TLS in x23; logging
@@ -73169,9 +75274,33 @@ static void heap_boost_owner(uint64_t owner) {
   sched_yield();
 }
 
+/* Which callback waits a signal may interrupt.  A futex or semaphore wait
+ * returns EINTR or restarts; a mutex or rwlock wait runs the handler and then
+ * goes on waiting, as on Linux, where those waits are futexes the kernel
+ * restarts.  The mutex case is the one Boehm's stop-the-world needs: a Java
+ * thread inside nativeRender that blocks on the allocation lock the collector
+ * holds must still ack the suspend signal, or the collector waits forever and
+ * the game freezes on the Kefir logo (seen 14-11, tid 76, sig 30 never taken). */
+static bool cb_wait_takes_signals(CbLockWait::Kind kind)
+{
+    /* Every kind, not only these: a wait left in place while the handler runs
+     * is granted under it, and the grant writes its result (0) into x0 -- the
+     * handler's signal number.  Boehm then aborts with "Bad signal in
+     * suspend_handler" (sleep and condition waits did this, intermittently,
+     * from ldoe15 on).  Sleep and condition waits are saved and resumed like a
+     * mutex wait: the handler runs, then the same wait carries on. */
+    return kind != CbLockWait::Idle;
+}
+
+/* Bumped every time a callback wait on this host thread ends, so the long-wait
+ * report below measures ONE wait. Before 17-11 it measured "same word, same
+ * kind" across waits, and a callback that took the guest heap lock thousands
+ * of times read as one 92-second wait on it (s57). */
+static thread_local uint64_t g_cbw_ended;
 static void cb_lock_wait_reset(void)
 {
   g_cb_lock_wait = {};
+    ++g_cbw_ended;
 }
 
 /* Attached Java threads have callback waits instead of ArmThread parks. A
@@ -73197,8 +75326,7 @@ static void cb_signal_suspend_wait(ArmExecCtx &ctx, ArmSignalFrameState &frame)
     return;
   }
   if (!g_cb_depth || g_cb_lock_wait.from_slice ||
-      (g_cb_lock_wait.kind != CbLockWait::Futex &&
-       g_cb_lock_wait.kind != CbLockWait::Sem)) return;
+        !cb_wait_takes_signals(g_cb_lock_wait.kind)) return;
   frame.callback_wait_slot = g_cb_depth - 1;
   g_cb_signal_wait[g_main_signal_depth] = *cb_wait_slot();
   if (g_cb_lock_wait.kind == CbLockWait::Futex)
@@ -73267,6 +75395,7 @@ static bool cb_lock_wait_try_grant(ArmExecCtx &ctx) {
    * that lock with guest SVCs.  Keep the check and grant atomic with their
    * updates, including when this callback was entered with the lock held. */
   ArmLockGuard wait_locked;
+    heap_reserve_expire();
   if (g_cb_lock_wait.kind == CbLockWait::Idle) return true;
   /* A sleep owns no word: the only condition is its deadline. */
   if(g_cb_lock_wait.kind==CbLockWait::RetrySleep) {
@@ -73289,7 +75418,7 @@ static bool cb_lock_wait_try_grant(ArmExecCtx &ctx) {
     const bool expired = g_cb_lock_wait.timed &&
                          host_mono_ns() >= g_cb_lock_wait.deadline_ns;
     if (!posted && !expired) return false;
-    if (posted) --it->second;
+        if (posted) { --it->second; sem_history_note(mva, -1, it->second, 0); }
     else if (uint32_t eva = errno_va(ctx, g_current_tid))
       ctx.mem.write32(eva, guest_errno_word(ETIMEDOUT));
     g_cb_resume_result = posted ? 0u : UINT64_MAX;
@@ -73309,10 +75438,110 @@ static bool cb_lock_wait_try_grant(ArmExecCtx &ctx) {
    * predicate, wait again, and spin at 1.5 million futex calls a second until
    * the 120-second abandon timer fired). */
   if (g_cb_lock_wait.kind == CbLockWait::Futex) {
-    const bool woken = futex_token_consume(mva);
+        bool woken = futex_token_consume(mva);
     const bool expired = g_cb_lock_wait.timed &&
                          host_mono_ns() >= g_cb_lock_wait.deadline_ns;
-    if (!woken && !expired) return false;
+        /* Fairness against parked guest threads: see g_cb_futex_starving. The
+         * clock runs across back-to-back waits on one word (a woken callback
+         * that loses the race for the lock and waits again is still the one
+         * that has waited longest); a gap of 100 ms starts it over. */
+        {
+            static thread_local GuestVA starve_va;
+            static thread_local uint64_t starve_since, starve_last;
+            const uint64_t now = host_mono_ns();
+            if (starve_va != mva || now - starve_last > 100'000'000ull) {
+                starve_va = mva;
+                starve_since = now;
+            }
+            starve_last = now;
+            const uint64_t waited = now - starve_since;
+            if (woken || expired) {
+                if (g_cb_futex_starving.erase(mva) && waited > 200'000'000ull) {
+                    static std::atomic<uint32_t> said{0};
+                    const uint32_t n = said.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (n <= 16 || (n & (n - 1)) == 0)
+                        fprintf(stderr, "[futex-fair] callback tid=%u got futex 0x%llx "
+                                "after %.0f ms ahead of parked threads (%u)%s\n",
+                                g_current_tid, (unsigned long long)mva, waited / 1e6, n,
+                                mva == a64_guest_va(HEAP_BASE + 8u) ? " [guest heap lock]" : "");
+                }
+            } else if (waited > 20'000'000ull) {
+                g_cb_futex_starving[mva] = now;
+            }
+        }
+        /* A lost wake strands this waiter for good: s52-2 (17-11) had a
+         * callback parked 31 s on the guest heap lock with the word at 0 (free)
+         * and 272,000 mallocs gone through since it went to sleep. The lock
+         * kept changing hands; this waiter's WAKE had gone to someone else and
+         * every later unlock saw the word uncontended and woke nobody. That
+         * stall is LDoE's "connection lost" (its network check times out
+         * behind it) and the 2 Player Games lockups.
+         * futex(2) allows a wait to return spuriously, and every correct user
+         * loops on its predicate (bionic's mutex re-marks itself contended with
+         * an exchange, which is what makes the next unlock wake it). So when
+         * the word has moved off the value this wait was entered on and no wake
+         * has come for 10 ms, return as woken (a guest thread's own park already
+         * ends the moment the word changes; this matches it, with a short grace). A wait whose word still holds
+         * the expected value is left alone: that one really is still asleep.
+         * LUNARIA_FUTEX_STALE_MS=0 turns this off. */
+        static thread_local GuestVA stale_va;
+        static thread_local uint64_t stale_since;
+        static thread_local GuestVA heap_wait_va;
+        static thread_local uint64_t heap_wait_since;
+        bool stale = false;
+        static const uint64_t stale_ns = [] {
+            const char *e = getenv("LUNARIA_FUTEX_STALE_MS");
+            return (uint64_t)(e ? atoll(e) : 10) * 1'000'000ull;
+        }();
+        if (!woken && !expired) {
+            /* The guest heap lock is the emulator's own (src/lib/guest.c), and
+             * its lock loop re-exchanges after every return, so on that word
+             * a wait with no wake for 50 ms just tries again whatever the word
+             * says. s55-1: the slow path was entered 82 times in the whole run,
+             * so the word sat at 0 between hundreds of thousands of fast-path
+             * cycles, and the one wake the waiter needed never arrived. */
+            if (heap_word_va(mva)) {
+                const uint64_t now = host_mono_ns();
+                if (heap_wait_va != mva) { heap_wait_va = mva; heap_wait_since = now; }
+                else if (now - heap_wait_since >= 50'000'000ull) {
+                    heap_wait_va = 0;
+                    static std::atomic<uint32_t> n_retry{0};
+                    const uint32_t n = n_retry.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (n <= 8 || (n & (n - 1)) == 0)
+                        fprintf(stderr, "[heap-retry] callback tid=%u: no wake on the guest "
+                                "heap lock in 50 ms (word=%u); retrying the exchange (%u so far)\n",
+                                g_current_tid, guest_word_load(ctx.mem, mva), n);
+                    stale = true;
+                }
+            }
+            if (!stale && (!stale_ns ||
+                           guest_word_load(ctx.mem, mva) == g_cb_lock_wait.futex_expected)) {
+                stale_va = 0;
+                return false;
+            }
+        }
+        if (stale) {
+            /* heap retry: fall through to the wake path */
+        } else if (!woken && !expired) {
+            const uint64_t now = host_mono_ns();
+            if (stale_va != mva) { stale_va = mva; stale_since = now; return false; }
+            if (now - stale_since < stale_ns) return false;
+            stale = true;
+            static std::atomic<uint32_t> n_stale{0};
+            const uint32_t n = n_stale.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 24 || (n & (n - 1)) == 0)
+                fprintf(stderr, "[futex-fix] callback tid=%u futex 0x%llx moved to "
+                        "0x%08x (waited for 0x%08x) and no wake came in %llu ms; "
+                        "returning as a spurious wake (%u so far)%s\n",
+                        g_current_tid, (unsigned long long)mva,
+                        guest_word_load(ctx.mem, mva), g_cb_lock_wait.futex_expected,
+                        (unsigned long long)((now - stale_since) / 1'000'000ull), n,
+                        mva == a64_guest_va(HEAP_BASE + 8u) ? " [guest heap lock]" : "");
+        }
+        stale_va = 0;
+        heap_wait_va = 0;
+        if (woken) heap_reserve_collect(mva);
+        if (stale) woken = true;
     futex_wait_addr_remove(mva);
     if (woken)
       g_cb_resume_result = 0u;
@@ -73407,8 +75636,137 @@ static bool cb_lock_wait_try_grant(ArmExecCtx &ctx) {
   }
 }
 
+/* A callback that has waited on one word for a long time is invisible to the
+ * thread dump: it borrows a tid but owns no ArmThread slot, so the 4-core
+ * Unity startup hang (16-11) showed every scheduler thread idle and the one
+ * thread that mattered, UnityMain inside pthread_cond_wait, nowhere at all.
+ * Say what it waits on, whether the word has moved since it was sampled (a
+ * signal that happened but whose WAKE was lost) and what the wake bookkeeping
+ * holds for it. Every 10 s per wait, so a stuck one keeps reporting. */
+/* malloc/free counters when this host thread's current callback wait began. */
+static thread_local uint64_t g_cbw_m0, g_cbw_f0;
+static void cb_lock_wait_long_report(ArmExecCtx &ctx, int depth) {
+    static thread_local GuestVA seen_va;
+    static thread_local uint8_t seen_kind;
+    static thread_local uint64_t since_ns, next_ns, seen_ended;
+    static std::atomic<int> reports{0};
+    const GuestVA va = g_cb_lock_wait.kind == CbLockWait::Cond
+                           ? g_cb_lock_wait.cond_va : g_cb_lock_wait.mva;
+    const uint64_t now = host_mono_ns();
+    if (va != seen_va || g_cb_lock_wait.kind != seen_kind || seen_ended != g_cbw_ended) {
+        seen_va = va; seen_kind = g_cb_lock_wait.kind; seen_ended = g_cbw_ended;
+        if (g_lh.ctl) { g_cbw_m0 = g_lh.ctl->malloc_calls; g_cbw_f0 = g_lh.ctl->free_calls; }
+        since_ns = now; next_ns = now + 5'000'000'000ull;
+        return;
+    }
+    if (now < next_ns || reports.load(std::memory_order_relaxed) >= 64) return;
+    next_ns = now + 10'000'000'000ull;
+    reports.fetch_add(1, std::memory_order_relaxed);
+    ArmLockGuard locked;
+    const uint32_t word = va && ctx.mem.ptr(va) ? ctx.mem.read32(va) : 0u;
+    auto wa = g_futex_wait_addrs.find(va);
+    fprintf(stderr, "[cbwait] tid=%u depth=%d kind=%u va=0x%llx word=0x%08x "
+            "expected=0x%08x %s mutex=0x%llx timed=%d for %.1fs tokens=%u "
+            "registered=%u scheduling=%d worker=%d\n",
+            g_current_tid, depth, (unsigned)g_cb_lock_wait.kind,
+            (unsigned long long)va, word, g_cb_lock_wait.futex_expected,
+            word != g_cb_lock_wait.futex_expected ? "MOVED" : "same",
+            (unsigned long long)g_cb_lock_wait.mva, (int)g_cb_lock_wait.timed,
+            (now - since_ns) / 1e9, futex_token_count(va),
+            wa == g_futex_wait_addrs.end() ? 0u : (unsigned)wa->second,
+            (int)g_scheduling, (int)g_a64_is_worker);
+    /* The wait seen in nearly every 4-core run (5-18 s, UnityMain) is on the
+     * guest heap's own lock (HEAP_BASE+8, lh_ctl.state). Its owner word names
+     * the holder's TPIDR_EL0; say who that is and what it is doing. A holder
+     * stopped by the GC inside malloc, or parked, is the whole answer. */
+    if (g_lh.ctl && va == a64_guest_va(HEAP_BASE + 8u)) {
+        /* ldoe48 answered "owner 0" with the word at 2: either nobody holds it
+         * and a wake was lost, or the holder took it and stopped before
+         * writing its name (a slice end delivers signals, and Boehm parks the
+         * thread right there). Progress tells them apart: malloc and free
+         * calls still counting = the lock changes hands and this waiter is
+         * not woken; standing still = it is held. */
+        uint64_t &seen_m = g_cbw_m0, &seen_f = g_cbw_f0;
+        const uint64_t m = g_lh.ctl->malloc_calls, f = g_lh.ctl->free_calls;
+        fprintf(stderr, "[cbwait]   heap: malloc_calls=%llu (+%llu since this wait began) "
+                "free_calls=%llu (+%llu) contended=%llu\n",
+                (unsigned long long)m, (unsigned long long)(m - seen_m),
+                (unsigned long long)f, (unsigned long long)(f - seen_f),
+                (unsigned long long)g_lh.ctl->contended);
+        for (auto &t : g_threads) {
+            if (t.finished || !(t.signal_depth || t.pending_signals ||
+                                t.waiting_futex == va))
+                continue;
+            fprintf(stderr, "[cbwait]   tid=%u (%s) in-signal-handler=%u pending=0x%llx "
+                    "running=%d futex=0x%llx sigsuspend-ish sleep=%d pc=0x%llx lr=0x%llx\n",
+                    t.id, thread_name_of(t.id), (unsigned)t.signal_depth,
+                    (unsigned long long)t.pending_signals, (int)t.running,
+                    (unsigned long long)t.waiting_futex, (int)(t.sleep_until_ns != 0),
+                    (unsigned long long)t.pc64, (unsigned long long)t.lr64);
+        }
+        const uint64_t owner = g_lh.ctl->owner;
+        const ArmThread *h = nullptr;
+        for (auto &t : g_threads)
+            if (!t.finished && t.tls64 == owner) { h = &t; break; }
+        if (!h)
+            fprintf(stderr, "[cbwait]   heap lock owner tls=0x%llx is no guest "
+                    "thread (a callback or the main thread)%s\n",
+                    (unsigned long long)owner,
+                    owner == g_tpidr_el0_val ? " - THIS callback's own tls" : "");
+        else
+            fprintf(stderr, "[cbwait]   heap lock held by tid=%u (%s): running=%d "
+                    "ready=%d in-signal-handler=%u pending-signals=0x%llx "
+                    "cond=0x%llx mutex=0x%llx futex=0x%llx sem=0x%llx sleep=%d "
+                    "slices=%llu pc=0x%llx lr=0x%llx\n", h->id, thread_name_of(h->id),
+                    (int)h->running, (int)g_in_ready[h->id], (unsigned)h->signal_depth,
+                    (unsigned long long)h->pending_signals,
+                    (unsigned long long)h->waiting_cond,
+                    (unsigned long long)h->waiting_mutex,
+                    (unsigned long long)h->waiting_futex,
+                    (unsigned long long)h->waiting_sem,
+                    (int)(h->sleep_until_ns != 0),
+                    (unsigned long long)h->slices,
+                    (unsigned long long)h->pc64, (unsigned long long)h->lr64);
+    }
+}
+
 static void cb_lock_wait_progress(ArmExecCtx &ctx, int depth) {
   if (g_cb_lock_wait.kind == CbLockWait::Idle) return;
+    cb_lock_wait_long_report(ctx, depth);
+    /* A Java thread blocked here on a guest lock must still take signals sent
+     * to it, as a Linux thread in futex_wait does (handler runs, wait goes
+     * on). Unity runs UnityMain on a Java host thread; before 17-11 only the
+     * VM's own waits took them, so the GC's stop-the-world signal (30) sat
+     * pending while UnityMain waited on the heap lock, the collector waited
+     * for its ack, and the heap lock's holder was already stopped: 11 s with
+     * no frame in Aloa's r28 LDoE run. The handler runs one nest level down,
+     * in its own wait slot, so this wait's record is untouched. */
+    if (ctx.is_arm64 && g_cb_depth < CB_MAX_DEPTH - 1 && arm_exec_dvm_signal_pending()) {
+        static std::atomic<unsigned> said{0};
+        if (said.fetch_add(1, std::memory_order_relaxed) < 16u)
+            fprintf(stderr, "[signal] tid=%u takes a pending signal inside a callback "
+                    "lock wait (kind=%u)\n", g_dvm_guest_tid, (unsigned)g_cb_lock_wait.kind);
+        (void)arm_exec_dvm_take_signals();
+        if (g_cb_lock_wait.kind == CbLockWait::Idle) return;
+    }
+    /* The pump lets go of the window when a guest bind wants it, but only at
+     * the top of its loop. A pump parked here, inside a callback waiting on a
+     * guest lock, never gets there: s53-1 (17-11) had Unity's first bind
+     * refused for 3 s while the pump sat in such a wait holding the bootstrap
+     * context on the window surface. Same test as the loop's. */
+    if (g_a64_is_pump && g_egl_guest_wants_window.load(std::memory_order_acquire) &&
+        g_egl_dpy != EGL_NO_DISPLAY && eglGetCurrentContext() != EGL_NO_CONTEXT &&
+        (eglGetCurrentContext() == g_egl_ctx ||
+         (eglGetCurrentSurface(EGL_DRAW) == g_egl_surf &&
+          g_egl_bound_handle < ARM_EGL_CTXTAB_BASE))) {
+        eglMakeCurrent(g_egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        egl_note_bound(0u, EGL_NO_SURFACE);
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1, std::memory_order_relaxed) < 8)
+            fprintf(stderr, "[egl] pump released the window surface from inside a "
+                    "callback wait (kind=%u) so the guest's bind can proceed\n",
+                    (unsigned)g_cb_lock_wait.kind);
+    }
   if (!g_scheduling || (!g_a64_is_worker &&
                         (ctx.is_arm64 || g_slice_depth <= CB_MAX_DEPTH))) {
     schedule_threads(env_ticks("LUNARIA_CB_MUTEX_TICKS", 2'000'000ULL));
@@ -73674,8 +76032,7 @@ static void call_guest_abi64(ArmExecCtx &ctx, GuestVA fn_va, const GuestArg *arg
         lock_abandon = true;
         break;
       }
-      if ((g_cb_lock_wait.kind == CbLockWait::Futex ||
-           g_cb_lock_wait.kind == CbLockWait::Sem) &&
+            if (cb_wait_takes_signals(g_cb_lock_wait.kind) &&
           cb.take_main_signal()) break;
       if (cb_lock_wait_try_grant(ctx)) break;
       if (trace_wait && host_mono_ns() >= wait_trace_at) {
@@ -76067,6 +78424,33 @@ static bool dvm_call_guest_native(const char *klass, const char *method,
       fprintf(stderr, "[dvm] native %s.%s%s -> 0x%llx (%d args)\n",
               klass, method, sig, (unsigned long long)fn, ng - 2);
   }
+    /* pairip's VM decodes every address as (enc ^ ~len) % len over the byte[]
+     * it is handed, so one wrong byte or a wrong length turns its first run into
+     * a load of a garbage pointer. Shadow Fight (Aloa 17-11) died that way, the
+     * same address every launch. Say exactly what it was given, so the bytes
+     * can be checked against the asset file in the APK. */
+    if (!strcmp(method, "executeVM") && sig[0] == '(' && sig[1] == '[' && sig[2] == 'B' &&
+        nargs >= 1 && g_ctx->jvm && args[0].l) {
+        struct jvm *jvm = g_ctx->jvm;
+        JNIEnv *env = &jvm->env;
+        const jsize len = jvm->native.GetArrayLength(env, (jarray)args[0].l);
+        jbyte *b = jvm->native.GetByteArrayElements(env, (jbyteArray)args[0].l, nullptr);
+        uint64_t h = 1469598103934665603ull;
+        char head[3 * 32 + 1] = {0};
+        for (jsize i = 0; b && i < len; ++i) {
+            h = (h ^ (uint8_t)b[i]) * 1099511628211ull;
+            if (i < 32) snprintf(head + 3 * i, 4, "%02x ", (unsigned)(uint8_t)b[i]);
+        }
+        jsize objs = -1;
+        if (nargs >= 2 && args[1].l)
+            objs = jvm->native.GetArrayLength(env, (jarray)args[1].l);
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1, std::memory_order_relaxed) < 8)
+            fprintf(stderr, "[pairip] executeVM bytecode len=%d fnv1a64=%016llx "
+                    "objects=%d head: %s\n", (int)len, (unsigned long long)h,
+                    (int)objs, head);
+        if (b) jvm->native.ReleaseByteArrayElements(env, (jbyteArray)args[0].l, b, JNI_ABORT);
+    }
 
   /* A Runnable delivered by the host pump is a Java/ART thread too, but it
    * does not pass through bytecode_thread_main().  Give that top-level
@@ -77159,6 +79543,19 @@ extern "C" void arm64_exec_threads_run_engine(int on) {
 extern "C" void arm64_exec_run_pending_threads(void) {
   g_a64_is_pump = true;   /* this is the frame pump's host thread */
   g_a64_pump_started.store(true, std::memory_order_release);
+    /* A guest bind on another host thread was refused because the pump still
+     * holds the bootstrap context with the window surface: let go here, at a
+     * point where the pump holds no lock the waiting thread could need. */
+    if (g_egl_guest_wants_window.load(std::memory_order_acquire) &&
+        g_egl_dpy != EGL_NO_DISPLAY && eglGetCurrentContext() != EGL_NO_CONTEXT &&
+        (eglGetCurrentContext() == g_egl_ctx ||
+         (eglGetCurrentSurface(EGL_DRAW) == g_egl_surf &&
+          g_egl_bound_handle < ARM_EGL_CTXTAB_BASE))) {
+        /* The bootstrap context, or any context that is not a guest's own
+         * (the overlay's, a card's) holding the window surface here. */
+        eglMakeCurrent(g_egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        egl_note_bound(0u, EGL_NO_SURFACE);
+    }
   // During bootstrap, workers need long slices to finish Unity's thread-pool setup.
   if (!g_ctx || !g_ctx->jit64) return;
   uint64_t slice = env_ticks("LUNARIA_THREAD_TICKS", UINT64_MAX);

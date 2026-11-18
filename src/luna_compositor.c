@@ -12,6 +12,7 @@
 
 #include "luna_boot.h"
 #include "luna_qfkey.h"
+#include "lunaria_os.h"
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -27,6 +28,11 @@
 #include <time.h>
 #include <zlib.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#include <EGL/eglext_angle.h>
+#endif
+
 #define SLOTS 3
 
 static EGLDisplay g_dpy = EGL_NO_DISPLAY;
@@ -34,6 +40,25 @@ static EGLConfig  g_cfg;
 static EGLContext g_ctx = EGL_NO_CONTEXT;
 static EGLSurface g_win = EGL_NO_SURFACE;
 static EGLNativeWindowType g_native;
+
+/* Windows: ANGLE gives every context on one EGLDisplay the same D3D11 device,
+ * and its D3D11 state cache is per device, not per context.  With the
+ * compositor drawing on its own thread while the guest draws on another,
+ * the guest's draws went to whatever render target the compositor had bound
+ * last: clears (which name their target) still landed, every draw vanished,
+ * and Unity titles showed only their clear colour.  So on Windows the
+ * compositor runs on a display of its own (a separate device) and frames
+ * cross over as pixels, the path Vulkan frames already use.
+ * LUNARIA_COMP_SHARED_DISPLAY=1 restores the shared display. */
+static bool g_own_display;
+static EGLDisplay g_guest_dpy = EGL_NO_DISPLAY;
+/* Frames between the two devices without a CPU round trip: each slot is a
+ * pbuffer on the guest's display whose D3D11 texture is opened on the
+ * compositor's through its share handle (EGL_ANGLE_surface_d3d_texture_2d_
+ * share_handle / EGL_ANGLE_d3d_share_handle_client_buffer).  Anything missing
+ * or failing drops back to pixels.  LUNARIA_COMP_SHARE=0 forces pixels. */
+static int   g_share_state;            /* 0 untried, 1 on, -1 off */
+static void *g_slot_handle[SLOTS];     /* under g_mu */
 
 static atomic_bool g_active;
 static atomic_ullong g_frames;
@@ -57,6 +82,7 @@ static EGLSync  g_ready_fence[SLOTS];  /* the copy into the slot is done */
 static EGLSync  g_release_fence[SLOTS];/* the compositor is done reading it */
 static int      g_queued = -1, g_shown = -1;
 static int      g_frame_w[SLOTS], g_frame_h[SLOTS];
+static atomic_uint g_comp_frames;     /* distinct guest frames the compositor got */
 static bool     g_wake;
 
 /* Guest side: per guest share group (keyed by the presenting context), the
@@ -155,12 +181,337 @@ static struct comp_source *source_for(EGLContext ctx, int w, int h)
   return src;
 }
 
+static void submit_pixels(int w, int h, const void *pixels, int stride,
+                          bool bgra, int swap_interval, bool bottom_up);
+
+#ifdef _WIN32
+static struct {
+   EGLContext ctx;
+   int w, h;
+   EGLSurface pb[SLOTS];
+   void *handle[SLOTS];
+   GLuint tex[SLOTS], fbo;
+   int pending;      /* slot copied but not yet handed over, or -1 */
+   EGLSync fence;    /* signals when that copy is done */
+} g_gs;
+
+static void share_off(const char *why)
+{
+   g_share_state = -1;
+   fprintf(stderr, "[compositor] shared texture off (%s); frames go as pixels\n", why);
+}
+
+/* Guest thread, guest context current.  False: use the pixel path. */
+static bool share_submit(EGLContext ctx, int w, int h, int swap_interval)
+{
+   static PFNEGLQUERYSURFACEPOINTERANGLEPROC query_ptr;
+   if (g_share_state < 0) return false;
+   if (g_share_state == 0) {
+      const char *env = getenv("LUNARIA_COMP_SHARE");
+      const char *e1 = eglQueryString(g_guest_dpy, EGL_EXTENSIONS);
+      const char *e2 = eglQueryString(g_dpy, EGL_EXTENSIONS);
+      query_ptr = (PFNEGLQUERYSURFACEPOINTERANGLEPROC)
+         eglGetProcAddress("eglQuerySurfacePointerANGLE");
+      if (env && env[0] == '0') { share_off("LUNARIA_COMP_SHARE=0"); return false; }
+      if (!e1 || !strstr(e1, "EGL_ANGLE_surface_d3d_texture_2d_share_handle") ||
+          !e2 || !strstr(e2, "EGL_ANGLE_d3d_share_handle_client_buffer") || !query_ptr) {
+         share_off("ANGLE share-handle extensions missing");
+         return false;
+      }
+      g_share_state = 1;
+   }
+   if (g_gs.ctx != ctx || g_gs.w != w || g_gs.h != h) {
+      for (int i = 0; i < SLOTS; ++i) {
+         if (g_gs.pb[i] != EGL_NO_SURFACE && g_gs.pb[i]) {
+            if (g_gs.ctx == ctx) eglReleaseTexImage(g_guest_dpy, g_gs.pb[i], EGL_BACK_BUFFER);
+            eglDestroySurface(g_guest_dpy, g_gs.pb[i]);
+         }
+         if (g_gs.ctx == ctx && g_gs.tex[i]) glDeleteTextures(1, &g_gs.tex[i]);
+      }
+      if (g_gs.ctx == ctx && g_gs.fbo) glDeleteFramebuffers(1, &g_gs.fbo);
+      if (g_gs.fence != EGL_NO_SYNC) eglDestroySync(g_guest_dpy, g_gs.fence);
+      memset(&g_gs, 0, sizeof g_gs);
+      g_gs.pending = -1;
+      const EGLint ca[] = {
+         EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+         EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_BIND_TO_TEXTURE_RGBA, EGL_TRUE,
+         EGL_NONE
+      };
+      EGLConfig cfg;
+      EGLint n = 0;
+      if (!eglChooseConfig(g_guest_dpy, ca, &cfg, 1, &n) || n < 1) {
+         share_off("no bindable pbuffer config");
+         return false;
+      }
+      GLint prev_tex = 0;
+      glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+      const EGLint pa[] = {
+         EGL_WIDTH, w, EGL_HEIGHT, h,
+         EGL_TEXTURE_FORMAT, EGL_TEXTURE_RGBA, EGL_TEXTURE_TARGET, EGL_TEXTURE_2D,
+         EGL_NONE
+      };
+      for (int i = 0; i < SLOTS; ++i) {
+         g_gs.pb[i] = eglCreatePbufferSurface(g_guest_dpy, cfg, pa);
+         if (g_gs.pb[i] == EGL_NO_SURFACE ||
+             !query_ptr(g_guest_dpy, g_gs.pb[i], EGL_D3D_TEXTURE_2D_SHARE_HANDLE_ANGLE,
+                        &g_gs.handle[i]) || !g_gs.handle[i]) {
+            glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+            share_off("pbuffer or share handle failed");
+            return false;
+         }
+         glGenTextures(1, &g_gs.tex[i]);
+         glBindTexture(GL_TEXTURE_2D, g_gs.tex[i]);
+         if (!eglBindTexImage(g_guest_dpy, g_gs.pb[i], EGL_BACK_BUFFER)) {
+            glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+            share_off("eglBindTexImage on the guest side failed");
+            return false;
+         }
+      }
+      glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+      glGenFramebuffers(1, &g_gs.fbo);
+      g_gs.ctx = ctx;
+      g_gs.w = w;
+      g_gs.h = h;
+      fprintf(stderr, "[compositor] shared D3D textures %dx%d x%d (frames stay on the GPU)\n",
+              w, h, SLOTS);
+   }
+
+   /* The previous frame was copied and fenced, not waited for: by now the
+    * GPU has normally finished it, so this wait is free and the guest never
+    * stalls on its own frame.  It reaches the compositor one submit late. */
+   if (g_gs.pending >= 0) {
+      eglClientWaitSync(g_guest_dpy, g_gs.fence, EGL_SYNC_FLUSH_COMMANDS_BIT, EGL_FOREVER);
+      eglDestroySync(g_guest_dpy, g_gs.fence);
+      g_gs.fence = EGL_NO_SYNC;
+   }
+
+   pthread_mutex_lock(&g_mu);
+   if (swap_interval > 0 && g_queued >= 0) {
+      struct timespec until;
+      clock_gettime(CLOCK_REALTIME, &until);
+      until.tv_nsec += 100 * 1000 * 1000;
+      if (until.tv_nsec >= 1000000000) { until.tv_sec += 1; until.tv_nsec -= 1000000000; }
+      while (g_queued >= 0 &&
+             pthread_cond_timedwait(&g_cv_guest, &g_mu, &until) != ETIMEDOUT) {
+      }
+   }
+   if (g_gs.pending >= 0) {
+      const int p = g_gs.pending;
+      g_slot_handle[p] = g_gs.handle[p];
+      g_frame_w[p] = g_gs.w;
+      g_frame_h[p] = g_gs.h;
+      g_queued = p;
+      g_gs.pending = -1;
+      pthread_cond_signal(&g_cv_comp);
+   }
+   int slot = 0;
+   while (slot == g_shown || slot == g_queued) ++slot;
+   if (slot >= SLOTS) slot = g_queued;
+   if (slot == g_queued) g_queued = -1;
+   pthread_mutex_unlock(&g_mu);
+
+   GLint prev_read = 0, prev_draw = 0;
+   GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+   glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+   glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw);
+   while (glGetError() != GL_NO_ERROR) {}
+   if (scissor) glDisable(GL_SCISSOR_TEST);   /* a blit is scissored */
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_gs.fbo);
+   glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                          g_gs.tex[slot], 0);
+   glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+   glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read);
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prev_draw);
+   if (scissor) glEnable(GL_SCISSOR_TEST);
+   const GLenum err = glGetError();
+   if (err != GL_NO_ERROR) {
+      char why[64];
+      snprintf(why, sizeof why, "blit error 0x%x", err);
+      share_off(why);
+      return false;
+   }
+   /* Another device reads the texture, so the copy must be finished before
+    * the compositor is told about it.  Fence it and publish next time. */
+   g_gs.fence = eglCreateSync(g_guest_dpy, EGL_SYNC_FENCE, NULL);
+   if (g_gs.fence != EGL_NO_SYNC) {
+      glFlush();
+      g_gs.pending = slot;
+      return true;
+   }
+   glFinish();
+
+   pthread_mutex_lock(&g_mu);
+   g_slot_handle[slot] = g_gs.handle[slot];
+   g_frame_w[slot] = w;
+   g_frame_h[slot] = h;
+   g_queued = slot;
+   pthread_cond_signal(&g_cv_comp);
+   pthread_mutex_unlock(&g_mu);
+   return true;
+}
+
+/* Hand over a fenced frame now: the pixel path is about to take over. */
+static void share_flush_pending(void)
+{
+   if (g_gs.pending < 0) return;
+   eglClientWaitSync(g_guest_dpy, g_gs.fence, EGL_SYNC_FLUSH_COMMANDS_BIT, EGL_FOREVER);
+   eglDestroySync(g_guest_dpy, g_gs.fence);
+   g_gs.fence = EGL_NO_SYNC;
+   pthread_mutex_lock(&g_mu);
+   const int p = g_gs.pending;
+   g_slot_handle[p] = g_gs.handle[p];
+   g_frame_w[p] = g_gs.w;
+   g_frame_h[p] = g_gs.h;
+   g_queued = p;
+   g_gs.pending = -1;
+   pthread_cond_signal(&g_cv_comp);
+   pthread_mutex_unlock(&g_mu);
+}
+
+/* Which path is faster depends on the machine: the shared texture saves a
+ * read-back and an upload, but a software device (WARP on a GPU-less box)
+ * or a driver that copies shared resources can make it the slower one.  So
+ * measure instead of guessing, keep the better one (the shared texture on a
+ * near tie, since it spends less CPU), and look again when it may have
+ * changed.  LUNARIA_COMP_SHARE=1/0 pins it.
+ *
+ * Measured on GitHub's runners the first version picked wrong in four runs
+ * out of five, costing ~15 fps for two minutes at a time, because:
+ *  - it timed shared, then pixels: a scene that got heavier between the two
+ *    windows (menu into gameplay) was charged to the pixel path.  Now the
+ *    windows run shared, pixels, pixels, shared, so a steady change in the
+ *    scene lands on both paths equally;
+ *  - in a menu both paths reach the frame cap, a tie that said nothing about
+ *    the game, and it was then kept for 120 s.  A tie now looks again in
+ *    20 s;
+ *  - nothing noticed a heavier scene after the pick.  Now a frame rate that
+ *    falls below 85% of what the pick measured looks again at once. */
+#define PICK_WARMUP_NS   (20ull * 1000000000ull)
+#define PICK_WINDOW_NS   (2ull * 1000000000ull)
+#define PICK_RECHECK_NS  (120ull * 1000000000ull)
+#define PICK_TIE_NS      (20ull * 1000000000ull)
+#define PICK_LOADING_NS  (15ull * 1000000000ull)
+#define PICK_WATCH_NS    (3ull * 1000000000ull)
+#define PICK_MIN_GAP_NS  (15ull * 1000000000ull)
+static bool share_choose(void)
+{
+   static int forced = -2;          /* -1 auto, 0 pixels, 1 shared */
+   static int phase;                /* 0 using the pick, 1..4 timing windows */
+   static bool pick = true;
+   static uint64_t t0, next_check, last_pick, watch_t0;
+   static unsigned f0, watch_f0;
+   static uint64_t ns[2];           /* [0] pixels, [1] shared */
+   static unsigned fr[2];
+   static double pick_fps;
+   static const bool order[5] = { false, true, false, false, true };   /* S P P S */
+   if (forced == -2) {
+      const char *env = getenv("LUNARIA_COMP_SHARE");
+      forced = !env || !*env ? -1 : env[0] == '0' ? 0 : 1;
+      if (forced >= 0)
+         fprintf(stderr, "[compositor] frame path pinned to %s (LUNARIA_COMP_SHARE)\n",
+                 forced ? "shared textures" : "pixels");
+   }
+   if (forced >= 0) return forced;
+   if (g_share_state < 0) return false;
+   const uint64_t now = now_ns();
+   const unsigned frames = atomic_load(&g_comp_frames);
+   if (!next_check) next_check = now + PICK_WARMUP_NS;
+
+   if (phase == 0) {
+      /* Watch the frame rate the pick is giving. */
+      if (pick_fps > 0.0) {
+         if (!watch_t0) { watch_t0 = now; watch_f0 = frames; }
+         else if (now - watch_t0 >= PICK_WATCH_NS) {
+            const double fps = (frames - watch_f0) * 1e9 / (double)(now - watch_t0);
+            watch_t0 = now; watch_f0 = frames;
+            if (fps >= 10.0 && fps < pick_fps * 0.85 && now - last_pick >= PICK_MIN_GAP_NS &&
+                next_check > now) {
+               fprintf(stderr, "[compositor] frame rate fell to %.1f fps from %.1f, timing both paths again\n",
+                       fps, pick_fps);
+               next_check = now;
+            }
+         }
+      }
+      if (now < next_check) return pick;
+      phase = 1; t0 = now; f0 = frames;
+      ns[0] = ns[1] = 0; fr[0] = fr[1] = 0;
+      return order[1];
+   }
+   if (now - t0 < PICK_WINDOW_NS) return order[phase];
+   /* Close this window on the path it timed. */
+   ns[order[phase]] += now - t0;
+   fr[order[phase]] += frames - f0;
+   if (phase < 4) {
+      ++phase; t0 = now; f0 = frames;
+      return order[phase];
+   }
+   phase = 0;
+   watch_t0 = 0;
+   const double shared_fps = fr[1] * 1e9 / (double)ns[1];
+   const double pixel_fps = fr[0] * 1e9 / (double)ns[0];
+   /* A window that caught loading compares a loading screen against
+    * gameplay, not two paths.  Keep the current pick and look again soon. */
+   if (shared_fps < 10.0 || pixel_fps < 10.0) {
+      next_check = now + PICK_LOADING_NS;
+      return pick;
+   }
+   const bool was = pick;
+   pick = shared_fps >= pixel_fps * 0.95;
+   const bool tie = shared_fps < pixel_fps * 1.05 && pixel_fps < shared_fps * 1.05;
+   pick_fps = pick ? shared_fps : pixel_fps;
+   last_pick = now;
+   static bool logged;
+   if (pick != was || !logged) {
+      fprintf(stderr, "[compositor] frame path: %s (shared %.1f fps, pixels %.1f fps)\n",
+              pick ? "shared textures" : "pixels", shared_fps, pixel_fps);
+      logged = true;
+   }
+   next_check = now + (tie ? PICK_TIE_NS : PICK_RECHECK_NS);
+   return pick;
+}
+#endif
+
 void luna_comp_submit(int w, int h, int swap_interval)
 {
   if (!atomic_load_explicit(&g_active, memory_order_acquire) || w <= 0 || h <= 0)
     return;
   EGLContext ctx = eglGetCurrentContext();
   if (ctx == EGL_NO_CONTEXT) return;
+
+#ifdef _WIN32
+   if (g_own_display) {
+      if (share_choose()) {
+         if (share_submit(ctx, w, h, swap_interval)) return;
+      } else {
+         share_flush_pending();
+      }
+   }
+#endif
+   if (g_own_display) {
+      /* The compositor is on another display: read the default framebuffer
+       * back and hand it over as pixels (already in texture row order). */
+      static _Thread_local uint8_t *buf;
+      static _Thread_local size_t cap;
+      const size_t need = (size_t)w * 4u * (size_t)h;
+      if (cap < need) {
+         uint8_t *nb = realloc(buf, need);
+         if (!nb) return;
+         buf = nb;
+         cap = need;
+      }
+      GLint prev_read = 0, pack = 4;
+      glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+      glGetIntegerv(GL_PACK_ALIGNMENT, &pack);
+      glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+      glPixelStorei(GL_PACK_ALIGNMENT, 4);
+      glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+      glPixelStorei(GL_PACK_ALIGNMENT, pack);
+      glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read);
+      submit_pixels(w, h, buf, w * 4, false, swap_interval, true);
+      return;
+   }
 
   pthread_mutex_lock(&g_mu);
   /* A device's BufferQueue: with vsync on, a frame that is still queued
@@ -321,6 +672,60 @@ static GLuint g_px_tex;               /* the last frame submitted as pixels */
 static int g_px_tex_w, g_px_tex_h;
 static bool g_px_shown;               /* g_px_tex is what is on screen */
 static EGLImage g_comp_img[SLOTS];    /* the image bound to it */
+
+#ifdef _WIN32
+static void      *g_comp_handle[SLOTS];  /* share handle bound to g_comp_tex */
+static EGLSurface g_comp_pb[SLOTS];
+
+/* Compositor thread: open the guest's D3D texture for this slot. */
+static void comp_bind_shared(int slot, void *handle)
+{
+   static EGLConfig pb_cfg;
+   static int have_cfg;
+   if (!handle || handle == g_comp_handle[slot]) return;
+   if (!have_cfg) {
+      const EGLint ca[] = {
+         EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+         EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_BIND_TO_TEXTURE_RGBA, EGL_TRUE,
+         EGL_NONE
+      };
+      EGLint n = 0;
+      have_cfg = eglChooseConfig(g_dpy, ca, &pb_cfg, 1, &n) && n == 1 ? 1 : -1;
+   }
+   if (g_comp_pb[slot]) {
+      glBindTexture(GL_TEXTURE_2D, g_comp_tex[slot]);
+      eglReleaseTexImage(g_dpy, g_comp_pb[slot], EGL_BACK_BUFFER);
+      eglDestroySurface(g_dpy, g_comp_pb[slot]);
+      g_comp_pb[slot] = EGL_NO_SURFACE;
+      g_comp_handle[slot] = NULL;
+   }
+   EGLSurface s = EGL_NO_SURFACE;
+   if (have_cfg > 0) {
+      const EGLint a[] = {
+         EGL_WIDTH, g_frame_w[slot], EGL_HEIGHT, g_frame_h[slot],
+         EGL_TEXTURE_FORMAT, EGL_TEXTURE_RGBA, EGL_TEXTURE_TARGET, EGL_TEXTURE_2D,
+         EGL_NONE
+      };
+      s = eglCreatePbufferFromClientBuffer(g_dpy, EGL_D3D_TEXTURE_2D_SHARE_HANDLE_ANGLE,
+                                           (EGLClientBuffer)handle, pb_cfg, a);
+   }
+   glBindTexture(GL_TEXTURE_2D, g_comp_tex[slot]);
+   if (s == EGL_NO_SURFACE || !eglBindTexImage(g_dpy, s, EGL_BACK_BUFFER)) {
+      static int warned;
+      if (warned++ < 4)
+         fprintf(stderr, "[compositor] opening a shared texture failed (0x%x)\n",
+                 eglGetError());
+      if (s != EGL_NO_SURFACE) eglDestroySurface(g_dpy, s);
+      return;
+   }
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+   g_comp_pb[slot] = s;
+   g_comp_handle[slot] = handle;
+}
+#endif
 
 static GLuint compile(GLenum type, const char *src)
 {
@@ -621,13 +1026,15 @@ static void *comp_main(void *arg)
     int take = g_queued;
     EGLSync ready = EGL_NO_SYNC;
     EGLImage take_img = EGL_NO_IMAGE;
+      void *take_handle = NULL;
     int prev_shown = g_shown;
     if (take >= 0) {
       /* Retire the old shown slot before publishing a different one.
        * All draws sampling the old slot were submitted on this context
        * in earlier iterations. The producer may immediately reuse it
        * after g_shown changes, so its release fence must already exist. */
-      if (prev_shown >= 0 && prev_shown != take) {
+         take_handle = g_slot_handle[take];
+         if (prev_shown >= 0 && prev_shown != take && !g_own_display) {
         EGLSync done = eglCreateSync(g_dpy, EGL_SYNC_FENCE, NULL);
         glFlush();
         if (g_release_fence[prev_shown] != EGL_NO_SYNC)
@@ -660,6 +1067,7 @@ static void *comp_main(void *arg)
                         GL_UNSIGNED_BYTE, g_px_buf);
       }
       g_px_pending = false;
+         atomic_fetch_add(&g_comp_frames, 1);
       g_px_shown = true;
       have_frame = true;
       pthread_cond_signal(&g_cv_guest);
@@ -673,6 +1081,11 @@ static void *comp_main(void *arg)
         eglWaitSync(g_dpy, ready, 0);
         eglDestroySync(g_dpy, ready);
       }
+#ifdef _WIN32
+         if (g_own_display) {
+            comp_bind_shared(take, take_handle);
+         } else
+#endif
       if (take_img != g_comp_img[take]) {
         glBindTexture(GL_TEXTURE_2D, g_comp_tex[take]);
         p_glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)take_img);
@@ -682,6 +1095,7 @@ static void *comp_main(void *arg)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         g_comp_img[take] = take_img;
       }
+         atomic_fetch_add(&g_comp_frames, 1);
       have_frame = true;
     }
     /* Images a resize or an evicted context left behind, once none of
@@ -749,14 +1163,74 @@ void luna_comp_stop(void)
   luna_overlay_set_hosted(false);
   fprintf(stderr, "[compositor] stopped\n");
 }
+#ifdef _WIN32
+/* A second ANGLE display, on the same backend as the guest's, keyed by the
+ * window's DC so ANGLE does not hand back the guest's display. */
+static EGLDisplay comp_own_display(EGLNativeWindowType win, EGLDisplay guest,
+                                   EGLConfig *cfg)
+{
+   const char *shared = getenv("LUNARIA_COMP_SHARED_DISPLAY");
+   if (shared && shared[0] && shared[0] != '0') return EGL_NO_DISPLAY;
+   PFNEGLGETPLATFORMDISPLAYEXTPROC gpd = (PFNEGLGETPLATFORMDISPLAYEXTPROC)
+      eglGetProcAddress("eglGetPlatformDisplayEXT");
+   HDC dc = GetDC((HWND)win);
+   if (!gpd || !dc) return EGL_NO_DISPLAY;
+   const char *be = getenv("LUNARIA_ANGLE_BACKEND");
+   const EGLint types[2] = {
+      be && !strcmp(be, "vulkan") ? EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE
+                                  : EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE,
+      EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE,
+   };
+   luna_os_angle_vulkan_prepare();   /* types[] can reach ANGLE's Vulkan backend */
+   for (int i = 0; i < 2; ++i) {
+      const EGLint attrs[] = { EGL_PLATFORM_ANGLE_TYPE_ANGLE, types[i], EGL_NONE };
+      EGLDisplay d = gpd(EGL_PLATFORM_ANGLE_ANGLE, (void *)dc, attrs);
+      EGLint major = 0, minor = 0;
+      if (d == EGL_NO_DISPLAY || d == guest || !eglInitialize(d, &major, &minor))
+         continue;
+      const EGLint ca[] = {
+         EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+         EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+         EGL_NONE
+      };
+      EGLint n = 0;
+      if (eglChooseConfig(d, ca, cfg, 1, &n) && n == 1) return d;
+      eglTerminate(d);
+   }
+   return EGL_NO_DISPLAY;
+}
+#endif
 
 bool luna_comp_start(void *egl_display, void *egl_config, void *native_window)
 {
   if (atomic_load(&g_active)) return true;
   g_dpy = (EGLDisplay)egl_display;
+   g_guest_dpy = g_dpy;
   g_cfg = (EGLConfig)egl_config;
   g_native = (EGLNativeWindowType)(uintptr_t)native_window;
 
+#ifdef _WIN32
+   {
+      EGLConfig own_cfg;
+      EGLDisplay own = comp_own_display(g_native, g_dpy, &own_cfg);
+      if (own != EGL_NO_DISPLAY) {
+         EGLSurface s = eglCreateWindowSurface(own, own_cfg, g_native, NULL);
+         if (s != EGL_NO_SURFACE) {
+            g_dpy = own;
+            g_cfg = own_cfg;
+            g_win = s;
+            g_own_display = true;
+            fprintf(stderr, "[compositor] own ANGLE display (separate device); "
+                    "guest frames arrive as pixels\n");
+         } else {
+            fprintf(stderr, "[compositor] own display: window surface failed (0x%x), "
+                    "sharing the guest's display\n", eglGetError());
+         }
+      }
+   }
+#endif
+   if (g_win == EGL_NO_SURFACE)
   g_win = eglCreateWindowSurface(g_dpy, g_cfg, g_native, NULL);
   if (g_win == EGL_NO_SURFACE) {
     fprintf(stderr, "[compositor] eglCreateWindowSurface failed (0x%x)\n",

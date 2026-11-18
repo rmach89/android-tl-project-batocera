@@ -50,6 +50,32 @@ size_t luna_os_stack_remaining(void)
   return current >= low && current < high ? (size_t)(current - low) : SIZE_MAX;
 }
 
+/* Android file names may hold characters a Windows name cannot: Firebase
+ * Crashlytics keeps its files under ".crashlytics.files.v2:<package>", and
+ * every create below it failed with ERROR_INVALID_NAME, which reached the
+ * guest as EINVAL ("Invalid argument", ~60 times a session in 2 Player Games,
+ * Aloa 17-11). WSL and Cygwin store such a character as U+F000 plus its
+ * code; so does this, and readdir turns it back. A drive letter's colon and
+ * the long-path prefix are left as they are. */
+static int file_name_char_forbidden(wchar_t c)
+{
+   return c == L':' || c == L'*' || c == L'?' || c == L'"' || c == L'<' ||
+          c == L'>' || c == L'|';
+}
+static void file_wide_encode(wchar_t *w)
+{
+   size_t i = 0;
+   if (!wcsncmp(w, L"\\\\?\\", 4)) i = 4;
+   if (((w[i] | 0x20) >= L'a' && (w[i] | 0x20) <= L'z') && w[i + 1] == L':') i += 2;
+   for (; w[i]; ++i)
+      if (file_name_char_forbidden(w[i])) w[i] = (wchar_t)(0xF000 + w[i]);
+}
+static void file_wide_decode(wchar_t *w, int count)
+{
+   for (int i = 0; i < count; ++i)
+      if (w[i] >= 0xF000 && w[i] < 0xF080 && file_name_char_forbidden((wchar_t)(w[i] - 0xF000)))
+         w[i] = (wchar_t)(w[i] - 0xF000);
+}
 static wchar_t *luna_file_wide(const char *path);
 static SOCKET lookup(int fd);
 static SRWLOCK socket_lock = SRWLOCK_INIT;
@@ -70,6 +96,7 @@ static int file_status_nonblock(int fd, HANDLE handle, int enabled, int set);
 #include <tlhelp32.h>
 #define PSAPI_VERSION 2
 #include <psapi.h>
+#include <dxgi1_4.h>
 
 /* Invalid guest descriptors are recoverable EBADF errors. UCRT's default
  * invalid-parameter handler aborts instead; change only this thread for the
@@ -195,6 +222,107 @@ void *luna_os_library_open_local(const char *path)
 {
   return luna_os_library_open(path);
 }
+
+/* ANGLE's Vulkan backend crashes on its first eglInitialize.  The ANGLE we
+ * ship (MSYS2's angleproject) has the Khronos Vulkan loader compiled INTO
+ * libGLESv2.dll.  That loader expects to be vulkan-1.dll: its DllMain is what
+ * creates its locks (loader_lock, the ICD preload lock, the instance list
+ * lock) and runs init_global_loader_settings(), which creates a fourth.
+ * Linked into another DLL that DllMain never runs, and the linker dropped it,
+ * so all four CRITICAL_SECTIONs stay zero.  The first vkCreateInstance enters
+ * one, Windows sees a zeroed section as held, takes the contended path and
+ * dereferences its NULL DebugInfo: access violation writing 0x24 in ntdll,
+ * on every PC and every GPU.  (Measured on test41..43: the crash moved from
+ * the settings lock to loader_lock once the first was fixed.)
+ *
+ * The fix is to do what that DllMain would have done, before Vulkan starts.
+ * Nothing here is exported, so both pieces are found by their code:
+ *  - init_global_loader_settings():
+ *      endbr64; sub rsp,28h; lea rcx,[rip+CS]; call [rip+InitializeCriticalSection]
+ *      lea rdx,[rip+settings]; xor ecx,ecx; add rsp,28h; jmp update_settings
+ *  - loader_release(), which survived because DllMain is not its only caller,
+ *    and names the other three locks as it deletes them:
+ *      call teardown; mov rbx,[rip+DeleteCriticalSection]
+ *      lea rcx,[rip+A]; call rbx; lea rcx,[rip+B]; call rbx; lea rcx,[rip+C]; mov rax,rbx
+ * Each import slot is checked against the real kernel32 function, each
+ * pattern must match exactly once, and a section is only touched while it is
+ * still all zeroes.  A future ANGLE that fixes this, or whose code differs,
+ * fails a check and is left alone, with a log line saying which. */
+static INIT_ONCE g_angle_vk_once = INIT_ONCE_STATIC_INIT;
+static bool angle_vk_cs_is_zero(const unsigned char *cs)
+{
+   for (size_t i = 0; i < sizeof(CRITICAL_SECTION); ++i) if (cs[i]) return false;
+   return true;
+}
+static const unsigned char *rip_target(const unsigned char *disp_at)
+{
+   int32_t d; memcpy(&d, disp_at, 4);
+   return disp_at + 4 + d;
+}
+static BOOL CALLBACK angle_vk_prepare_once(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+   (void)once; (void)param; (void)ctx;
+   HMODULE m = GetModuleHandleW(L"libGLESv2.dll");
+   if (!m) m = LoadLibraryW(L"libGLESv2.dll");
+   if (!m) { fprintf(stderr, "[angle-vk] libGLESv2.dll not loaded; nothing to prepare\n"); return TRUE; }
+   HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+   FARPROC ics = GetProcAddress(k32, "InitializeCriticalSection");
+   FARPROC dcs = GetProcAddress(k32, "DeleteCriticalSection");
+   const unsigned char *base = (const unsigned char *)m;
+   const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(base + ((const IMAGE_DOS_HEADER *)base)->e_lfanew);
+   const IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+   const unsigned char *settings_init = NULL, *release = NULL;
+   int n_init = 0, n_release = 0;
+   for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+      if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+      const unsigned char *p = base + sec[i].VirtualAddress;
+      const size_t n = sec[i].Misc.VirtualSize;
+      for (size_t k = 0; k + 48 <= n; ++k) {
+         const unsigned char *q = p + k;
+         if (q[0] == 0xF3 && q[1] == 0x0F && q[2] == 0x1E && q[3] == 0xFA &&
+             !memcmp(q + 4, "\x48\x83\xEC\x28\x48\x8D\x0D", 7) && q[15] == 0xFF && q[16] == 0x15 &&
+             !memcmp(q + 21, "\x48\x8D\x15", 3) && (q[28] == 0x31 || q[28] == 0x33) && q[29] == 0xC9 &&
+             !memcmp(q + 30, "\x48\x83\xC4\x28\xE9", 5) &&
+             ics && *(const FARPROC *)rip_target(q + 17) == ics) {
+            ++n_init; settings_init = q;
+         }
+         if (q[0] == 0xE8 && !memcmp(q + 5, "\x48\x8B\x1D", 3) &&
+             !memcmp(q + 12, "\x48\x8D\x0D", 3) && q[19] == 0xFF && q[20] == 0xD3 &&
+             !memcmp(q + 21, "\x48\x8D\x0D", 3) && q[28] == 0xFF && q[29] == 0xD3 &&
+             !memcmp(q + 30, "\x48\x8D\x0D", 3) && !memcmp(q + 37, "\x48\x89\xD8", 3) &&
+             dcs && *(const FARPROC *)rip_target(q + 8) == dcs) {
+            ++n_release; release = q;
+         }
+      }
+   }
+   int made = 0;
+   if (n_release == 1) {
+      const unsigned char *locks[3] = { rip_target(release + 15), rip_target(release + 24),
+                                        rip_target(release + 33) };
+      for (int i = 0; i < 3; ++i)
+         if (angle_vk_cs_is_zero(locks[i])) {
+            InitializeCriticalSection((CRITICAL_SECTION *)locks[i]);
+            ++made;
+         }
+   } else
+      fprintf(stderr, "[angle-vk] Vulkan loader locks: %d candidates in libGLESv2.dll; "
+              "leaving them alone\n", n_release);
+   if (n_init == 1) {
+      if (angle_vk_cs_is_zero(rip_target(settings_init + 11))) {
+         ((void (*)(void))settings_init)();
+         ++made;
+      }
+   } else
+      fprintf(stderr, "[angle-vk] Vulkan loader settings init: %d candidates in libGLESv2.dll; "
+              "leaving it alone\n", n_init);
+   fprintf(stderr, "[angle-vk] set up %d of the static Vulkan loader's 4 locks in libGLESv2.dll "
+           "(its DllMain never runs; 0 means they were already set up or not found)\n", made);
+   return TRUE;
+}
+void luna_os_angle_vulkan_prepare(void)
+{
+   InitOnceExecuteOnce(&g_angle_vk_once, angle_vk_prepare_once, NULL, NULL);
+}
 const char *luna_os_library_error(void)
 {
   static _Thread_local char message[512];
@@ -274,12 +402,213 @@ static DWORD luna_prot_to_host(int prot)
   return PAGE_NOACCESS;
 }
 
+/* ---- lazy commit ---------------------------------------------------------
+ *
+ * A big reservation (the 4 GB guest window) is only reserved; each 64 KB
+ * piece is committed the first time something touches it.  Touches from this
+ * process fault and are committed by lazy_veh.  The kernel does not fault on
+ * our behalf: ReadFile/recv into a reserved page fail with ERROR_NOACCESS, so
+ * every path that hands a buffer to the kernel calls luna_lazy_ensure first,
+ * as do protect/lock (Windows cannot change protection of reserved pages).
+ * LUNARIA_LAZY_COMMIT=0 restores reserve-and-commit. */
+#define LAZY_MIN   ((size_t)256 << 20)
+#define LAZY_CHUNK ((uintptr_t)64 << 10)
+/* Unity's Dynamic Heap reserves a fresh 512 MiB block whenever it grows.
+ * With 8 slots LDoE filled the table during startup, and every block after
+ * that fell through to reserve-and-commit: 511 MB of commit charge each,
+ * 5 GB on an 8 GB laptop, and the PC swapped while the game drew nothing.
+ * Freed ranges give their slot back (lazy_reserve reuses it). */
+#define LAZY_MAX   256
+static struct { uintptr_t lo, hi; } lazy_ranges[LAZY_MAX];
+static volatile LONG lazy_count;
+static SRWLOCK lazy_lock = SRWLOCK_INIT;
+static int lazy_state;   /* 0 unknown, 1 on, -1 off */
+
+static int lazy_find(uintptr_t a)
+{
+   const LONG n = lazy_count;
+   for (LONG i = 0; i < n; ++i)
+      if (a >= lazy_ranges[i].lo && a < lazy_ranges[i].hi) return (int)i;
+   return -1;
+}
+
+/* Commit the reserved parts of [a, a+len) inside lazy range r.  Pages that
+ * are already committed keep their contents and protection. */
+static int lazy_commit(int r, uintptr_t a, size_t len)
+{
+   uintptr_t lo = a & ~(LAZY_CHUNK - 1);
+   uintptr_t hi = a + len;
+   if (hi < a) return 0;
+   hi = (hi + LAZY_CHUNK - 1) & ~(LAZY_CHUNK - 1);
+   if (lo < lazy_ranges[r].lo) lo = lazy_ranges[r].lo;
+   if (hi > lazy_ranges[r].hi) hi = lazy_ranges[r].hi;
+   int ok = 1;
+   AcquireSRWLockExclusive(&lazy_lock);
+   for (uintptr_t at = lo; at < hi;) {
+      MEMORY_BASIC_INFORMATION mi;
+      if (!VirtualQuery((void *)at, &mi, sizeof mi)) { ok = 0; break; }
+      uintptr_t end = (uintptr_t)mi.BaseAddress + mi.RegionSize;
+      if (end > hi) end = hi;
+      if (mi.State == MEM_RESERVE &&
+          !VirtualAlloc((void *)at, end - at, MEM_COMMIT, PAGE_READWRITE))
+         ok = 0;
+      at = end;
+   }
+   ReleaseSRWLockExclusive(&lazy_lock);
+   return ok;
+}
+
+void luna_lazy_ensure(const void *addr, size_t len)
+{
+   if (!lazy_count || !addr || !len) return;
+   uintptr_t a = (uintptr_t)addr, last = a + len - 1;
+   if (last < a) last = UINTPTR_MAX;
+   for (LONG i = 0; i < lazy_count; ++i) {
+      uintptr_t lo = a > lazy_ranges[i].lo ? a : lazy_ranges[i].lo;
+      uintptr_t hi = last < lazy_ranges[i].hi - 1 ? last : lazy_ranges[i].hi - 1;
+      if (lo <= hi) lazy_commit((int)i, lo, hi - lo + 1);
+   }
+}
+
+/* RAM cap: a Windows job object limits how much memory Lunaria may commit,
+ * so a game that keeps growing ends Lunaria instead of swapping the whole PC
+ * into a freeze (a player's 8 GB laptop locked up once).  Default 60% of
+ * the PC's RAM; LUNARIA_MAX_RAM_MB=N sets it, 0 turns it off. */
+static uint64_t ram_cap_mb;
+
+int luna_os_mem_breakdown(char *out, size_t out_len);
+
+static void ram_cap_init(void)
+{
+   MEMORYSTATUSEX ms; ms.dwLength = sizeof ms;
+   const uint64_t total_mb = GlobalMemoryStatusEx(&ms) ? ms.ullTotalPhys >> 20 : 0;
+   uint64_t mb = total_mb * 6 / 10;
+   const char *v = getenv("LUNARIA_MAX_RAM_MB");
+   if (v && *v) mb = strtoull(v, NULL, 10);
+   if (!mb) { fprintf(stderr, "[mem] ram cap off\n"); return; }
+   if (mb < 1024) mb = 1024;
+   HANDLE job = CreateJobObjectW(NULL, NULL);
+   JOBOBJECT_EXTENDED_LIMIT_INFORMATION li;
+   memset(&li, 0, sizeof li);
+   li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+   li.ProcessMemoryLimit = (SIZE_T)(mb << 20);
+   if (!job || !SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof li) ||
+       !AssignProcessToJobObject(job, GetCurrentProcess())) {
+      fprintf(stderr, "[mem] ram cap not set (error %lu)\n", (unsigned long)GetLastError());
+      if (job) CloseHandle(job);
+      return;
+   }
+   ram_cap_mb = mb;
+   fprintf(stderr, "[mem] ram cap %llu MB of %llu MB (LUNARIA_MAX_RAM_MB, 0 = off)\n",
+           (unsigned long long)mb, (unsigned long long)total_mb);
+}
+
+static void ram_cap_hit(uintptr_t a)
+{
+   static volatile LONG once;
+   if (InterlockedExchange(&once, 1)) { Sleep(INFINITE); }
+   char where[320];
+   if (luna_os_mem_breakdown(where, sizeof where) != 0) where[0] = 0;
+   fprintf(stderr, "[mem] RAM CAP HIT: the game wanted more than %llu MB (at %p). "
+           "Lunaria is closing so the PC does not freeze. %s\n",
+           (unsigned long long)ram_cap_mb, (void *)a, where);
+   fflush(stderr); fflush(stdout);
+   ExitProcess(3);
+}
+
+static LONG CALLBACK lazy_veh(EXCEPTION_POINTERS *e)
+{
+   const EXCEPTION_RECORD *r = e->ExceptionRecord;
+   if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2)
+      return EXCEPTION_CONTINUE_SEARCH;
+   const uintptr_t a = (uintptr_t)r->ExceptionInformation[1];
+   const int i = lazy_find(a);
+   if (i < 0) return EXCEPTION_CONTINUE_SEARCH;
+   MEMORY_BASIC_INFORMATION mi;
+   if (!VirtualQuery((void *)a, &mi, sizeof mi)) return EXCEPTION_CONTINUE_SEARCH;
+   if (mi.State == MEM_RESERVE) {
+      if (lazy_commit(i, a, 1)) return EXCEPTION_CONTINUE_EXECUTION;
+      if (ram_cap_mb) ram_cap_hit(a);
+      return EXCEPTION_CONTINUE_SEARCH;
+   }
+   /* Two threads can fault on the same reserved chunk: one commits it while
+    * the other's fault is still being dispatched, and the second then finds
+    * the page committed.  Its access was valid, so retry it.  Wait for any
+    * commit still in progress first, and retry only when the page's
+    * protection really allows this access, so a genuine protection fault
+    * still reaches the crash report instead of looping. */
+   AcquireSRWLockShared(&lazy_lock);
+   const BOOL q = VirtualQuery((void *)a, &mi, sizeof mi);
+   ReleaseSRWLockShared(&lazy_lock);
+   if (q && mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+      const ULONG_PTR kind = r->ExceptionInformation[0];   /* 0 read, 1 write, 8 execute */
+      const DWORD pr = mi.Protect & 0xff;
+      const int can_write = pr == PAGE_READWRITE || pr == PAGE_WRITECOPY ||
+                            pr == PAGE_EXECUTE_READWRITE || pr == PAGE_EXECUTE_WRITECOPY;
+      const int can_exec = pr == PAGE_EXECUTE || pr == PAGE_EXECUTE_READ ||
+                           pr == PAGE_EXECUTE_READWRITE || pr == PAGE_EXECUTE_WRITECOPY;
+      if ((kind == 0 && pr != PAGE_EXECUTE) || (kind == 1 && can_write) ||
+          (kind == 8 && can_exec)) {
+         static volatile LONG raced;
+         if (InterlockedIncrement(&raced) <= 3)
+            fprintf(stderr, "[mem] lazy commit race at %p: committed by another thread, retrying\n",
+                    (void *)a);
+         return EXCEPTION_CONTINUE_EXECUTION;
+      }
+   }
+   static volatile LONG declined;
+   if (InterlockedIncrement(&declined) <= 3)
+      fprintf(stderr, "[mem] lazy range fault at %p not handled: state=0x%lx protect=0x%lx access=%llu\n",
+              (void *)a, q ? (unsigned long)mi.State : 0ul, q ? (unsigned long)mi.Protect : 0ul,
+              (unsigned long long)r->ExceptionInformation[0]);
+   return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void *lazy_reserve(void *want, size_t len, int exact)
+{
+   if (lazy_state == 0) {
+      const char *v = getenv("LUNARIA_LAZY_COMMIT");
+      lazy_state = v && v[0] == '0' ? -1 : 1;
+      ram_cap_init();
+      if (lazy_state > 0 && !AddVectoredExceptionHandler(1, lazy_veh)) lazy_state = -1;
+      fprintf(stderr, "[mem] lazy commit %s\n", lazy_state > 0 ? "on" : "off");
+   }
+   if (lazy_state < 0 || len < LAZY_MIN) return NULL;
+   void *p = VirtualAlloc(exact ? want : NULL, len,
+                          MEM_RESERVE | (exact ? 0 : MEM_TOP_DOWN), PAGE_READWRITE);
+   if (!p) return NULL;
+   if (exact && p != want) { VirtualFree(p, 0, MEM_RELEASE); return NULL; }
+   AcquireSRWLockExclusive(&lazy_lock);
+   LONG n = lazy_count, slot = -1;
+   for (LONG i = 0; i < n; ++i)
+      if (!lazy_ranges[i].lo && !lazy_ranges[i].hi) { slot = i; break; }
+   if (slot < 0 && n < LAZY_MAX) slot = n;
+   if (slot < 0) {
+      static int warned;
+      ReleaseSRWLockExclusive(&lazy_lock);
+      VirtualFree(p, 0, MEM_RELEASE);
+      if (!warned++)
+         fprintf(stderr, "[mem] WARNING: %d lazy ranges in use, further large reservations "
+                 "are committed up front\n", LAZY_MAX);
+      return NULL;
+   }
+   /* lazy_find reads without the lock: a slot with hi set and lo still 0
+    * would claim every address below hi, so lo goes in first. */
+   lazy_ranges[slot].lo = (uintptr_t)p;
+   MemoryBarrier();
+   lazy_ranges[slot].hi = (uintptr_t)p + len;
+   if (slot == n) InterlockedExchange(&lazy_count, n + 1);
+   ReleaseSRWLockExclusive(&lazy_lock);
+   fprintf(stderr, "[mem] reserved %zu MB at %p, committed on first touch\n",
+           len >> 20, p);
+   return p;
+}
+
 void *luna_os_reserve(void *want, size_t len, int exact)
 {
-  if (!len || (exact && !want)) {
-    errno = EINVAL;
-    return NULL;
-  }
+   if (!len || (exact && !want)) { errno = EINVAL; return NULL; }
+   void *lazy = len >= LAZY_MIN ? lazy_reserve(want, len, exact) : NULL;
+   if (lazy) return lazy;
   void *p = VirtualAlloc(exact ? want : NULL, len,
                          MEM_RESERVE | MEM_COMMIT | (exact ? 0 : MEM_TOP_DOWN),
                          PAGE_READWRITE);
@@ -341,7 +670,18 @@ int luna_os_release(void *addr, size_t len)
         }
       }
       ReleaseSRWLockExclusive(&file_view_lock);
-    } else ok = VirtualFree(base, 0, MEM_RELEASE);
+      } else {
+         const int lazy = lazy_find((uintptr_t)base);
+         ok = VirtualFree(base, 0, MEM_RELEASE);
+         if (ok && lazy >= 0) {
+            AcquireSRWLockExclusive(&lazy_lock);
+            /* hi first, for the same lock-free reader as in lazy_reserve. */
+            lazy_ranges[lazy].hi = 0;
+            MemoryBarrier();
+            lazy_ranges[lazy].lo = 0;
+            ReleaseSRWLockExclusive(&lazy_lock);
+         }
+      }
     if (!ok) errno = EINVAL;
     return ok ? 0 : -1;
   }
@@ -363,13 +703,15 @@ int luna_os_release(void *addr, size_t len)
     }
     at += mi.RegionSize;
   }
-  if (!committed) VirtualFree(base, 0, MEM_RELEASE);
+   /* A lazy range is mostly reserved by design: never drop it whole here. */
+   if (!committed && lazy_find((uintptr_t)base) < 0) VirtualFree(base, 0, MEM_RELEASE);
   return 0;
 }
 
 int luna_os_protect(void *addr, size_t len, int prot)
 {
   DWORD old = 0;
+   luna_lazy_ensure(addr, len);
   return VirtualProtect(addr, len, luna_prot_to_host(prot), &old) ? 0 : -1;
 }
 
@@ -410,6 +752,20 @@ void *luna_os_map_file_flags(void *want, size_t len, int prot, int policy,
   DWORD access = (prot & LUNA_PROT_EXEC) ? FILE_MAP_EXECUTE : 0;
   access |= writable ? (shared ? FILE_MAP_WRITE : FILE_MAP_COPY) : FILE_MAP_READ;
 
+   /* Linux maps whole pages past the end of a file (the tail reads as zeros,
+    * a page wholly past EOF faults); Windows refuses a view longer than the
+    * file.  The callers round len up to a page, so a 4-byte file (AndroidX
+    * DataStore's shared counter) always failed with ENOMEM.  Ask for the bytes
+    * the file has: the view still covers whole pages, as on Linux.  Only when
+    * that last page reaches the end of the request - otherwise the caller
+    * would record pages as mapped that are not. */
+   LARGE_INTEGER file_size;
+   if (GetFileSizeEx(h, &file_size) && file_size.QuadPart > 0 &&
+       (uint64_t)file_size.QuadPart > off) {
+      const uint64_t have = (uint64_t)file_size.QuadPart - off;
+      if ((uint64_t)len > have && ((have + 4095u) & ~4095ull) >= (uint64_t)len)
+         len = (size_t)have;
+   }
   HANDLE m = CreateFileMappingA(h, NULL, page, 0, 0, NULL);
   if (!m) return NULL;
   void *p = NULL;
@@ -490,6 +846,53 @@ size_t luna_os_page_size(void)
   return si.dwPageSize ? si.dwPageSize : 4096u;
 }
 
+/* MADV_DONTNEED / MADV_FREE on [first, last]: give the pages back.
+ * Linux promises zero-filled pages on the next touch of a private anonymous
+ * mapping.  MEM_DECOMMIT gives exactly that: inside a lazy range the next
+ * touch faults into lazy_veh, which commits fresh zero pages; outside one the
+ * range is committed again straight away (still zero, still no RAM until
+ * touched).  Only private read/write memory is released; anything else
+ * (file views, code, guard pages) keeps its pages, as before. */
+static int memory_release(uintptr_t first, uintptr_t last)
+{
+   int released = 0, kept = 0;
+   AcquireSRWLockExclusive(&lazy_lock);
+   for (uintptr_t at = first; at <= last;) {
+      MEMORY_BASIC_INFORMATION mi;
+      if (!VirtualQuery((void *)at, &mi, sizeof mi)) break;
+      uintptr_t end = (uintptr_t)mi.BaseAddress + mi.RegionSize - 1;
+      if (end > last) end = last;
+      const size_t n = end - at + 1;
+      if (mi.State == MEM_COMMIT && mi.Type == MEM_PRIVATE &&
+          mi.Protect == PAGE_READWRITE) {
+         const int lazy = lazy_find(at) >= 0 && lazy_find(end) >= 0;
+         if (VirtualFree((void *)at, n, MEM_DECOMMIT)) {
+            if (!lazy && !VirtualAlloc((void *)at, n, MEM_COMMIT, PAGE_READWRITE)) {
+               ReleaseSRWLockExclusive(&lazy_lock);
+               fprintf(stderr, "[mem] DONTNEED re-commit failed at %p (+%zu), error %lu\n",
+                       (void *)at, n, (unsigned long)GetLastError());
+               errno = ENOMEM; return -1;
+            }
+            released = 1;
+         } else {
+            memset((void *)at, 0, n);   /* committed RW: no fault, no lock re-entry */
+            kept = 1;
+         }
+      } else if (mi.State == MEM_COMMIT) {
+         kept = 1;
+      }
+      /* MEM_RESERVE inside a lazy range was never touched: already zero. */
+      if (end == last) break;
+      at = end + 1;
+   }
+   ReleaseSRWLockExclusive(&lazy_lock);
+   static volatile LONG said;
+   if (released && !InterlockedExchange(&said, 1))
+      fprintf(stderr, "[mem] DONTNEED gives pages back to Windows (decommit)\n");
+   (void)kept;
+   return 0;
+}
+
 int luna_os_memory_advise(void *addr, size_t len, int advice)
 {
   switch (advice) {
@@ -534,11 +937,18 @@ int luna_os_memory_advise(void *addr, size_t len, int advice)
     return -1;
   }
   uintptr_t last = first + len - 1;
+   /* No luna_lazy_ensure here: advice must never commit memory.  It used to,
+    * so every DONTNEED Unity sent over a freed 512 MiB heap block committed
+    * the whole block and then refused to release it - Lunaria grew to 4.8 GB
+    * on an 8 GB laptop with the guest told it had 2 GB.  A reserved page of a
+    * lazy range counts as mapped (it is, to the guest). */
+   int all_committed = 1;
   for (uintptr_t cursor = first;;) {
     MEMORY_BASIC_INFORMATION info;
-    if (!VirtualQuery((void *)cursor, &info, sizeof info) || info.State != MEM_COMMIT) {
-      errno = ENOMEM;
-      return -1;
+      if (!VirtualQuery((void *)cursor, &info, sizeof info)) { errno = ENOMEM; return -1; }
+      if (info.State != MEM_COMMIT) {
+         if (info.State != MEM_RESERVE || lazy_find(cursor) < 0) { errno = ENOMEM; return -1; }
+         all_committed = 0;
     }
     uintptr_t end = (uintptr_t)info.BaseAddress + info.RegionSize - 1;
     if (end >= last) break;
@@ -546,16 +956,14 @@ int luna_os_memory_advise(void *addr, size_t len, int advice)
   }
   /* Access-pattern advice is a hint; Windows keeps its own paging policy. */
   if (advice <= 2) return 0;
-  if (advice != 3) {
-    /* DiscardVirtualMemory does not promise zero-filled anonymous pages,
-     * so it cannot implement Linux MADV_DONTNEED. Preserve the mapping. */
-    errno = ENOTSUP;
-    return -1;
-  }
-  struct memory_range {
-    void *address;
-    SIZE_T size;
-  } range = { addr, len };
+   if (advice == 4 || advice == 8) {
+      if (getenv("LUNARIA_DONTNEED_KEEP")) { errno = ENOTSUP; return -1; }
+      return memory_release(first, last);
+   }
+   if (advice != 3) { errno = ENOTSUP; return -1; }
+   /* WILLNEED over untouched lazy pages would only pull in zero pages. */
+   if (!all_committed) return 0;
+   struct memory_range { void *address; SIZE_T size; } range = { addr, len };
   typedef BOOL (WINAPI *prefetch_fn)(HANDLE, ULONG_PTR, struct memory_range *, ULONG);
   prefetch_fn prefetch = (prefetch_fn)(uintptr_t)GetProcAddress(
                            GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
@@ -575,6 +983,7 @@ int luna_os_memory_advise(void *addr, size_t len, int advice)
 
 int luna_os_memory_sync(void *addr, size_t len, int flags)
 {
+   luna_lazy_ensure(addr, len);
   uintptr_t first = (uintptr_t)addr;
   if (first % luna_os_page_size() ||
       (flags & ~(LUNA_MS_ASYNC | LUNA_MS_INVALIDATE | LUNA_MS_SYNC)) ||
@@ -655,6 +1064,7 @@ int luna_os_memory_sync(void *addr, size_t len, int flags)
 
 int luna_os_memory_lock(void *addr, size_t len, int unlock)
 {
+   luna_lazy_ensure(addr, len);
   uintptr_t cursor = (uintptr_t)addr;
   if (!len) return 0;
   if (len - 1 > UINTPTR_MAX - cursor) {
@@ -689,6 +1099,7 @@ int luna_os_memory_lock(void *addr, size_t len, int unlock)
 
 int luna_os_residency(void *addr, size_t len, unsigned char *vector)
 {
+   luna_lazy_ensure(addr, len);
   const size_t page = luna_os_page_size();
   const uintptr_t first = (uintptr_t)addr;
   if (first % page) {
@@ -1104,6 +1515,146 @@ uint64_t luna_os_peak_rss_kb(void)
          ? (uint64_t)usage.PeakWorkingSetSize / 1024 : 0;
 }
 
+/* Where the RAM is right now: the working set split by what owns the pages.
+ * Commit is not RAM, so this walks the working set itself (QueryWorkingSet)
+ * and files each resident page under the region VirtualQuery says it is in.
+ * guest = the guest's own heap reservation, blocks = the other lazy ranges
+ * (Unity's 512 MiB heap blocks), jit = private executable pages (translated
+ * code), host = other private pages (our heap, the Java VM, ANGLE/driver),
+ * dll = loaded images, files = mapped files and sections. */
+struct ws_region { uintptr_t lo, hi; unsigned char kind; };
+enum { WS_GUEST, WS_BLOCKS, WS_JIT, WS_HOST, WS_DLL, WS_FILES, WS_KINDS };
+
+static int ws_region_cmp(const void *k, const void *e)
+{
+   const uintptr_t a = *(const uintptr_t *)k;
+   const struct ws_region *r = (const struct ws_region *)e;
+   return a < r->lo ? -1 : a >= r->hi ? 1 : 0;
+}
+
+int luna_os_mem_breakdown(char *out, size_t out_len)
+{
+   if (!out || !out_len) return -1;
+   out[0] = 0;
+   uintptr_t guest_lo = 0, guest_hi = 0;
+   for (LONG i = 0; i < lazy_count; ++i)
+      if (lazy_ranges[i].lo && (!guest_lo || lazy_ranges[i].lo < guest_lo)) {
+         guest_lo = lazy_ranges[i].lo; guest_hi = lazy_ranges[i].hi;
+      }
+   size_t cap = 4096, n = 0;
+   struct ws_region *rs = (struct ws_region *)malloc(cap * sizeof *rs);
+   if (!rs) return -1;
+   SYSTEM_INFO si; GetSystemInfo(&si);
+   for (uintptr_t at = (uintptr_t)si.lpMinimumApplicationAddress;
+        at < (uintptr_t)si.lpMaximumApplicationAddress;) {
+      MEMORY_BASIC_INFORMATION mi;
+      if (!VirtualQuery((void *)at, &mi, sizeof mi)) break;
+      const uintptr_t lo = (uintptr_t)mi.BaseAddress, hi = lo + mi.RegionSize;
+      if (hi <= at) break;
+      if (mi.State == MEM_COMMIT) {
+         unsigned char k;
+         if (mi.Type == MEM_IMAGE) k = WS_DLL;
+         else if (mi.Type == MEM_MAPPED) k = WS_FILES;
+         else if (lo >= guest_lo && lo < guest_hi) k = WS_GUEST;
+         else if (lazy_find(lo) >= 0) k = WS_BLOCKS;
+         else if (mi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) k = WS_JIT;
+         else k = WS_HOST;
+         if (n == cap) {
+            struct ws_region *g = (struct ws_region *)realloc(rs, (cap *= 2) * sizeof *rs);
+            if (!g) { free(rs); return -1; }
+            rs = g;
+         }
+         rs[n].lo = lo; rs[n].hi = hi; rs[n].kind = k; ++n;
+      }
+      at = hi;
+   }
+   /* Room for every resident page plus some growth while we look. */
+   PROCESS_MEMORY_COUNTERS pmc; memset(&pmc, 0, sizeof pmc); pmc.cb = sizeof pmc;
+   GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc);
+   size_t entries = pmc.WorkingSetSize / si.dwPageSize + 65536;
+   PSAPI_WORKING_SET_INFORMATION *ws = NULL;
+   for (int tries = 0; tries < 3; ++tries) {
+      const size_t bytes = sizeof(ULONG_PTR) + entries * sizeof(PSAPI_WORKING_SET_BLOCK);
+      ws = (PSAPI_WORKING_SET_INFORMATION *)VirtualAlloc(NULL, bytes, MEM_COMMIT | MEM_RESERVE,
+                                                         PAGE_READWRITE);
+      if (!ws) break;
+      if (QueryWorkingSet(GetCurrentProcess(), ws, (DWORD)bytes)) break;
+      const DWORD err = GetLastError();
+      const size_t need = ws->NumberOfEntries;
+      VirtualFree(ws, 0, MEM_RELEASE); ws = NULL;
+      if (err != ERROR_BAD_LENGTH) break;
+      entries = need + 65536;
+   }
+   uint64_t mb[WS_KINDS] = {0}, other = 0;
+   if (ws) {
+      for (ULONG_PTR i = 0; i < ws->NumberOfEntries; ++i) {
+         const uintptr_t a = (uintptr_t)ws->WorkingSetInfo[i].VirtualPage * si.dwPageSize;
+         const struct ws_region *r = (const struct ws_region *)
+            bsearch(&a, rs, n, sizeof *rs, ws_region_cmp);
+         if (r) mb[r->kind] += si.dwPageSize; else other += si.dwPageSize;
+      }
+      VirtualFree(ws, 0, MEM_RELEASE);
+   }
+   free(rs);
+   if (!ws && !mb[WS_HOST]) {
+      snprintf(out, out_len, "working set unavailable (error %lu)", (unsigned long)GetLastError());
+      return -1;
+   }
+   snprintf(out, out_len,
+            "now %llu MB in RAM: guest heap %llu, unity blocks %llu, jit %llu, host %llu, "
+            "dlls %llu, files %llu, other %llu (MB); commit %llu MB",
+            (unsigned long long)(pmc.WorkingSetSize >> 20),
+            (unsigned long long)(mb[WS_GUEST] >> 20), (unsigned long long)(mb[WS_BLOCKS] >> 20),
+            (unsigned long long)(mb[WS_JIT] >> 20), (unsigned long long)(mb[WS_HOST] >> 20),
+            (unsigned long long)(mb[WS_DLL] >> 20), (unsigned long long)(mb[WS_FILES] >> 20),
+            (unsigned long long)(other >> 20), (unsigned long long)(pmc.PagefileUsage >> 20));
+   return 0;
+}
+
+/* This process's GPU memory per DXGI (Windows 10+): dedicated VRAM in use and
+ * shared system memory in use, summed over hardware adapters.  When VRAM is
+ * full the driver spills into shared memory, which is ordinary RAM. */
+/* Own copies so no dxguid import library is needed. */
+static const GUID luna_iid_factory1 = {0x770aae78, 0xf26f, 0x4dba, {0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87}};
+static const GUID luna_iid_adapter3 = {0x645967a4, 0x1392, 0x4310, {0xa7, 0x98, 0x80, 0x53, 0xce, 0x3e, 0x93, 0xfd}};
+
+int luna_os_gpu_mem_mb(uint64_t *vram_mb, uint64_t *shared_mb, uint64_t *vram_budget_mb)
+{
+   *vram_mb = *shared_mb = *vram_budget_mb = 0;
+   static HMODULE dxgi;
+   typedef HRESULT (WINAPI *create_fn)(REFIID, void **);
+   static create_fn create;
+   if (!dxgi) {
+      dxgi = LoadLibraryW(L"dxgi.dll");
+      if (dxgi) create = (create_fn)(uintptr_t)GetProcAddress(dxgi, "CreateDXGIFactory1");
+   }
+   if (!create) return -1;
+   IDXGIFactory1 *f = NULL;
+   if (FAILED(create(&luna_iid_factory1, (void **)&f)) || !f) return -1;
+   int any = 0;
+   IDXGIAdapter1 *a = NULL;
+   for (UINT i = 0; f->lpVtbl->EnumAdapters1(f, i, &a) == S_OK; ++i) {
+      DXGI_ADAPTER_DESC1 d;
+      IDXGIAdapter3 *a3 = NULL;
+      if (SUCCEEDED(a->lpVtbl->GetDesc1(a, &d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+          SUCCEEDED(a->lpVtbl->QueryInterface(a, &luna_iid_adapter3, (void **)&a3)) && a3) {
+         DXGI_QUERY_VIDEO_MEMORY_INFO local, shared;
+         if (SUCCEEDED(a3->lpVtbl->QueryVideoMemoryInfo(a3, 0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) &&
+             SUCCEEDED(a3->lpVtbl->QueryVideoMemoryInfo(a3, 0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared))) {
+            *vram_mb += local.CurrentUsage >> 20;
+            *vram_budget_mb += local.Budget >> 20;
+            *shared_mb += shared.CurrentUsage >> 20;
+            any = 1;
+         }
+         a3->lpVtbl->Release(a3);
+      }
+      a->lpVtbl->Release(a);
+   }
+   f->lpVtbl->Release(f);
+   return any ? 0 : -1;
+}
+
 int luna_os_mem_info(uint64_t *total_bytes, uint64_t *avail_bytes)
 {
   MEMORYSTATUSEX st;
@@ -1377,7 +1928,7 @@ void luna_os_audio_set_pull(void (*pull)(void)) {
   (void)pull;
 }
 
-int luna_os_audio_open(unsigned rate, unsigned channels)
+static int wo_audio_open(unsigned rate, unsigned channels)
 {
   AcquireSRWLockExclusive(&win_audio_lock);
   audio_saved_prefs();
@@ -1418,7 +1969,7 @@ int luna_os_audio_open(unsigned rate, unsigned channels)
   return 0;
 }
 
-int luna_os_audio_write(const void *pcm16, unsigned frames)
+static int wo_audio_write(const void *pcm16, unsigned frames)
 {
   if (!pcm16 || !frames) return 0;
   AcquireSRWLockExclusive(&win_audio_lock);
@@ -1453,7 +2004,7 @@ int luna_os_audio_write(const void *pcm16, unsigned frames)
   return (int)accepted;
 }
 
-unsigned luna_os_audio_queued_frames(void)
+static unsigned wo_audio_queued_frames(void)
 {
   AcquireSRWLockExclusive(&win_audio_lock);
   win_audio_reap();
@@ -1465,7 +2016,7 @@ unsigned luna_os_audio_queued_frames(void)
   return frames;
 }
 
-uint64_t luna_os_audio_played_frames(void)
+static uint64_t wo_audio_played_frames(void)
 {
   AcquireSRWLockExclusive(&win_audio_lock);
   win_audio_reap();
@@ -1474,7 +2025,7 @@ uint64_t luna_os_audio_played_frames(void)
   return frames;
 }
 
-void luna_os_audio_close(void)
+static void wo_audio_close(void)
 {
   AcquireSRWLockExclusive(&win_audio_lock);
   if (win_audio) {
@@ -1490,6 +2041,225 @@ void luna_os_audio_close(void)
   memset(win_audio_headers, 0, sizeof win_audio_headers);
   win_audio_played = 0;
   ReleaseSRWLockExclusive(&win_audio_lock);
+}
+
+/* ---- WASAPI output ------------------------------------------------------
+ * waveOut goes through Windows' legacy mixer, which keeps its own buffers on
+ * top of the ones handed to it.  WASAPI shared mode writes straight into the
+ * audio engine's buffer and reports exactly how much is still queued, so the
+ * mixer's latency target is the real latency.  waveOut stays as the fallback
+ * (no endpoint, COM unavailable, LUNARIA_AUDIO_API=waveout).
+ *
+ * COM is loaded at run time so the link line does not change, and every call
+ * is non-blocking: GetCurrentPadding / GetBuffer / ReleaseBuffer only touch
+ * the shared buffer, which matters because the guest's execution lock is held
+ * while the pump writes.  A lost device (headphones unplugged) closes the
+ * stream; the next write after a second reopens it on the new default. */
+#define COBJMACROS
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+#ifndef AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+#define AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM 0x80000000
+#endif
+#ifndef AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
+#define AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY 0x08000000
+#endif
+static const GUID luna_clsid_mmde = { 0xBCDE0395, 0xE52F, 0x467C, { 0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E } };
+static const GUID luna_iid_mmde   = { 0xA95664D2, 0x9614, 0x4F35, { 0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6 } };
+static const GUID luna_iid_client = { 0x1CB9AD4C, 0xDBFA, 0x4C32, { 0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2 } };
+static const GUID luna_iid_render = { 0xF294ACFC, 0x3146, 0x4483, { 0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2 } };
+
+static IAudioClient *was_client;
+static IAudioRenderClient *was_render;
+static UINT32 was_capacity;              /* frames */
+static unsigned was_rate, was_channels;
+static uint64_t was_written, was_played_base;
+static int was_started;
+static uint64_t was_retry_ms;
+static unsigned long was_underruns;
+static int g_audio_backend;              /* 0 none, 1 WASAPI, 2 waveOut */
+
+static void was_release(void)
+{
+   if (was_client) IAudioClient_Stop(was_client);
+   if (was_render) IAudioRenderClient_Release(was_render);
+   if (was_client) IAudioClient_Release(was_client);
+   was_render = NULL;
+   was_client = NULL;
+   was_started = 0;
+}
+
+/* Called with win_audio_lock held. */
+static int was_open_locked(unsigned rate, unsigned channels)
+{
+   typedef HRESULT (WINAPI *init_fn)(LPVOID, DWORD);
+   typedef HRESULT (WINAPI *create_fn)(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID *);
+   static init_fn co_init;
+   static create_fn co_create;
+   static int loaded;
+   if (!loaded) {
+      loaded = 1;
+      HMODULE ole = LoadLibraryA("ole32.dll");
+      if (ole) {
+         co_init = (init_fn)(void *)GetProcAddress(ole, "CoInitializeEx");
+         co_create = (create_fn)(void *)GetProcAddress(ole, "CoCreateInstance");
+      }
+   }
+   if (!co_init || !co_create) return -1;
+   co_init(NULL, COINIT_MULTITHREADED);   /* S_FALSE / RPC_E_CHANGED_MODE are fine */
+
+   IMMDeviceEnumerator *en = NULL;
+   IMMDevice *dev = NULL;
+   HRESULT hr = co_create(&luna_clsid_mmde, NULL, CLSCTX_ALL, &luna_iid_mmde, (void **)&en);
+   if (SUCCEEDED(hr)) hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(en, eRender, eConsole, &dev);
+   if (SUCCEEDED(hr)) hr = IMMDevice_Activate(dev, &luna_iid_client, CLSCTX_ALL, NULL, (void **)&was_client);
+   if (dev) IMMDevice_Release(dev);
+   if (en) IMMDeviceEnumerator_Release(en);
+   if (FAILED(hr)) {
+      static int logged;
+      if (!logged++) fprintf(stderr, "[audio] WASAPI unavailable (0x%08lx), using waveOut\n", (unsigned long)hr);
+      was_release();
+      return -1;
+   }
+   WAVEFORMATEX f = { 0 };
+   f.wFormatTag = WAVE_FORMAT_PCM;
+   f.nChannels = (WORD)channels;
+   f.nSamplesPerSec = rate;
+   f.wBitsPerSample = 16;
+   f.nBlockAlign = (WORD)(channels * sizeof(int16_t));
+   f.nAvgBytesPerSec = rate * f.nBlockAlign;
+   /* Room for the mixer's largest target (100 ms) plus a margin; the mixer,
+    * not this size, decides how much is actually queued. */
+   const REFERENCE_TIME span = 150 * 10000;
+   hr = IAudioClient_Initialize(was_client, AUDCLNT_SHAREMODE_SHARED,
+                                AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+                                AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                                span, 0, &f, NULL);
+   if (SUCCEEDED(hr)) hr = IAudioClient_GetBufferSize(was_client, &was_capacity);
+   if (SUCCEEDED(hr)) hr = IAudioClient_GetService(was_client, &luna_iid_render, (void **)&was_render);
+   if (FAILED(hr)) {
+      fprintf(stderr, "[audio] WASAPI stream setup failed (0x%08lx), using waveOut\n", (unsigned long)hr);
+      was_release();
+      return -1;
+   }
+   REFERENCE_TIME engine = 0;
+   IAudioClient_GetStreamLatency(was_client, &engine);
+   was_rate = rate;
+   was_channels = channels;
+   was_played_base = was_written;
+   fprintf(stderr, "[audio] WASAPI shared: %u Hz, %u ch, buffer %u frames (%.1f ms), engine latency %.1f ms\n",
+           rate, channels, (unsigned)was_capacity, was_capacity * 1000.0 / rate, engine / 10000.0);
+   return 0;
+}
+
+static int was_reopen_locked(void)
+{
+   const uint64_t now = GetTickCount64();
+   if (now < was_retry_ms) return -1;
+   was_retry_ms = now + 1000;
+   return was_open_locked(was_rate, was_channels);
+}
+
+static unsigned was_padding_locked(void)
+{
+   if (!was_client && was_reopen_locked() != 0) return 0;
+   UINT32 pad = 0;
+   const HRESULT hr = IAudioClient_GetCurrentPadding(was_client, &pad);
+   if (FAILED(hr)) {
+      fprintf(stderr, "[audio] WASAPI device lost (0x%08lx), reopening\n", (unsigned long)hr);
+      /* Whatever was queued on the lost device is gone. */
+      was_played_base = was_written;
+      was_release();
+      return 0;
+   }
+   return pad;
+}
+
+static int was_write_locked(const int16_t *src, unsigned frames, int gain)
+{
+   const unsigned pad = was_padding_locked();
+   if (!was_client) return 0;
+   if (was_started && pad == 0) {
+      ++was_underruns;
+      if (was_underruns <= 3 || !(was_underruns & (was_underruns - 1)))
+         fprintf(stderr, "[audio] underrun #%lu (the buffer ran dry before the next mix)\n", was_underruns);
+   }
+   unsigned n = was_capacity - pad;
+   if (n > frames) n = frames;
+   if (!n) return 0;
+   BYTE *dst = NULL;
+   if (FAILED(IAudioRenderClient_GetBuffer(was_render, n, &dst)) || !dst) return 0;
+   int16_t *out = (int16_t *)dst;
+   for (unsigned i = 0; i < n * was_channels; ++i)
+      out[i] = (int16_t)((int32_t)src[i] * gain / 32768);
+   IAudioRenderClient_ReleaseBuffer(was_render, n, 0);
+   was_written += n;
+   if (!was_started && SUCCEEDED(IAudioClient_Start(was_client))) was_started = 1;
+   return (int)n;
+}
+
+int luna_os_audio_open(unsigned rate, unsigned channels)
+{
+   if (!rate) rate = 48000;
+   if (channels < 1 || channels > 8) channels = 2;
+   AcquireSRWLockExclusive(&win_audio_lock);
+   audio_saved_prefs();
+   if (g_audio_backend) { ReleaseSRWLockExclusive(&win_audio_lock); return 0; }
+   const char *api = getenv("LUNARIA_AUDIO_API");
+   const int want_waveout = api && (!_stricmp(api, "waveout") || !_stricmp(api, "winmm"));
+   if (!want_waveout && was_open_locked(rate, channels) == 0) {
+      g_audio_backend = 1;
+      ReleaseSRWLockExclusive(&win_audio_lock);
+      return 0;
+   }
+   ReleaseSRWLockExclusive(&win_audio_lock);
+   if (wo_audio_open(rate, channels) != 0) return -1;
+   g_audio_backend = 2;
+   fprintf(stderr, "[audio] waveOut: %u Hz, %u ch\n", rate, channels);
+   return 0;
+}
+
+int luna_os_audio_write(const void *pcm16, unsigned frames)
+{
+   if (g_audio_backend != 1) return g_audio_backend == 2 ? wo_audio_write(pcm16, frames) : 0;
+   if (!pcm16 || !frames) return 0;
+   AcquireSRWLockExclusive(&win_audio_lock);
+   const int gain = g_win_muted || !strcmp(g_win_audio_dev, "off") ? 0 : (int)(g_win_gain * 32768.0f);
+   const int n = was_write_locked((const int16_t *)pcm16, frames, gain);
+   ReleaseSRWLockExclusive(&win_audio_lock);
+   return n;
+}
+
+unsigned luna_os_audio_queued_frames(void)
+{
+   if (g_audio_backend != 1) return g_audio_backend == 2 ? wo_audio_queued_frames() : 0;
+   AcquireSRWLockExclusive(&win_audio_lock);
+   const unsigned pad = was_padding_locked();
+   ReleaseSRWLockExclusive(&win_audio_lock);
+   return pad;
+}
+
+uint64_t luna_os_audio_played_frames(void)
+{
+   if (g_audio_backend != 1) return g_audio_backend == 2 ? wo_audio_played_frames() : 0;
+   AcquireSRWLockExclusive(&win_audio_lock);
+   const unsigned pad = was_padding_locked();
+   const uint64_t queued_total = was_written - was_played_base;
+   const uint64_t played = was_played_base + (queued_total > pad ? queued_total - pad : 0);
+   ReleaseSRWLockExclusive(&win_audio_lock);
+   return played;
+}
+
+void luna_os_audio_close(void)
+{
+   if (g_audio_backend == 2) wo_audio_close();
+   if (g_audio_backend == 1) {
+      AcquireSRWLockExclusive(&win_audio_lock);
+      was_release();
+      was_written = was_played_base = 0;
+      ReleaseSRWLockExclusive(&win_audio_lock);
+   }
+   g_audio_backend = 0;
 }
 
 /* Windows file operations. */
@@ -1562,6 +2332,24 @@ static wchar_t *luna_file_wide(const char *path)
     errno = EILSEQ;
     return NULL;
   }
+   /* Past MAX_PATH (260) a plain drive path fails with ERROR_PATH_NOT_FOUND
+    * unless the machine has LongPathsEnabled.  A game unpacked under a deep
+    * folder crossed it partway through (LDoE died at 1217 of 1536 MiB when
+    * lunaria sat in D:\Games\lunaria-...\, and finished from D:\).  The \\?\
+    * form lifts the limit to 32767; it skips normalisation, so normalise
+    * first with GetFullPathNameW (which also turns / into \). */
+   if (length > 240 && ((wide[0] | 0x20) >= L'a' && (wide[0] | 0x20) <= L'z') && wide[1] == L':' &&
+       (wide[2] == L'\\' || wide[2] == L'/')) {
+      DWORD need = GetFullPathNameW(wide, 0, NULL, NULL);
+      wchar_t *full = need ? (wchar_t *)malloc(((size_t)need + 4) * sizeof *full) : NULL;
+      if (full) {
+         memcpy(full, L"\\\\?\\", 4 * sizeof *full);
+         DWORD got = GetFullPathNameW(wide, need, full + 4, NULL);
+         if (got && got < need) { free(wide); file_wide_encode(full); return full; }
+         free(full);
+      }
+   }
+   file_wide_encode(wide);
   return wide;
 }
 /* RootDirectory keeps relative opens tied to the directory object even if
@@ -2053,6 +2841,7 @@ luna_directory_entry *luna_directory_read(luna_directory *directory)
   else directory->ready = 0;
   luna_directory_entry *entry = &directory->entry;
   int count = (int)(native->FileNameLength / sizeof(wchar_t));
+   file_wide_decode(native->FileName, count);
   int length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, native->FileName, count,
                                    entry->d_name, sizeof entry->d_name - 1, NULL, NULL);
   if (!length) {
@@ -2367,8 +3156,33 @@ int luna_file_rename(const char *from, const char *to)
   }
   BOOL ok = MoveFileExW(source, target, MOVEFILE_REPLACE_EXISTING);
   DWORD error = GetLastError();
-  free(source);
-  free(target);
+   /* POSIX rename replaces a target that somebody still has open; MoveFileEx
+    * refuses (access denied / sharing violation).  Play services writes
+    * <file>.tmp and renames it over <file> while <file> is open, and lost
+    * its trusted-time store that way on Aloa's PC 14-11.  Windows 10 1809+
+    * has the POSIX behaviour as a rename flag, as the unlink above uses. */
+   if (!ok && (error == ERROR_ACCESS_DENIED || error == ERROR_SHARING_VIOLATION)) {
+      HANDLE handle = CreateFileW(source, DELETE | SYNCHRONIZE,
+         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+         FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+      if (handle != INVALID_HANDLE_VALUE) {
+         const size_t bytes = wcslen(target) * sizeof(wchar_t);
+         struct { DWORD flags; HANDLE root; DWORD length; WCHAR name[1]; } *info;
+         const size_t size = offsetof(__typeof__(*info), name) + bytes + sizeof(WCHAR);
+         info = calloc(1, size);
+         if (info) {
+            info->flags = 0x1 | 0x2; /* FILE_RENAME_FLAG_REPLACE_IF_EXISTS | _POSIX_SEMANTICS */
+            info->length = (DWORD)bytes;
+            memcpy(info->name, target, bytes);
+            ok = SetFileInformationByHandle(handle,
+                    (FILE_INFO_BY_HANDLE_CLASS)22 /* FileRenameInfoEx */, info, (DWORD)size);
+            if (!ok) error = GetLastError();
+            free(info);
+         }
+         CloseHandle(handle);
+      }
+   }
+   free(source); free(target);
   return ok ? 0 : luna_file_error(error);
 }
 int luna_file_unlink(const char *path)
@@ -2559,10 +3373,25 @@ char *luna_file_realpath(const char *path, char *result, size_t capacity)
   return result;
 }
 int luna_file_sync(int fd, int data_only)
+{ (void)data_only; return _commit(fd); }
+/* Calls, bytes and time per I/O path, for the sampler's report: kernel time
+ * in ZwWriteFile/ZwReadFile says nothing about which of these issued it.
+ * One QueryPerformanceCounter pair per call. */
+enum { IO_PREAD, IO_PWRITE, IO_PIPE_R, IO_PIPE_W, IO_FD_R, IO_FD_W, IO_KINDS };
+static volatile LONG64 io_calls[IO_KINDS], io_ticks[IO_KINDS], io_bytes[IO_KINDS];
+static LONG64 io_now(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+static ptrdiff_t io_note(int kind, LONG64 t0, ptrdiff_t result)
 {
-  (void)data_only;
-  return _commit(fd);
+   InterlockedIncrement64(&io_calls[kind]);
+   InterlockedAdd64(&io_ticks[kind], io_now() - t0);
+   if (result > 0) InterlockedAdd64(&io_bytes[kind], result);
+   return result;
 }
+
+#define PIO_FALLBACK PTRDIFF_MIN
+static int pio_cache_on(void);
+static ptrdiff_t pio_cached(int fd, HANDLE native, void *buffer, size_t length, int64_t offset, int writing);
+
 static ptrdiff_t file_positional_io(int fd, void *buffer, size_t length, int64_t offset, int writing)
 {
   if (offset < 0) {
@@ -2570,14 +3399,12 @@ static ptrdiff_t file_positional_io(int fd, void *buffer, size_t length, int64_t
     return -1;
   }
   intptr_t native = file_descriptor_handle(fd);
-  if (native == -1) {
-    errno = EBADF;
-    return -1;
-  }
-  if (GetFileType((HANDLE)native) != FILE_TYPE_DISK) {
-    errno = ESPIPE;
-    return -1;
-  }
+   if (native == -1) { errno = EBADF; return -1; }
+   if (pio_cache_on()) {
+      const ptrdiff_t r = pio_cached(fd, (HANDLE)native, buffer, length, offset, writing);
+      if (r != PIO_FALLBACK) return r;
+   }
+   if (GetFileType((HANDLE)native) != FILE_TYPE_DISK) { errno = ESPIPE; return -1; }
   typedef NTSTATUS (NTAPI *query_file_fn)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG,
                                           FILE_INFORMATION_CLASS);
   query_file_fn query = (query_file_fn)(void *)GetProcAddress(
@@ -2608,6 +3435,7 @@ static ptrdiff_t file_positional_io(int fd, void *buffer, size_t length, int64_t
     return luna_file_error(error);
   }
   DWORD count = 0, request = length > INT_MAX ? INT_MAX : (DWORD)length;
+   luna_lazy_ensure(buffer, request);
   BOOL ok = writing ? WriteFile(handle, buffer, request, &count, &operation)
             : ReadFile(handle, buffer, request, &count, &operation);
   DWORD error = ok ? ERROR_SUCCESS : GetLastError();
@@ -2621,13 +3449,9 @@ static ptrdiff_t file_positional_io(int fd, void *buffer, size_t length, int64_t
   return luna_file_error(error);
 }
 ptrdiff_t luna_file_pread(int fd, void *buffer, size_t length, int64_t offset)
-{
-  return file_positional_io(fd, buffer, length, offset, 0);
-}
+{ const LONG64 t0 = io_now(); return io_note(IO_PREAD, t0, file_positional_io(fd, buffer, length, offset, 0)); }
 ptrdiff_t luna_file_pwrite(int fd, const void *buffer, size_t length, int64_t offset)
-{
-  return file_positional_io(fd, (void *)buffer, length, offset, 1);
-}
+{ const LONG64 t0 = io_now(); return io_note(IO_PWRITE, t0, file_positional_io(fd, (void *)buffer, length, offset, 1)); }
 
 int luna_file_lock(int fd, int64_t start, int64_t length,
                    int shared, int nonblocking, int unlock)
@@ -2681,6 +3505,12 @@ struct file_description_state {
   HANDLE handle;
   SRWLOCK operation_lock;
   int kind, status, status_known;
+   /* pread/pwrite: an overlapped handle per direction, opened on first use
+    * and closed with the description, plus the two facts every call used to
+    * ask the kernel for again (file type + 1, and the access mask). */
+   HANDLE positional[2];
+   DWORD file_type1, access;
+   int access_known;
 };
 static struct {
   HANDLE handle;
@@ -2696,8 +3526,9 @@ static void file_description_release_locked(struct file_description_state *state
       region.OffsetHigh = 0x80000000;
       UnlockFileEx(state->handle, 0, 1, 0, &region);
     }
-    CloseHandle(state->handle);
-    free(state);
+      if (state->positional[0]) CloseHandle(state->positional[0]);
+      if (state->positional[1]) CloseHandle(state->positional[1]);
+      CloseHandle(state->handle); free(state);
   }
 }
 static void file_description_release(struct file_description_state *state)
@@ -2766,6 +3597,102 @@ static void file_description_duplicate(int target, HANDLE handle, struct file_de
   if (state) ++state->references;
   ReleaseSRWLockExclusive(&file_description_lock);
 }
+/* Positional I/O through a handle kept with the open file description.  The
+ * uncached path in file_positional_io reopens the file, creates an event and closes both on
+ * every call - eight kernel calls for one read, paid thousands of times a
+ * second by a game that streams assets or keeps an SQLite database.  Here the
+ * overlapped handle, the file type and the access mask are looked up once per
+ * description and the event once per thread.  LUNARIA_PIO_CACHE=0 restores
+ * the old path; anything unexpected falls back to it. */
+static int pio_cache_state = -1;
+static int pio_cache_on(void)
+{
+   if (pio_cache_state < 0) {
+      const char *e = getenv("LUNARIA_PIO_CACHE");
+      pio_cache_state = !(e && e[0] == '0');
+   }
+   return pio_cache_state;
+}
+static DWORD pio_fls = FLS_OUT_OF_INDEXES;
+static INIT_ONCE pio_fls_once = INIT_ONCE_STATIC_INIT;
+static void WINAPI pio_fls_free(void *event) { if (event) CloseHandle((HANDLE)event); }
+static BOOL CALLBACK pio_fls_init(PINIT_ONCE once, void *param, void **context)
+{
+   (void)once; (void)param; (void)context;
+   pio_fls = FlsAlloc(pio_fls_free);
+   return TRUE;
+}
+static HANDLE pio_event(void)
+{
+   InitOnceExecuteOnce(&pio_fls_once, pio_fls_init, NULL, NULL);
+   if (pio_fls == FLS_OUT_OF_INDEXES) return NULL;
+   HANDLE event = (HANDLE)FlsGetValue(pio_fls);
+   if (!event) {
+      event = CreateEventW(NULL, TRUE, FALSE, NULL);
+      if (event && !FlsSetValue(pio_fls, event)) { CloseHandle(event); event = NULL; }
+   }
+   return event;
+}
+static ptrdiff_t pio_cached(int fd, HANDLE native, void *buffer, size_t length, int64_t offset, int writing)
+{
+   struct file_description_state *state = file_description_acquire(fd, native);
+   if (!state) return PIO_FALLBACK;
+   ptrdiff_t result = PIO_FALLBACK;
+   AcquireSRWLockExclusive(&file_description_lock);
+   DWORD type1 = state->file_type1, access = state->access;
+   int access_known = state->access_known;
+   HANDLE handle = state->positional[writing];
+   ReleaseSRWLockExclusive(&file_description_lock);
+   if (!type1) type1 = GetFileType(native) + 1;
+   if (type1 != FILE_TYPE_DISK + 1) { errno = ESPIPE; result = -1; goto done; }
+   if (!access_known) {
+      typedef NTSTATUS (NTAPI *query_file_fn)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG,
+                                             FILE_INFORMATION_CLASS);
+      static query_file_fn query;
+      if (!query) query = (query_file_fn)(void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"),
+                                                                "NtQueryInformationFile");
+      FILE_ACCESS_INFORMATION info;
+      IO_STATUS_BLOCK status;
+      if (!query || query(native, &status, &info, sizeof info, FileAccessInformation) < 0) goto done;
+      access = info.AccessFlags;
+      access_known = 1;
+   }
+   if (!(access & (writing ? FILE_WRITE_DATA : FILE_READ_DATA))) { errno = EBADF; result = -1; goto done; }
+   if (!handle) {
+      HANDLE fresh = ReOpenFile(native, writing ? GENERIC_WRITE : GENERIC_READ,
+         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_FLAG_OVERLAPPED);
+      if (fresh == INVALID_HANDLE_VALUE) goto done;
+      AcquireSRWLockExclusive(&file_description_lock);
+      if (state->positional[writing]) { handle = state->positional[writing]; CloseHandle(fresh); }
+      else handle = state->positional[writing] = fresh;
+      ReleaseSRWLockExclusive(&file_description_lock);
+   }
+   AcquireSRWLockExclusive(&file_description_lock);
+   state->file_type1 = type1; state->access = access; state->access_known = access_known;
+   ReleaseSRWLockExclusive(&file_description_lock);
+   {
+      OVERLAPPED operation = { 0 };
+      operation.Offset = (DWORD)offset;
+      operation.OffsetHigh = (DWORD)((uint64_t)offset >> 32);
+      operation.hEvent = pio_event();
+      if (!operation.hEvent) goto done;
+      DWORD count = 0, request = length > INT_MAX ? INT_MAX : (DWORD)length;
+      luna_lazy_ensure(buffer, request);
+      BOOL ok = writing ? WriteFile(handle, buffer, request, &count, &operation)
+                        : ReadFile(handle, buffer, request, &count, &operation);
+      DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+      if (!ok && error == ERROR_IO_PENDING) {
+         ok = GetOverlappedResult(handle, &operation, &count, TRUE);
+         error = ok ? ERROR_SUCCESS : GetLastError();
+      }
+      if (ok || (!writing && error == ERROR_HANDLE_EOF)) result = count;
+      else result = luna_file_error(error);
+   }
+done:
+   file_description_release(state);
+   return result;
+}
+
 static int file_status_register(int fd, int flags)
 {
   HANDLE handle = (HANDLE)file_descriptor_handle(fd);
@@ -3018,10 +3945,22 @@ int luna_file_record_control(int fd, int command, luna_file_record_lock *lock)
   }
   /* LockFileEx is a mandatory, handle-owned lock. It cannot implement
    * F_GETLK's owner/range query or POSIX process locks (merging/splitting and
-   * release when any fd for that file closes). Do not report a fictitious
-   * unlocked range or silently substitute Java's handle-owned byte locks. */
-  errno = ENOTSUP;
-  return -1;
+    * release when any fd for that file closes), so it is not used.
+    *
+    * POSIX record locks are owned by the PROCESS, and a process never
+    * conflicts with its own locks: every set succeeds (replacing that range)
+    * and a query from the owner finds nothing in the way.  The whole guest is
+    * one process, so for it that answer is the right one, not a stand-in.
+    * What this does not do is keep two lunaria processes (the game and the
+    * Play services helper) apart on one file; they keep separate data
+    * directories, so no file is shared between them in practice.
+    * ENOTSUP here made Play services' LevelDB refuse to open its databases
+    * ("IO error: lock .../LOCK: error 95"), seen on Aloa's PC 14-11. */
+   if (command == LUNA_RECORD_QUERY) {
+      lock->type = LUNA_RECORD_UNLOCK;
+      lock->pid = 0;
+   }
+   return 0;
 }
 FILE *luna_file_memstream_begin(luna_file_memstream *writer)
 {
@@ -3607,6 +4546,7 @@ ptrdiff_t luna_socket_recv(int fd, void *buffer, size_t length, int flags)
   SOCKET socket = (SOCKET)luna_socket_native(fd);
   if (socket == INVALID_SOCKET) return -1;
   int n = length > INT_MAX ? INT_MAX : (int)length;
+   luna_lazy_ensure(buffer, (size_t)n);
   int result = recv(socket,buffer,n,flags);
   return result == SOCKET_ERROR ? failed() : result;
 }
@@ -3623,6 +4563,7 @@ ptrdiff_t luna_socket_recvfrom(int fd, void *buffer, size_t length, int flags, s
   SOCKET socket = (SOCKET)luna_socket_native(fd);
   if (socket == INVALID_SOCKET) return -1;
   int n = length > INT_MAX ? INT_MAX : (int)length;
+   luna_lazy_ensure(buffer, (size_t)n);
   int result = recvfrom(socket,buffer,n,flags,address,address_length);
   return result == SOCKET_ERROR ? failed() : result;
 }
@@ -3658,6 +4599,7 @@ static WSABUF *message_buffers(const struct msghdr *message)
     total += length;
     buffers[i].len = (ULONG)length;
     buffers[i].buf = message->msg_iov[i].iov_base;
+      luna_lazy_ensure(buffers[i].buf, buffers[i].len);
   }
   return buffers;
 }
@@ -4049,6 +4991,7 @@ static ptrdiff_t pipe_io(HANDLE handle, void *buffer, DWORD length, int writing)
     }
   }
   DWORD bytes = 0;
+   luna_lazy_ensure(buffer, length);
   BOOL ok = writing ? WriteFile(handle, buffer, length, &bytes, NULL)
             : ReadFile(handle, buffer, length, &bytes, NULL);
   if (ok && (!writing || bytes || !length)) return bytes;
@@ -4085,16 +5028,15 @@ static short pipe_poll(HANDLE handle, short events)
 }
 ptrdiff_t luna_fd_read(int fd, void *buffer, size_t length)
 {
+   luna_lazy_ensure(buffer, length > INT_MAX ? INT_MAX : length);
   SOCKET socket = lookup(fd);
   unsigned int n = length > INT_MAX ? INT_MAX : (unsigned int)length;
   if (socket == INVALID_SOCKET) {
     intptr_t handle = file_descriptor_handle(fd);
-    if (handle == -1) {
-      errno = EBADF;
-      return -1;
-    }
-    if (GetFileType((HANDLE)handle) == FILE_TYPE_PIPE) return pipe_io((HANDLE)handle, buffer, n, 0);
-    return _read(fd, buffer, n);
+      if (handle == -1) { errno = EBADF; return -1; }
+      const LONG64 t0 = io_now();
+      if (GetFileType((HANDLE)handle) == FILE_TYPE_PIPE) return io_note(IO_PIPE_R, t0, pipe_io((HANDLE)handle, buffer, n, 0));
+      return io_note(IO_FD_R, t0, _read(fd, buffer, n));
   }
   int result = recv(socket, buffer, (int)n, 0);
   return result == SOCKET_ERROR ? failed() : result;
@@ -4105,12 +5047,10 @@ ptrdiff_t luna_fd_write(int fd, const void *buffer, size_t length)
   unsigned int n = length > INT_MAX ? INT_MAX : (unsigned int)length;
   if (socket == INVALID_SOCKET) {
     intptr_t handle = file_descriptor_handle(fd);
-    if (handle == -1) {
-      errno = EBADF;
-      return -1;
-    }
-    if (GetFileType((HANDLE)handle) == FILE_TYPE_PIPE) return pipe_io((HANDLE)handle, (void *)buffer, n, 1);
-    return _write(fd, buffer, n);
+      if (handle == -1) { errno = EBADF; return -1; }
+      const LONG64 t0 = io_now();
+      if (GetFileType((HANDLE)handle) == FILE_TYPE_PIPE) return io_note(IO_PIPE_W, t0, pipe_io((HANDLE)handle, (void *)buffer, n, 1));
+      return io_note(IO_FD_W, t0, _write(fd, buffer, n));
   }
   int result = send(socket, buffer, (int)n, 0);
   return result == SOCKET_ERROR ? failed() : result;
@@ -4230,7 +5170,65 @@ rescan:
 
 /* IANA identifiers map to Windows' own, year-specific timezone rules. */
 #include "unicode/windows_zones.h"
-static int luna_zone(const char *zone, DYNAMIC_TIME_ZONE_INFORMATION *tz)
+
+/* The emulated phone used to be set to Asia/Tokyo and Japanese unless the
+ * player set LUNARIA_TIMEZONE / LUNARIA_LOCALE; Windows has no LANG for the
+ * fallback to read, so every Windows player got a Japanese device (LDoE's
+ * window title came up in Japanese).  These read the PC's own settings. */
+static char host_timezone[64];
+static BOOL CALLBACK host_timezone_once(PINIT_ONCE once, PVOID param, PVOID *context)
+{
+   (void)once; (void)param; (void)context;
+   char *result = host_timezone;
+   DYNAMIC_TIME_ZONE_INFORMATION d;
+   if (GetDynamicTimeZoneInformation(&d) == TIME_ZONE_ID_INVALID || !d.TimeZoneKeyName[0])
+      return TRUE;
+   /* Windows 10 1903+ ships ICU; region NULL picks CLDR's canonical zone
+    * ("001"), which the flat table below cannot (its first Tokyo entry is
+    * Asia/Dili). */
+   typedef int32_t (*icu_fn)(const wchar_t *, int32_t, const char *, wchar_t *, int32_t, int *);
+   HMODULE icu = LoadLibraryA("icu.dll");
+   icu_fn lookup = icu ? (icu_fn)(void *)GetProcAddress(icu, "ucal_getTimeZoneIDForWindowsID") : NULL;
+   wchar_t id[64];
+   int status = 0;
+   int32_t n = lookup ? lookup(d.TimeZoneKeyName, -1, NULL, id, 63, &status) : 0;
+   if (n > 0 && n < 63 && status <= 0) {
+      id[n] = 0;
+      if (!WideCharToMultiByte(CP_UTF8, 0, id, -1, result, sizeof host_timezone, NULL, NULL)) result[0] = 0;
+   }
+   for (size_t i = 0; !result[0] && i < sizeof luna_windows_zones / sizeof luna_windows_zones[0]; i++)
+      if (!wcscmp(luna_windows_zones[i].windows, d.TimeZoneKeyName))
+         snprintf(result, sizeof host_timezone, "%s", luna_windows_zones[i].iana);
+   return TRUE;
+}
+const char *luna_os_host_timezone(void)
+{
+   static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+   InitOnceExecuteOnce(&once, host_timezone_once, NULL, NULL);
+   return host_timezone[0] ? host_timezone : NULL;
+}
+
+static char host_locale[LOCALE_NAME_MAX_LENGTH];
+static BOOL CALLBACK host_locale_once(PINIT_ONCE once, PVOID param, PVOID *context)
+{
+   (void)once; (void)param; (void)context;
+   wchar_t name[LOCALE_NAME_MAX_LENGTH];
+   LANGID ui = GetUserDefaultUILanguage();
+   if (!LCIDToLocaleName(MAKELCID(ui, SORT_DEFAULT), name, LOCALE_NAME_MAX_LENGTH, 0) &&
+       !GetUserDefaultLocaleName(name, LOCALE_NAME_MAX_LENGTH))
+      return TRUE;
+   if (!WideCharToMultiByte(CP_UTF8, 0, name, -1, host_locale, sizeof host_locale, NULL, NULL))
+      host_locale[0] = 0;
+   return TRUE;
+}
+const char *luna_os_host_locale(void)
+{
+   static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+   InitOnceExecuteOnce(&once, host_locale_once, NULL, NULL);
+   return host_locale[0] ? host_locale : NULL;
+}
+
+static int luna_zone_uncached(const char *zone, DYNAMIC_TIME_ZONE_INFORMATION *tz)
 {
   if (!zone || !*zone)
     return GetDynamicTimeZoneInformation(tz) == TIME_ZONE_ID_INVALID ? -1 : 0;
@@ -4279,7 +5277,7 @@ static int luna_zone(const char *zone, DYNAMIC_TIME_ZONE_INFORMATION *tz)
   }
   return -1;
 }
-static BOOL luna_zone_year(WORD year, DYNAMIC_TIME_ZONE_INFORMATION *zone, TIME_ZONE_INFORMATION *out)
+static BOOL luna_zone_year_uncached(WORD year, DYNAMIC_TIME_ZONE_INFORMATION *zone, TIME_ZONE_INFORMATION *out)
 {
   if (zone->TimeZoneKeyName[0])
     return GetTimeZoneInformationForYear(year, zone, out);
@@ -4291,6 +5289,79 @@ static BOOL luna_zone_year(WORD year, DYNAMIC_TIME_ZONE_INFORMATION *zone, TIME_
   memcpy(out->StandardName, zone->StandardName, sizeof out->StandardName);
   memcpy(out->DaylightName, zone->DaylightName, sizeof out->DaylightName);
   return TRUE;
+}
+
+/* Both lookups above read the registry: luna_zone_uncached walks every zone
+ * Windows knows (EnumDynamicTimeZoneInformation, ~140 registry keys) to find
+ * one by name, and a year's rules are another read.  localtime() paid both on
+ * every call - measured at 17 ms per call on a GitHub runner, a dropped frame
+ * each time a game asked the time.  Neither answer changes while we run (the
+ * year is part of the key), so each is kept, failures included. */
+static SRWLOCK luna_zone_cache_lock = SRWLOCK_INIT;
+static struct { char name[128]; int used, result; DYNAMIC_TIME_ZONE_INFORMATION tz; } luna_zone_cache[8];
+static unsigned luna_zone_cache_next;
+static struct { wchar_t key[128]; WORD year; int used; BOOL ok; TIME_ZONE_INFORMATION out; } luna_year_cache[8];
+static unsigned luna_year_cache_next;
+
+static int luna_zone_cache_off(void)   /* LUNARIA_TZ_CACHE=0, for A/B runs */
+{
+   static int off = -1;
+   if (off < 0) { const char *e = getenv("LUNARIA_TZ_CACHE"); off = e && e[0] == '0'; }
+   return off;
+}
+static int luna_zone(const char *zone, DYNAMIC_TIME_ZONE_INFORMATION *tz)
+{
+   const char *name = zone ? zone : "";
+   if (luna_zone_cache_off() || strlen(name) >= sizeof luna_zone_cache[0].name) return luna_zone_uncached(zone, tz);
+   AcquireSRWLockShared(&luna_zone_cache_lock);
+   for (unsigned i = 0; i < 8; ++i)
+      if (luna_zone_cache[i].used && !strcmp(luna_zone_cache[i].name, name)) {
+         const int result = luna_zone_cache[i].result;
+         if (!result) *tz = luna_zone_cache[i].tz;
+         ReleaseSRWLockShared(&luna_zone_cache_lock);
+         return result;
+      }
+   ReleaseSRWLockShared(&luna_zone_cache_lock);
+   DYNAMIC_TIME_ZONE_INFORMATION found;
+   memset(&found, 0, sizeof found);
+   const int result = luna_zone_uncached(zone, &found);
+   AcquireSRWLockExclusive(&luna_zone_cache_lock);
+   const unsigned slot = luna_zone_cache_next++ % 8;
+   snprintf(luna_zone_cache[slot].name, sizeof luna_zone_cache[slot].name, "%s", name);
+   luna_zone_cache[slot].result = result;
+   luna_zone_cache[slot].tz = found;
+   luna_zone_cache[slot].used = 1;
+   ReleaseSRWLockExclusive(&luna_zone_cache_lock);
+   if (!result) *tz = found;
+   return result;
+}
+static BOOL luna_zone_year(WORD year, DYNAMIC_TIME_ZONE_INFORMATION *zone, TIME_ZONE_INFORMATION *out)
+{
+   if (luna_zone_cache_off() || !zone->TimeZoneKeyName[0]) return luna_zone_year_uncached(year, zone, out);
+   AcquireSRWLockShared(&luna_zone_cache_lock);
+   for (unsigned i = 0; i < 8; ++i)
+      if (luna_year_cache[i].used && luna_year_cache[i].year == year &&
+          !wcscmp(luna_year_cache[i].key, zone->TimeZoneKeyName)) {
+         const BOOL ok = luna_year_cache[i].ok;
+         if (ok) *out = luna_year_cache[i].out;
+         ReleaseSRWLockShared(&luna_zone_cache_lock);
+         return ok;
+      }
+   ReleaseSRWLockShared(&luna_zone_cache_lock);
+   TIME_ZONE_INFORMATION rules;
+   memset(&rules, 0, sizeof rules);
+   const BOOL ok = luna_zone_year_uncached(year, zone, &rules);
+   AcquireSRWLockExclusive(&luna_zone_cache_lock);
+   const unsigned slot = luna_year_cache_next++ % 8;
+   wcsncpy(luna_year_cache[slot].key, zone->TimeZoneKeyName, 127);
+   luna_year_cache[slot].key[127] = 0;
+   luna_year_cache[slot].year = year;
+   luna_year_cache[slot].ok = ok;
+   luna_year_cache[slot].out = rules;
+   luna_year_cache[slot].used = 1;
+   ReleaseSRWLockExclusive(&luna_zone_cache_lock);
+   if (ok) *out = rules;
+   return ok;
 }
 static int luna_ms_system(int64_t ms, SYSTEMTIME *st)
 {
@@ -4894,6 +5965,7 @@ ptrdiff_t luna_os_command_pipe_read(intptr_t value, void *buffer, size_t capacit
   }
   DWORD bytes;
   DWORD length = capacity > MAXDWORD ? MAXDWORD : (DWORD)capacity;
+   luna_lazy_ensure(buffer, length);
   if (ReadFile(pipe, buffer, length, &bytes, NULL)) return bytes;
   DWORD error = GetLastError();
   if (error == ERROR_BROKEN_PIPE) {
@@ -4917,4 +5989,446 @@ void *luna_os_library_loaded_symbol(const char *module, const char *name)
   HMODULE handle = GetModuleHandleW(wide);
   free(wide);
   return handle ? (void *)GetProcAddress(handle, name) : NULL;
+}
+
+/* ---- LUNARIA_SAMPLE=MS: where the CPU time goes ---------------------------
+ *
+ * Every MS milliseconds, stop each thread of this process for a moment and
+ * note where it was.  A thread that did not run since the last look (its
+ * cycle counter did not move) is skipped, so blocked threads do not count.
+ * Every 30 s the totals go to stderr by module (no module = translated guest
+ * code) and by thread, and every lunaria.exe hit, by RVA, goes to
+ * $LUNARIA_DUMP_DIR/sample-exe.txt for symbolising offline.  Debug only. */
+#define SAMP_THREADS 256
+#define SAMP_MODS    48
+#define SAMP_RVAS    (1u << 16)
+static struct { DWORD tid; HANDLE h; ULONG64 cycles; char name[48]; unsigned long long n; } samp_t[SAMP_THREADS];
+static int samp_nt;
+static struct { uintptr_t lo, hi; char name[48]; unsigned long long n; } samp_m[SAMP_MODS];
+static int samp_nm;
+static struct { uint32_t rva; unsigned long long n; } samp_rva[SAMP_RVAS];
+static unsigned long long samp_total, samp_anon;
+#define SAMP_SYS (1u << 14)
+static struct { uintptr_t pc; unsigned long long n; } samp_sys[SAMP_SYS];  /* outside lunaria.exe */
+
+/* "module!export+off" for a PC in a loaded DLL, from its export table. */
+static void samp_name(uintptr_t pc, char *out, size_t cap)
+{
+   HMODULE m = NULL;
+   snprintf(out, cap, "%p", (void *)pc);
+   if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)pc, &m) || !m)
+      return;
+   char path[MAX_PATH];
+   const char *mod = "?";
+   if (GetModuleFileNameA(m, path, sizeof path)) {
+      mod = strrchr(path, '\\');
+      mod = mod ? mod + 1 : path;
+   }
+   const uint8_t *base = (const uint8_t *)m;
+   const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(base + ((const IMAGE_DOS_HEADER *)base)->e_lfanew);
+   const IMAGE_DATA_DIRECTORY *dd = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+   const uint32_t rva = (uint32_t)(pc - (uintptr_t)base);
+   const char *best = NULL;
+   uint32_t best_rva = 0;
+   if (dd->VirtualAddress && dd->Size) {
+      const IMAGE_EXPORT_DIRECTORY *ex = (const IMAGE_EXPORT_DIRECTORY *)(base + dd->VirtualAddress);
+      const DWORD *funcs = (const DWORD *)(base + ex->AddressOfFunctions);
+      const DWORD *names = (const DWORD *)(base + ex->AddressOfNames);
+      const WORD *ords = (const WORD *)(base + ex->AddressOfNameOrdinals);
+      for (DWORD i = 0; i < ex->NumberOfNames; ++i) {
+         const uint32_t f = funcs[ords[i]];
+         if (f <= rva && f >= best_rva) { best_rva = f; best = (const char *)(base + names[i]); }
+      }
+   }
+   if (best) snprintf(out, cap, "%s!%s+0x%x", mod, best, rva - best_rva);
+   else snprintf(out, cap, "%s+0x%x", mod, rva);
+}
+
+static int samp_cmp_sys(const void *a, const void *b)
+{
+   const unsigned long long x = *(const unsigned long long *)((const char *)a + sizeof(uintptr_t));
+   const unsigned long long y = *(const unsigned long long *)((const char *)b + sizeof(uintptr_t));
+   return x < y ? 1 : x > y ? -1 : 0;
+}
+
+/* Top DLL functions: sort a copy of the PC table, name the heaviest PCs and
+ * merge PCs that land in the same export. */
+static void samp_report_sys(void)
+{
+   static struct { uintptr_t pc; unsigned long long n; } copy[SAMP_SYS];
+   static struct { char name[96]; unsigned long long n; } agg[64];
+   int nc = 0, na = 0;
+   for (uint32_t i = 0; i < SAMP_SYS; ++i)
+      if (samp_sys[i].n) { copy[nc].pc = samp_sys[i].pc; copy[nc].n = samp_sys[i].n; ++nc; }
+   qsort(copy, (size_t)nc, sizeof copy[0], samp_cmp_sys);
+   for (int i = 0; i < nc && i < 300; ++i) {
+      char full[160];
+      samp_name(copy[i].pc, full, sizeof full);
+      char *plus = strrchr(full, '+');
+      if (plus && strchr(full, '!')) *plus = 0;   /* merge by export, keep offsets for unnamed */
+      int j = 0;
+      while (j < na && strcmp(agg[j].name, full)) ++j;
+      if (j == na) {
+         if (na == 64) continue;
+         snprintf(agg[na].name, sizeof agg[na].name, "%s", full);
+         agg[na].n = 0;
+         ++na;
+      }
+      agg[j].n += copy[i].n;
+   }
+   for (int i = 0; i < na; ++i)
+      for (int j = i + 1; j < na; ++j)
+         if (agg[j].n > agg[i].n) {
+            char t[96]; unsigned long long tn = agg[i].n;
+            memcpy(t, agg[i].name, sizeof t); memcpy(agg[i].name, agg[j].name, sizeof t);
+            memcpy(agg[j].name, t, sizeof t); agg[i].n = agg[j].n; agg[j].n = tn;
+         }
+   fprintf(stderr, "[sample] top functions outside lunaria.exe:\n");
+   for (int i = 0; i < na && i < 16; ++i)
+      fprintf(stderr, "[sample]   %5.1f%%  %s\n", 100.0 * agg[i].n / samp_total, agg[i].name);
+}
+
+static void samp_threads_refresh(DWORD self)
+{
+   typedef HRESULT (WINAPI *desc_fn)(HANDLE, PWSTR *);
+   static desc_fn get_desc;
+   if (!get_desc)
+      get_desc = (desc_fn)(uintptr_t)GetProcAddress(GetModuleHandleW(L"kernelbase.dll"),
+                                                    "GetThreadDescription");
+   HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+   if (snap == INVALID_HANDLE_VALUE) return;
+   THREADENTRY32 te;
+   te.dwSize = sizeof te;
+   const DWORD pid = GetCurrentProcessId();
+   for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+      if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+      int known = 0;
+      for (int i = 0; i < samp_nt; ++i) known |= samp_t[i].tid == te.th32ThreadID;
+      if (known || samp_nt >= SAMP_THREADS) continue;
+      HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                            THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+      if (!h) continue;
+      samp_t[samp_nt].tid = te.th32ThreadID;
+      samp_t[samp_nt].h = h;
+      QueryThreadCycleTime(h, &samp_t[samp_nt].cycles);
+      snprintf(samp_t[samp_nt].name, sizeof samp_t[samp_nt].name, "tid%lu",
+               (unsigned long)te.th32ThreadID);
+      PWSTR wide = NULL;
+      if (get_desc && SUCCEEDED(get_desc(h, &wide)) && wide) {
+         if (wide[0])
+            WideCharToMultiByte(CP_UTF8, 0, wide, -1, samp_t[samp_nt].name,
+                                sizeof samp_t[samp_nt].name - 1, NULL, NULL);
+         LocalFree(wide);
+      }
+      ++samp_nt;
+   }
+   CloseHandle(snap);
+}
+
+/* w: the thread's CPU kilocycles since the last look, so a thread that
+ * barely ran (a wake-up to check a timer) weighs next to nothing. */
+static void samp_note(uintptr_t pc, unsigned long long w, uintptr_t exe_lo, uintptr_t exe_hi)
+{
+   samp_total += w;
+   if (pc >= exe_lo && pc < exe_hi) {
+      uint32_t rva = (uint32_t)(pc - exe_lo);
+      uint32_t k = (rva * 2654435761u) >> 16;
+      for (uint32_t probe = 0; probe < SAMP_RVAS; ++probe, k = (k + 1) & (SAMP_RVAS - 1)) {
+         if (samp_rva[k].n == 0) { samp_rva[k].rva = rva; samp_rva[k].n = w; break; }
+         if (samp_rva[k].rva == rva) { samp_rva[k].n += w; break; }
+      }
+   } else {
+      uint32_t k = (uint32_t)(((uint64_t)pc * 11400714819323198485ull) >> 50);
+      for (uint32_t probe = 0; probe < SAMP_SYS; ++probe, k = (k + 1) & (SAMP_SYS - 1)) {
+         if (samp_sys[k].n == 0) { samp_sys[k].pc = pc; samp_sys[k].n = w; break; }
+         if (samp_sys[k].pc == pc) { samp_sys[k].n += w; break; }
+      }
+   }
+   for (int i = 0; i < samp_nm; ++i)
+      if (pc >= samp_m[i].lo && pc < samp_m[i].hi) { samp_m[i].n += w; return; }
+   HMODULE m = NULL;
+   if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                          GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          (LPCWSTR)pc, &m) && m && samp_nm < SAMP_MODS) {
+      MODULEINFO mi;
+      char path[MAX_PATH];
+      if (GetModuleInformation(GetCurrentProcess(), m, &mi, sizeof mi) &&
+          GetModuleFileNameA(m, path, sizeof path)) {
+         const char *base = strrchr(path, '\\');
+         base = base ? base + 1 : path;
+         samp_m[samp_nm].lo = (uintptr_t)mi.lpBaseOfDll;
+         samp_m[samp_nm].hi = (uintptr_t)mi.lpBaseOfDll + mi.SizeOfImage;
+         snprintf(samp_m[samp_nm].name, sizeof samp_m[samp_nm].name, "%s", base);
+         samp_m[samp_nm].n = w;
+         ++samp_nm;
+         return;
+      }
+   }
+   samp_anon += w;
+}
+
+static int samp_cmp_desc(const void *a, const void *b)
+{
+   const unsigned long long x = *(const unsigned long long *)a, y = *(const unsigned long long *)b;
+   return x < y ? 1 : x > y ? -1 : 0;
+}
+
+/* Handed in by the loader: the OS layer is also linked into tests that have
+ * no JIT, so it cannot name dynarmic's counters itself. */
+static unsigned long long (*samp_jit_count)(void), (*samp_jit_ns)(void);
+
+static void samp_report(int seconds, uintptr_t exe_lo)
+{
+   /* Translation cost over time: how much of it lands at load and how much
+    * keeps happening in play, which is what a translated-code cache saves. */
+   if (samp_jit_count && samp_jit_ns) {
+      static unsigned long long last_n, last_ns;
+      const unsigned long long n = samp_jit_count(), ns = samp_jit_ns();
+      fprintf(stderr, "[sample] t=%ds jit: %llu blocks compiled, %.0f ms total; last window +%llu blocks, +%.0f ms\n",
+              seconds, n, ns / 1e6, n - last_n, (ns - last_ns) / 1e6);
+      last_n = n; last_ns = ns;
+   }
+   {
+      static const char *const names[IO_KINDS] = { "pread", "pwrite", "pipe read", "pipe write", "file read", "file write" };
+      static LONG64 last_calls[IO_KINDS], last_ticks[IO_KINDS], last_bytes[IO_KINDS];
+      LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+      for (int k = 0; k < IO_KINDS; ++k) {
+         const LONG64 c = io_calls[k], t = io_ticks[k], b = io_bytes[k];
+         if (c != last_calls[k])
+            fprintf(stderr, "[sample] t=%ds io %-10s +%lld calls, +%.1f MB, +%.1f ms (total %lld calls, %.0f ms)\n",
+                    seconds, names[k], (long long)(c - last_calls[k]), (b - last_bytes[k]) / 1048576.0,
+                    (t - last_ticks[k]) * 1000.0 / f.QuadPart, (long long)c, t * 1000.0 / f.QuadPart);
+         last_calls[k] = c; last_ticks[k] = t; last_bytes[k] = b;
+      }
+   }
+   if (!samp_total) return;
+   fprintf(stderr, "[sample] t=%ds %.1f Gcycles of CPU sampled. by module:\n", seconds, samp_total / 1e6);
+   struct { unsigned long long n; int i; } order[SAMP_MODS + 1];
+   int k = 0;
+   for (int i = 0; i < samp_nm; ++i) { order[k].n = samp_m[i].n; order[k].i = i; ++k; }
+   order[k].n = samp_anon; order[k].i = -1; ++k;
+   qsort(order, (size_t)k, sizeof order[0], samp_cmp_desc);
+   for (int j = 0; j < k && j < 14; ++j) {
+      if (!order[j].n) break;
+      fprintf(stderr, "[sample]   %5.1f%%  %s\n", 100.0 * order[j].n / samp_total,
+              order[j].i < 0 ? "(no module: translated guest code)" : samp_m[order[j].i].name);
+   }
+   samp_report_sys();
+   struct { unsigned long long n; int i; } tord[SAMP_THREADS];
+   for (int i = 0; i < samp_nt; ++i) { tord[i].n = samp_t[i].n; tord[i].i = i; }
+   qsort(tord, (size_t)samp_nt, sizeof tord[0], samp_cmp_desc);
+   fprintf(stderr, "[sample] by thread:\n");
+   for (int j = 0; j < samp_nt && j < 10; ++j) {
+      if (!tord[j].n) break;
+      fprintf(stderr, "[sample]   %5.1f%%  %s\n", 100.0 * tord[j].n / samp_total,
+              samp_t[tord[j].i].name);
+   }
+   const char *dir = getenv("LUNARIA_DUMP_DIR");
+   if (dir && *dir) {
+      char path[1024];
+      snprintf(path, sizeof path, "%s/sample-exe.txt", dir);
+      FILE *f = fopen(path, "w");
+      if (f) {
+         fprintf(f, "# lunaria.exe base %p, kcycles %llu, rva kcycles\n", (void *)exe_lo, samp_total);
+         for (uint32_t i = 0; i < SAMP_RVAS; ++i)
+            if (samp_rva[i].n) fprintf(f, "%x %llu\n", samp_rva[i].rva, samp_rva[i].n);
+         fclose(f);
+      }
+   }
+}
+
+static DWORD WINAPI samp_thread(void *arg)
+{
+   const int ms = (int)(intptr_t)arg;
+   const DWORD self = GetCurrentThreadId();
+   MODULEINFO exe;
+   GetModuleInformation(GetCurrentProcess(), GetModuleHandleW(NULL), &exe, sizeof exe);
+   const uintptr_t exe_lo = (uintptr_t)exe.lpBaseOfDll, exe_hi = exe_lo + exe.SizeOfImage;
+   const ULONGLONG start = GetTickCount64();
+   ULONGLONG next_refresh = 0, next_report = start + 30000;
+   for (;;) {
+      Sleep((DWORD)ms);
+      const ULONGLONG now = GetTickCount64();
+      if (now >= next_refresh) { samp_threads_refresh(self); next_refresh = now + 1000; }
+      for (int i = 0; i < samp_nt; ++i) {
+         ULONG64 cycles = 0;
+         if (!QueryThreadCycleTime(samp_t[i].h, &cycles) || cycles == samp_t[i].cycles) continue;
+         const unsigned long long w = (cycles - samp_t[i].cycles) / 1000;
+         samp_t[i].cycles = cycles;
+         if (!w) continue;
+         if (SuspendThread(samp_t[i].h) == (DWORD)-1) continue;
+         CONTEXT c;
+         memset(&c, 0, sizeof c);
+         c.ContextFlags = CONTEXT_CONTROL;
+         const BOOL got = GetThreadContext(samp_t[i].h, &c);
+         ResumeThread(samp_t[i].h);
+         /* Resolved after the resume: naming a module takes the loader lock,
+          * which the stopped thread may hold. */
+         if (!got) continue;
+         samp_t[i].n += w;
+#if defined(_M_X64) || defined(__x86_64__)
+         samp_note((uintptr_t)c.Rip, w, exe_lo, exe_hi);
+#elif defined(_M_ARM64) || defined(__aarch64__)
+         samp_note((uintptr_t)c.Pc, w, exe_lo, exe_hi);
+#else
+         samp_note((uintptr_t)c.Eip, w, exe_lo, exe_hi);
+#endif
+      }
+      if (now >= next_report) {
+         samp_report((int)((now - start) / 1000), exe_lo);
+         next_report = now + 30000;
+      }
+   }
+   return 0;
+}
+
+/* LUNARIA_DBG_IOBENCH=1: at start, time random 4 KB pread/pwrite on an 8 MB
+ * temp file through luna_file_pread/pwrite, with the per-description handle
+ * cache off and on, twice each, then carry on. */
+static void pio_bench(void)
+{
+   char dir[MAX_PATH], path[MAX_PATH + 32];
+   if (!GetTempPathA(sizeof dir, dir)) return;
+   snprintf(path, sizeof path, "%slunaria-iobench-%lu.bin", dir, (unsigned long)GetCurrentProcessId());
+   for (char *c = path; *c; ++c) if (*c == '\\') *c = '/';
+   int fd = luna_file_open(path, _O_RDWR | _O_CREAT | _O_TRUNC, 0644);
+   if (fd < 0) { fprintf(stderr, "[iobench] cannot create %s\n", path); return; }
+   static char block[4096];
+   memset(block, 0x5a, sizeof block);
+   for (int i = 0; i < 2048; ++i) luna_fd_write(fd, block, sizeof block);
+   LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+   const int saved = pio_cache_on();
+   for (int round = 0; round < 4; ++round) {
+      pio_cache_state = round & 1;
+      unsigned x = 12345u + (unsigned)round;
+      int bad = 0;
+      LONG64 t0 = io_now();
+      for (int i = 0; i < 3000; ++i) {
+         x = x * 1103515245u + 12345u;
+         if (luna_file_pread(fd, block, sizeof block, (int64_t)((x >> 8) % 2048) * 4096) != 4096) ++bad;
+      }
+      LONG64 t1 = io_now();
+      for (int i = 0; i < 1000; ++i) {
+         x = x * 1103515245u + 12345u;
+         if (luna_file_pwrite(fd, block, sizeof block, (int64_t)((x >> 8) % 2048) * 4096) != 4096) ++bad;
+      }
+      LONG64 t2 = io_now();
+      fprintf(stderr, "[iobench] %-16s pread %.2f us/call, pwrite %.2f us/call%s\n",
+              round & 1 ? "cached handle" : "reopen per call",
+              (t1 - t0) * 1e6 / f.QuadPart / 3000, (t2 - t1) * 1e6 / f.QuadPart / 1000,
+              bad ? " (SOME CALLS FAILED)" : "");
+   }
+   pio_cache_state = saved;
+   {   /* the position read()/write() see must not have moved */
+      const long long pos = _lseeki64(fd, 0, SEEK_CUR);
+      fprintf(stderr, "[iobench] file position after positional I/O: %lld (expect %d)\n", pos, 2048 * 4096);
+   }
+   luna_fd_close(fd);
+   DeleteFileA(path);
+   {   /* localtime's zone work, as it was (registry every call) and cached */
+      DYNAMIC_TIME_ZONE_INFORMATION tz; TIME_ZONE_INFORMATION year;
+      LONG64 t0 = io_now();
+      for (int i = 0; i < 20; ++i) {
+         luna_zone_uncached("America/New_York", &tz);
+         luna_zone_year_uncached(2026, &tz, &year);
+      }
+      LONG64 t1 = io_now();
+      struct tm tm; int32_t off; char name[128];
+      for (int i = 0; i < 200; ++i) luna_calendar_break((1700000000LL + i * 3600) * 1000, "America/New_York", &tm, &off, name, sizeof name);
+      LONG64 t2 = io_now();
+      fprintf(stderr, "[iobench] localtime zone lookup: uncached %.1f us/call, cached (whole localtime) %.2f us/call\n",
+              (t1 - t0) * 1e6 / f.QuadPart / 20, (t2 - t1) * 1e6 / f.QuadPart / 200);
+   }
+}
+
+void luna_os_sampler_start(unsigned long long (*jit_count)(void), unsigned long long (*jit_ns)(void))
+{
+   samp_jit_count = jit_count;
+   samp_jit_ns = jit_ns;
+   if (getenv("LUNARIA_DBG_IOBENCH")) pio_bench();
+   const char *v = getenv("LUNARIA_SAMPLE");
+   const int ms = v ? atoi(v) : 0;
+   if (ms <= 0) return;
+   HANDLE t = CreateThread(NULL, 0, samp_thread, (void *)(intptr_t)ms, 0, NULL);
+   if (t) {
+      SetThreadPriority(t, THREAD_PRIORITY_TIME_CRITICAL);
+      CloseHandle(t);
+      fprintf(stderr, "[sample] sampling every %d ms\n", ms);
+   }
+}
+
+/* HKCU\Software\Classes\<scheme>: a per-user URL protocol, no admin.  A
+ * scheme some other program already handles is left alone. */
+int luna_os_register_url_scheme(const char *scheme, const char *command)
+{
+   if (!scheme || !*scheme || !command) { errno = EINVAL; return -1; }
+   wchar_t ws[96], wcmd[8192], key[256], cur[8192];
+   if (!MultiByteToWideChar(CP_UTF8, 0, scheme, -1, ws, 96) ||
+       !MultiByteToWideChar(CP_UTF8, 0, command, -1, wcmd, 8192)) { errno = EINVAL; return -1; }
+   _snwprintf(key, 256, L"Software\\Classes\\%ls\\shell\\open\\command", ws);
+   key[255] = 0;
+   DWORD size = sizeof cur;
+   if (RegGetValueW(HKEY_CURRENT_USER, key, NULL, RRF_RT_REG_SZ, NULL, cur, &size) == ERROR_SUCCESS &&
+       !wcsstr(cur, L"--deliver-url")) return 1;
+   size = sizeof cur;
+   wchar_t mkey[256];
+   _snwprintf(mkey, 256, L"%ls\\shell\\open\\command", ws);
+   mkey[255] = 0;
+   if (RegGetValueW(HKEY_CLASSES_ROOT, mkey, NULL, RRF_RT_REG_SZ, NULL, cur, &size) == ERROR_SUCCESS &&
+       !wcsstr(cur, L"--deliver-url")) return 1;
+   HKEY base = NULL, cmd = NULL;
+   wchar_t bkey[160], desc[128];
+   _snwprintf(bkey, 160, L"Software\\Classes\\%ls", ws);
+   bkey[159] = 0;
+   _snwprintf(desc, 128, L"URL:%ls (Lunaria)", ws);
+   desc[127] = 0;
+   int rc = -1;
+   if (RegCreateKeyExW(HKEY_CURRENT_USER, bkey, 0, NULL, 0, KEY_WRITE, NULL, &base, NULL) == ERROR_SUCCESS &&
+       RegSetValueExW(base, NULL, 0, REG_SZ, (const BYTE *)desc, (DWORD)((wcslen(desc) + 1) * sizeof(wchar_t))) == ERROR_SUCCESS &&
+       RegSetValueExW(base, L"URL Protocol", 0, REG_SZ, (const BYTE *)L"", sizeof(wchar_t)) == ERROR_SUCCESS &&
+       RegCreateKeyExW(HKEY_CURRENT_USER, key, 0, NULL, 0, KEY_WRITE, NULL, &cmd, NULL) == ERROR_SUCCESS &&
+       RegSetValueExW(cmd, NULL, 0, REG_SZ, (const BYTE *)wcmd, (DWORD)((wcslen(wcmd) + 1) * sizeof(wchar_t))) == ERROR_SUCCESS)
+      rc = 0;
+   if (cmd) RegCloseKey(cmd);
+   if (base) RegCloseKey(base);
+   if (rc) errno = EIO;
+   return rc;
+}
+
+/* Open an http(s) URL in a browser on the host desktop (a game's login or
+ * "open website" button).  LUNARIA_EXTERNAL_BROWSER names a browser
+ * executable to use; otherwise the user's default browser opens it.  Only
+ * plain http/https reaches here (the caller checks), and the URL is passed
+ * as one quoted argument, so a guest cannot make this run anything else. */
+int luna_os_open_url(const char *url)
+{
+   if (!url || (strncmp(url, "http://", 7) && strncmp(url, "https://", 8))) {
+      errno = EINVAL;
+      return -1;
+   }
+   for (const char *p = url; *p; ++p)
+      if ((unsigned char)*p < 0x20 || *p == '"') { errno = EINVAL; return -1; }
+   const char *browser = getenv("LUNARIA_EXTERNAL_BROWSER");
+   char cmd[8192];
+   int n;
+   if (browser && *browser)
+      n = snprintf(cmd, sizeof cmd, "\"%s\" \"%s\"", browser, url);
+   else
+      n = snprintf(cmd, sizeof cmd, "rundll32.exe url.dll,FileProtocolHandler \"%s\"", url);
+   if (n < 0 || (size_t)n >= sizeof cmd) { errno = ENAMETOOLONG; return -1; }
+   wchar_t wcmd[8192];
+   if (!MultiByteToWideChar(CP_UTF8, 0, cmd, -1, wcmd, (int)(sizeof wcmd / sizeof wcmd[0]))) {
+      errno = EINVAL;
+      return -1;
+   }
+   STARTUPINFOW si = { .cb = sizeof si };
+   PROCESS_INFORMATION pi;
+   if (!CreateProcessW(NULL, wcmd, NULL, NULL, FALSE, DETACHED_PROCESS, NULL, NULL, &si, &pi)) {
+      errno = ENOENT;
+      return -1;
+   }
+   CloseHandle(pi.hThread);
+   CloseHandle(pi.hProcess);
+   return 0;
 }

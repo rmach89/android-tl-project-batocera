@@ -485,6 +485,47 @@ static bool st_of(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   RETL(st_new(vm, "Ljava/util/stream/Stream;", list));
 }
 
+/* Arrays.stream(T[]) / Arrays.stream(T[], from, to). */
+static bool st_arrays_stream(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                             int nargs, union dvm_value *out)
+{
+  (void)self;
+  dvm_ref array = nargs > 0 ? ARG(0).l : 0;
+  if (!array) {
+    dvm__throw(vm, "java/lang/NullPointerException", "array");
+    return false;
+  }
+  const uint32_t n = dvm_array_length(vm, array);
+  int64_t from = nargs > 2 ? ARG(1).i : 0, to = nargs > 2 ? ARG(2).i : (int64_t)n;
+  if (from < 0 || to > n || from > to) {
+    dvm__throw(vm, "java/lang/ArrayIndexOutOfBoundsException", "%lld..%lld of %u",
+               (long long)from, (long long)to, n);
+    return false;
+  }
+  dvm_ref list = coll_new_list(vm, ST_LIST_DESC);
+  for (int64_t i = from; list && i < to; ++i)
+    if (!st_add(vm, list, ((dvm_ref *)dvm_array_data(vm, array))[i])) return false;
+  RETL(st_new(vm, "Ljava/util/stream/Stream;", list));
+}
+
+/* Stream.concat(a, b). */
+static bool st_concat(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                      int nargs, union dvm_value *out)
+{
+  (void)self;
+  if (nargs < 2 || !ARG(0).l || !ARG(1).l) {
+    dvm__throw(vm, "java/lang/NullPointerException", "concat");
+    return false;
+  }
+  dvm_ref list = coll_new_list(vm, ST_LIST_DESC);
+  for (int k = 0; k < 2; ++k) {
+    struct rt_list *src = st_items(vm, ARG(k).l);
+    for (uint32_t i = 0; list && src && i < src->size; ++i)
+      if (!st_add(vm, list, src->items[i])) return false;
+  }
+  RETL(st_new(vm, "Ljava/util/stream/Stream;", list));
+}
+
 /* ---- Collector(s) ------------------------------------------------------ */
 
 enum { CK_LIST = 1, CK_SET, CK_JOIN, CK_COLLECTION, CK_MAP };
@@ -706,6 +747,7 @@ static const struct rt_method rt_stream[] = {
   SM("of", "([Ljava/lang/Object;)Ljava/util/stream/Stream;", st_of),
   SM("of", "(Ljava/lang/Object;)Ljava/util/stream/Stream;", st_of),
   SM("empty", "()Ljava/util/stream/Stream;", st_of),
+  SM("concat", "(Ljava/util/stream/Stream;Ljava/util/stream/Stream;)Ljava/util/stream/Stream;", st_concat),
   M_END,
 };
 

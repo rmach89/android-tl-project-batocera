@@ -514,6 +514,50 @@ static unsigned char *zip_memory(struct zip *z, const char *name, size_t *size)
 {
   return zip_memory_limit(z, name, size, APK_MAX_MANIFEST);
 }
+/* A tree that was fully checked or extracted once carries a stamp with the
+ * archive's entry count and expanded size.  The tree's directory is named
+ * after the archive's content, so the same stamp means the same archive;
+ * later starts look at the stamp and a few sample files instead of every
+ * file.  Play services' tree is 9720 files, and it was walked on every one
+ * of its starts -- seconds of stat() on Aloa's HDD each time (17-11).
+ * A missing sample, or LUNARIA_FULL_CHECK=1, falls back to the full walk. */
+static void zip_stamp_name(char *out, size_t cap, const char *root)
+{
+   if (path_join(out, cap, root, ".lunaria-complete")) out[0] = 0;
+}
+static bool zip_stamp_ok(struct zip *z, const char *root, uint64_t total)
+{
+   if (getenv("LUNARIA_FULL_CHECK") && *getenv("LUNARIA_FULL_CHECK") == '1') return false;
+   char stamp[APK_PATH];
+   zip_stamp_name(stamp, sizeof stamp, root);
+   if (!stamp[0]) return false;
+   FILE *f = open_file(stamp, "rb");
+   if (!f) return false;
+   unsigned long long count = 0, bytes = 0;
+   const int got = fscanf(f, "%llu %llu", &count, &bytes);
+   fclose(f);
+   if (got != 2 || count != (unsigned long long)z->count || bytes != (unsigned long long)total)
+      return false;
+   /* Up to 16 files spread over the archive must still be there. */
+   const size_t step = z->count / 16 + 1;
+   for (size_t i = 0; i < z->count; i += step) {
+      const struct zip_entry *e = z->entries + i;
+      if (!e->name[0] || e->name[strlen(e->name) - 1] == '/' || !entry_safe(e->name)) continue;
+      char path[APK_PATH];
+      if (path_join(path, sizeof path, root, e->name) || !exists(path)) return false;
+   }
+   return true;
+}
+static void zip_stamp_write(struct zip *z, const char *root, uint64_t total)
+{
+   char stamp[APK_PATH];
+   zip_stamp_name(stamp, sizeof stamp, root);
+   if (!stamp[0]) return;
+   FILE *f = open_file(stamp, "wb");
+   if (!f) return;
+   fprintf(f, "%llu %llu", (unsigned long long)z->count, (unsigned long long)total);
+   fclose(f);
+}
 static int zip_extract(struct zip *z, const char *root, bool overwrite)
 {
   if (mkdirs(root))
@@ -524,6 +568,11 @@ static int zip_extract(struct zip *z, const char *root, bool overwrite)
       return apk_error("archive expanded size is too large");
     progress.total += z->entries[i].size;
   }
+   if (!overwrite && zip_stamp_ok(z, root, progress.total)) {
+      fprintf(stderr, "[apk] cached files complete (stamp + samples, %zu files): %s\n",
+              progress.count, root);
+      return 0;
+   }
   luna_launcher_progress(overwrite ? "Extracting archive" : "Checking installed files", root, 0, progress.total);
   fprintf(stderr, "[apk] %s: %s (%.1f MiB, %zu files)\n",
           overwrite ? "Extracting" : "Checking cached files / restoring missing files",
@@ -573,6 +622,7 @@ static int zip_extract(struct zip *z, const char *root, bool overwrite)
   }
   progress.name = "done";
   extraction_report(&progress, true);
+   zip_stamp_write(z, root, progress.total);
   return 0;
 }
 /* A growable NUL-terminated string.  Manifest metadata has no useful fixed
@@ -1847,6 +1897,36 @@ static int env_set(const char *key, const char *value, bool overwrite)
 {
   return luna_os_setenv(key, value, overwrite);
 }
+/* A manifest table for the environment.  Windows refuses one variable longer
+ * than 32767 characters (_putenv_s: EINVAL), and Play services' tables are
+ * several times that: env_set failed, apk_prepare took `goto done` without a
+ * word, and the Google services install stopped right after copying base.apk
+ * (Aloa, 14-11).  An over-long value goes to a file in `dir` and the variable
+ * names it; readers use luna_env_long(). */
+static int env_set_table(const char *key, const char *value, const char *dir)
+{
+#ifdef _WIN32
+   const size_t limit = 30000;
+#else
+   const size_t limit = (size_t)-1;
+#endif
+   const size_t n = strlen(value);
+   if (strlen(key) + n + 2 < limit) {
+      if (!env_set(key, value, true)) return 0;
+      return apk_error("cannot set %s (%zu characters): %s", key, n, strerror(errno));
+   }
+   char path[APK_PATH], ref[APK_PATH + 32];
+   if (snprintf(path, sizeof path, "%s/.lunaria-env-%s", dir, key) >= (int)sizeof path)
+      return apk_error("%s: path too long", key);
+   FILE *f = open_file(path, "wb");
+   if (!f) return apk_error("cannot write %s: %s", path, strerror(errno));
+   const bool ok = fwrite(value, 1, n, f) == n;
+   if (fclose(f) || !ok) return apk_error("cannot write %s", path);
+   snprintf(ref, sizeof ref, "%s%s", LUNA_ENV_FILE_PREFIX, path);
+   fprintf(stderr, "[apk] %s is %zu characters: kept in %s\n", key, n, path);
+   if (env_set(key, ref, true)) return apk_error("cannot set %s: %s", key, strerror(errno));
+   return 0;
+}
 static int env_default(const char *key, const char *value)
 {
   const char *old = getenv(key);
@@ -1916,6 +1996,102 @@ static int absolute_path(const char *path, char *out, size_t cap)
   return path_join(out, cap, cwd, path);
 #endif
 }
+/* ---- lunaria-recent.txt: packages opened before, newest first, one per line.
+ * It sits next to lunaria.conf so the launcher can offer them again with a
+ * Play button instead of a fresh drag-and-drop every time. */
+#define RECENT_MAX 8
+static int conf_default_path(char *out, size_t cap);
+static int recent_file(char *out, size_t cap)
+{
+   char conf[APK_PATH];
+   if (conf_default_path(conf, sizeof conf)) return -1;
+   char *cut = strrchr(conf, '/'), *back = strrchr(conf, '\\');
+   if (back > cut) cut = back;
+   if (!cut) return -1;
+   *cut = 0;
+   return path_join(out, cap, conf, "lunaria-recent.txt");
+}
+
+/* The system packages Lunaria itself starts as helper processes, recognised
+ * by where they live rather than by reading the archive: the service broker
+ * runs them from the per-app device root (.../device-root/product/priv-app/
+ * PrebuiltGmsCore/PrebuiltGmsCore.apk), whose Play services APK has no
+ * signing block, so the package-name check below never saw them, and every
+ * game launch added PrebuiltGmsCore.apk and Phonesky.apk to "Play again"
+ * (Aloa, 17-11). Checked when the list is read too, so entries recorded
+ * before this was fixed disappear. */
+static bool recent_is_system_path(const char *path)
+{
+   static const char *const parts[] = {"device-root", "/priv-app/", "\\priv-app\\",
+                                       "PrebuiltGmsCore", "Phonesky", "GoogleServicesFramework",
+                                       "GmsCore.apk"};
+   for (size_t i = 0; i < sizeof parts / sizeof parts[0]; i++)
+      if (strstr(path, parts[i])) return true;
+   return false;
+}
+
+static size_t recent_load(char out[][APK_PATH], size_t max)
+{
+   char file[APK_PATH], line[APK_PATH];
+   size_t n = 0;
+   if (recent_file(file, sizeof file)) return 0;
+   FILE *f = open_file(file, "rb");
+   if (!f) return 0;
+   while (n < max && fgets(line, sizeof line, f)) {
+      line[strcspn(line, "\r\n")] = 0;
+      if (line[0] && !recent_is_system_path(line)) memcpy(out[n++], line, strlen(line) + 1);
+   }
+   fclose(f);
+   return n;
+}
+
+static bool recent_is_package(const char *path)
+{
+   static const char *const ext[] = {".apk", ".xapk", ".apks", ".apkm", ".aab"};
+   const size_t len = strlen(path);
+   for (size_t i = 0; i < sizeof ext / sizeof ext[0]; i++) {
+      const size_t el = strlen(ext[i]);
+      if (len <= el) continue;
+      size_t k = 0;
+      while (k < el && tolower((unsigned char)path[len - el + k]) == ext[i][k]) k++;
+      if (k == el) return true;
+   }
+   return false;
+}
+
+/* Google's own packages (Play services, Play Store, Services Framework) are
+ * system parts, not something to play: dropping the Play services APK on the
+ * launcher put it under "Play again" with a Play button (Aloa, 15-11). */
+static bool update_archive_package(const char *path, char *pkg, size_t cap);
+static bool recent_is_google(const char *path)
+{
+   static const char *const google[] = {"com.google.android.gms", "com.android.vending", "com.google.android.gsf"};
+   char pkg[256];
+   if (!update_archive_package(path, pkg, sizeof pkg)) return false;
+   for (size_t i = 0; i < sizeof google / sizeof google[0]; i++)
+      if (!strcmp(pkg, google[i])) return true;
+   return false;
+}
+
+/* Puts the package this run opens at the top of the list.  Best effort: a
+ * read-only folder only loses the convenience. */
+static void recent_remember(int argc, const char **argv)
+{
+   const char *pkg = NULL;
+   for (int i = 1; i < argc; i++)
+      if (argv[i] && argv[i][0] != '-' && recent_is_package(argv[i])) pkg = argv[i];
+   static char list[RECENT_MAX][APK_PATH];
+   char abs[APK_PATH], file[APK_PATH];
+   if (!pkg || recent_is_system_path(pkg) || recent_is_google(pkg) || absolute_path(pkg, abs, sizeof abs) || recent_file(file, sizeof file)) return;
+   const size_t n = recent_load(list, RECENT_MAX);
+   FILE *f = open_file(file, "wb");
+   if (!f) return;
+   fprintf(f, "%s\n", abs);
+   for (size_t i = 0, kept = 1; i < n && kept < RECENT_MAX; i++)
+      if (strcmp(list[i], abs)) { fprintf(f, "%s\n", list[i]); kept++; }
+   fclose(f);
+}
+
 static char *trim(char *s)
 {
   while (isspace((unsigned char) * s))
@@ -2488,6 +2664,28 @@ static int font_defaults(const char *exedir)
   for (size_t i = 0; i < sizeof faces / sizeof faces[0]; i++)
     if (!path_join(path, sizeof path, fonts, faces[i].file) && exists(path))
       env_default(faces[i].key, path);
+#ifdef _WIN32
+   /* make-dist.sh copies Inter from a sibling luna-shell checkout, which a CI
+    * build does not have, so a Windows ZIP can ship an empty fonts/ and every
+    * label in the launcher and menus renders blank.  Every Windows install
+    * has Segoe UI: use it for any face still unset. */
+   {
+      static const struct { const char *key, *file; } system_faces[] = {
+         {"LUNA_FONT_REGULAR", "segoeui.ttf"}, {"LUNA_FONT_BOLD", "segoeuib.ttf"},
+         {"LUNA_FONT_REGULAR", "arial.ttf"}, {"LUNA_FONT_BOLD", "arialbd.ttf"},
+      };
+      const char *windir = getenv("WINDIR");
+      char dir[APK_PATH];
+      snprintf(dir, sizeof dir, "%s/Fonts", windir && *windir ? windir : "C:/Windows");
+      for (char *c = dir; *c; c++)
+         if (*c == '\\') *c = '/';
+      for (size_t i = 0; i < sizeof system_faces / sizeof system_faces[0]; i++) {
+         const char *have = getenv(system_faces[i].key);
+         if ((!have || !*have) && !path_join(path, sizeof path, dir, system_faces[i].file) && exists(path))
+            env_default(system_faces[i].key, path);
+      }
+   }
+#endif
   static const char *cjk[] = {"NotoSansCJKjp-Regular.otf", "NotoSansCJK-Regular.ttc", "NotoSansCJKjp-Regular.ttc"};
   for (size_t i = 0; i < sizeof cjk / sizeof cjk[0]; i++)
     if (!path_join(path, sizeof path, fonts, cjk[i]) && exists(path)) {
@@ -2854,18 +3052,102 @@ done:
  * had been given.  The data folder leads because it is the one choice that
  * cannot be taken back: a later run pointed elsewhere does not find what an
  * earlier one downloaded. */
+/* Login return links.  A game that logs in through the desktop browser gets
+ * sent back by a link in its own scheme (mygame://auth?code=...).  Each
+ * BROWSABLE VIEW filter scheme of the game is registered with the desktop
+ * (per user), pointing at `lunaria --deliver-url <data root> <link>`; that
+ * second process drops the link in <data root>/inbox-url.txt and exits, and
+ * the running game picks it up on its main looper (dvm_deliver_inbox_url). */
+static bool return_link_scheme_ok(const char *s)
+{
+   static const char *const skip[] = { "http", "https", "file", "content", "market", "mailto", "tel", "sms",
+                                       "geo", "intent", "data", "javascript", "about", "android-app", "ftp" };
+   if (!s || !*s || strlen(s) > 64 || !isalpha((unsigned char)*s)) return false;
+   for (const char *c = s; *c; ++c)
+      if (!isalnum((unsigned char)*c) && *c != '+' && *c != '-' && *c != '.') return false;
+   for (size_t i = 0; i < sizeof skip / sizeof skip[0]; ++i)
+      if (!strcasecmp(s, skip[i])) return false;
+   return true;
+}
+
+static void register_return_links(const char *rows, const char *root)
+{
+   if (!rows || !*rows || !root || getenv("LUNARIA_NO_RETURN_LINKS")) return;
+   char exe[APK_PATH], command[APK_PATH * 2 + 64];
+   if (luna_os_executable_path(exe, sizeof exe)) return;
+   if (strchr(exe, '"') || strchr(root, '"')) return;
+   snprintf(command, sizeof command, "\"%s\" --deliver-url \"%s\" \"%%1\"", exe, root);
+   char *copy = strdup(rows);
+   for (char *p = copy, *row; p && (row = luna_strsep(&p, "\n"));) {
+      char *name = luna_strsep(&row, "|"), *actions = luna_strsep(&row, "|"), *cats = luna_strsep(&row, "|");
+      (void)name;
+      if (!actions || !cats || !row || !strstr(actions, "android.intent.action.VIEW") ||
+          !strstr(cats, "android.intent.category.BROWSABLE")) continue;
+      (void)luna_strsep(&row, "|"); (void)luna_strsep(&row, "|");   /* data flag, priority */
+      for (char *spec; row && (spec = luna_strsep(&row, ";,"));) {
+         if (strncmp(spec, "scheme=", 7) || !return_link_scheme_ok(spec + 7)) continue;
+         int rc = luna_os_register_url_scheme(spec + 7, command);
+         fprintf(stderr, "[apk] return link %s://: %s\n", spec + 7,
+                 rc == 0 ? "registered" : rc == 1 ? "left alone (another app owns it)" : "not registered");
+      }
+   }
+   free(copy);
+}
+
+/* `lunaria --deliver-url <data root> <link>`: hand the link to the running
+ * game and exit.  Returns 1 when this was that call. */
+static int deliver_url_command(int argc, const char **argv)
+{
+   if (argc != 4 || strcmp(argv[1], "--deliver-url")) return 0;
+   const char *root = argv[2], *url = argv[3];
+   const char *colon = strchr(url, ':');
+   if (!colon || strlen(url) > 8000) { fprintf(stderr, "[apk] --deliver-url: not a link\n"); return 1; }
+   char scheme[80];
+   snprintf(scheme, sizeof scheme, "%.*s", (int)(colon - url < 79 ? colon - url : 79), url);
+   if (!return_link_scheme_ok(scheme)) { fprintf(stderr, "[apk] --deliver-url: scheme refused\n"); return 1; }
+   char tmp[APK_PATH], dst[APK_PATH];
+   if (path_join(tmp, sizeof tmp, root, "inbox-url.tmp") || path_join(dst, sizeof dst, root, "inbox-url.txt")) return 1;
+   FILE *f = fopen(tmp, "wb");
+   if (!f) { fprintf(stderr, "[apk] --deliver-url: cannot write %s\n", tmp); return 1; }
+   fputs(url, f);
+   fclose(f);
+   (void)remove(dst);
+   if (luna_file_rename(tmp, dst)) fprintf(stderr, "[apk] --deliver-url: cannot place %s\n", dst);
+   return 1;
+}
+
+static bool g_google_from_launcher;
+static bool g_google_auto;
+static char g_google_auto_pkg[256];
+static int google_find_download(const char *root, char *out, size_t cap, char *pkg_out, size_t pkg_cap);
+static int google_setup_restart(void);
 static int launcher_ask(int *argc, const char ***argv)
 {
   static const char *const devices[] = {"", "pixel6", "pixel7", "galaxys21", "lunaria", NULL};
-  static const struct {
-    const char *key, *label, *hint;
-    int folder, compact;
-  } fields[] = {
-    {"LUNARIA_DATA_ROOT", "Data folder", "Where the app's files live. Keep it set: a different folder starts from nothing.", 1, 0},
-    {"LUNARIA_CACHE_DIR", "Package cache folder", "Empty: cache/packages inside the data folder.", 1, 0},
-    {"LUNARIA_DEVICE", "Device", "", 0, 1},
-    {"LUNARIA_WIDTH", "Width (px)", "", 0, 1},
-    {"LUNARIA_HEIGHT", "Height (px)", "", 0, 1},
+#ifdef _WIN32
+   /* arm_exec's init_host_egl: anything but "vulkan" is D3D11, falling back
+    * to Vulkan when D3D11 cannot start. */
+   static const char *const graphics[] = {"", "vulkan", NULL};
+   static const char *const graphics_labels[] = {"DirectX 11 (default)", "Vulkan", NULL};
+#endif
+   /* LUNARIA_A64_ENGINES: 64-bit games only; empty picks from the core count. */
+   static const char *const engines[] = {"", "1", "2", "4", NULL};
+   static const char *const engine_labels[] = {"Auto", "1", "2", "4", NULL};
+   static const struct {
+      const char *key, *label, *hint; int folder, compact;
+      const char *const *choices, *const *labels; const char *heading;
+   } fields[] = {
+      {"LUNARIA_DATA_ROOT", "Data folder", "Where the app's files live. Keep it set: a different folder starts from nothing.", 1, 0, NULL, NULL, NULL},
+      {"LUNARIA_CACHE_DIR", "Package cache folder", "Empty: cache/packages inside the data folder.", 1, 0, NULL, NULL, NULL},
+      {"LUNARIA_DEVICE", "Device", "", 0, 1, devices, NULL, NULL},
+      {"LUNARIA_WIDTH", "Width (px)", "", 0, 1, NULL, NULL, NULL},
+      {"LUNARIA_HEIGHT", "Height (px)", "", 0, 1, NULL, NULL, NULL},
+#ifdef _WIN32
+      {"LUNARIA_ANGLE_BACKEND", "Graphics", "", 0, 2, graphics, graphics_labels, "PERFORMANCE"},
+      {"LUNARIA_A64_ENGINES", "Game threads (64-bit games)", "", 0, 2, engines, engine_labels, NULL},
+#else
+      {"LUNARIA_A64_ENGINES", "Game threads (64-bit games)", "", 0, 2, engines, engine_labels, "PERFORMANCE"},
+#endif
   };
   static luna_launcher_setting settings[sizeof fields / sizeof fields[0]];
   static char chosen[APK_PATH], conf[APK_PATH], before[sizeof fields / sizeof fields[0]][1024];
@@ -2878,7 +3160,9 @@ static int launcher_ask(int *argc, const char ***argv)
     settings[i].hint = fields[i].hint;
     settings[i].folder = fields[i].folder;
     settings[i].compact = fields[i].compact;
-    settings[i].choices = !strcmp(fields[i].key, "LUNARIA_DEVICE") ? devices : NULL;
+      settings[i].choices = fields[i].choices;
+      settings[i].choice_labels = fields[i].labels;
+      settings[i].heading = fields[i].heading;
     const char *env = getenv(fields[i].key);
     if (env && *env && strlen(env) < sizeof settings[i].value)
       strcpy(settings[i].value, env);
@@ -2886,7 +3170,16 @@ static int launcher_ask(int *argc, const char ***argv)
       conf_get(conf, fields[i].key, settings[i].value, sizeof settings[i].value);
     strcpy(before[i], settings[i].value);
   }
-  if (luna_launcher_pick(chosen, sizeof chosen, settings, sizeof fields / sizeof fields[0]) != 0)
+   static char recent[RECENT_MAX][APK_PATH];
+   const char *recent_ptr[RECENT_MAX];
+   const size_t nloaded = recent_load(recent, RECENT_MAX);
+   size_t nrecent = 0;
+   /* lists written before Google packages were left out still hold them */
+   for (size_t i = 0; i < nloaded; i++)
+      if (!recent_is_google(recent[i])) recent_ptr[nrecent++] = recent[i];
+   luna_launcher_set_recent(recent_ptr, nrecent);
+   const int picked = luna_launcher_pick(chosen, sizeof chosen, settings, sizeof fields / sizeof fields[0]);
+   if (picked != 0 && picked != LUNA_LAUNCHER_GOOGLE)
     return 1;
   for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++) {
     if (!strcmp(before[i], settings[i].value))
@@ -2901,7 +3194,10 @@ static int launcher_ask(int *argc, const char ***argv)
   if (env_set("LUNARIA_CONF", conf, true))
     return -1;
   synthesized[0] = *argc > 0 ? (*argv)[0] : "lunaria";
-  synthesized[1] = chosen;
+   /* The Google services button carries on exactly as `--google-services`
+    * would: its own file picker, then the system install. */
+   g_google_from_launcher = picked == LUNA_LAUNCHER_GOOGLE;
+   synthesized[1] = g_google_from_launcher ? "--google-services" : chosen;
   synthesized[2] = NULL;
   *argc = 2;
   *argv = synthesized;
@@ -2920,7 +3216,17 @@ static int apk_prepare_inner(int *argc, const char ***argv)
   if (restart_environment_remember()) return apk_error("cannot retain the launch environment");
   if (*argc < 2) {
     /* Started with nothing to run (a double-clicked app, a launcher icon).
-     * Without a display there is nobody to ask. */
+       * Without a display there is nobody to ask.  The launcher draws text
+       * too, so its fonts are set up before it opens, not only once an app
+       * has been chosen. */
+      char launcher_exe[APK_PATH];
+      if (!luna_os_executable_path(launcher_exe, sizeof launcher_exe)) {
+         char *cut = strrchr(launcher_exe, '/');
+         if (cut) {
+            *cut = 0;
+            font_defaults(launcher_exe);
+         }
+      }
     const int asked = launcher_ask(argc, argv);
     if (asked) {
       luna_launcher_end(0);
@@ -2929,6 +3235,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
       return asked > 0 ? 1 : -1;
     }
   }
+   recent_remember(*argc, *argv);
   restart_remember(*argc, *argv);
   bool list = false, prepare = false, install = false, choose = false, profile_requested = false;
   bool system_install = false, google_setup = false;
@@ -3013,13 +3320,17 @@ static int apk_prepare_inner(int *argc, const char ***argv)
     char note[APK_PATH + 128];
     snprintf(note, sizeof note, "Shared data folder: %s",
              env_value("LUNARIA_DATA_ROOT", "."));
-    if (luna_launcher_pick_named(selected, sizeof selected, "Install Google services", note)) return 1;
+      /* Guided setup: Google apps the person downloaded and has not
+       * installed yet are taken from Downloads in order, no picker. */
+      if (!google_find_download(env_value("LUNARIA_DATA_ROOT", "."), selected, sizeof selected, g_google_auto_pkg, sizeof g_google_auto_pkg)) {
+         g_google_auto = true;
+      } else if (luna_launcher_pick_named(selected, sizeof selected, "Install Google services", note)) return 1;
     argument = selected;
   } else {
     if (at >= *argc || *argc - at != 1) return apk_error("specify one APK or module");
     argument = (*argv)[at];
   }
-  bool container = suffix(argument, ".xapk") || suffix(argument, ".apks");
+   bool container = suffix(argument, ".xapk") || suffix(argument, ".apks") || suffix(argument, ".apkm");
   if (!container && !suffix(argument, ".apk") && !suffix(argument, ".aab")) {
     if (at != 1)
       return apk_error("APK options require an APK archive");
@@ -3062,12 +3373,47 @@ static int apk_prepare_inner(int *argc, const char ***argv)
   luna_file_info info;
   if (luna_file_infoat(LUNA_AT_FDCWD, input, &info, 0))
     return -1;
-  uint64_t hash = hash_bytes(UINT64_C(14695981039346656037), input, strlen(input));
-  hash = hash_bytes(hash, &info.size, sizeof info.size);
+   /* Keyed on what the archive IS, not where it sits: size, modified time and
+    * the last 64 KiB, which hold the zip central directory (every entry's CRC).
+    * The path used to be part of the key, so moving or renaming a 1.5 GB game
+    * unpacked all of it again into a second copy (Aloa, 14-11). */
+   uint64_t hash = hash_bytes(UINT64_C(14695981039346656037), &info.size, sizeof info.size);
   hash = hash_bytes(hash, &info.modified, sizeof info.modified);
+   {
+      FILE *tail = open_file(input, "rb");
+      if (tail) {
+         static unsigned char buf[65536];
+         const uint64_t size = (uint64_t)info.size;
+         const uint64_t at = size > sizeof buf ? size - sizeof buf : 0;
+         if (!seek_file(tail, at)) {
+            const size_t got = fread(buf, 1, sizeof buf, tail);
+            hash = hash_bytes(hash, buf, got);
+         }
+         fclose(tail);
+      }
+   }
   char key[64];
-  snprintf(key, sizeof key, "native-v1-%016" PRIx64, hash);
-  if (path_join(cache, sizeof cache, cache_root, key) || mkdirs(cache) || path_join(pkgdir, sizeof pkgdir, cache, "pkg") || path_join(inst, sizeof inst, cache, "inst") || path_join(ready, sizeof ready, cache, ".ready"))
+   snprintf(key, sizeof key, "native-v2-%016" PRIx64, hash);
+   if (path_join(cache, sizeof cache, cache_root, key))
+      return -1;
+   {  /* A cache unpacked under the old path-based key is the same archive if it
+       * is still at that path: adopt it rather than unpack 1.5 GB again. */
+      char old_cache[APK_PATH], old_ready[APK_PATH];
+      uint64_t old = hash_bytes(UINT64_C(14695981039346656037), input, strlen(input));
+      old = hash_bytes(old, &info.size, sizeof info.size);
+      old = hash_bytes(old, &info.modified, sizeof info.modified);
+      char old_key[64];
+      snprintf(old_key, sizeof old_key, "native-v1-%016" PRIx64, old);
+      if (!path_join(old_cache, sizeof old_cache, cache_root, old_key) &&
+          !path_join(old_ready, sizeof old_ready, old_cache, ".ready") &&
+          exists(old_ready) && !exists(cache)) {
+         if (luna_file_rename(old_cache, cache))
+            fprintf(stderr, "[apk] could not adopt the old cache %s\n", old_cache);
+         else
+            fprintf(stderr, "[apk] cache: adopted %s as %s\n", old_key, key);
+      }
+   }
+   if (mkdirs(cache) || path_join(pkgdir, sizeof pkgdir, cache, "pkg") || path_join(inst, sizeof inst, cache, "inst") || path_join(ready, sizeof ready, cache, ".ready"))
     return -1;
   bool hit = exists(ready) && !env_true("LUNARIA_NO_CACHE");
   fprintf(stderr, "[apk] Preparing %s%s\n", input, hit ? " (cached)" : "");
@@ -3242,7 +3588,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
   snprintf(relative, sizeof relative, "lib/%s", arch);
   if (path_join(libdir, sizeof libdir, inst, relative) || mkdirs(libdir) || path_join(staged_apk, sizeof staged_apk, inst, "base.apk") || materialize(base, staged_apk))
     goto done;
-  if (env_set("ANDROID_PACKAGE_NAME", m->package, true) || env_set("ANDROID_PACKAGE_CODE_PATH", inst, true) || env_set("ANDROID_APK_FILE", staged_apk, true) || env_set("ANDROID_NATIVE_LIB_DIR", libdir, true) || env_set("ANDROID_SPLIT_APKS", text_get(&split_list), true))
+   if (env_set("ANDROID_PACKAGE_NAME", m->package, true) || env_set("ANDROID_PACKAGE_CODE_PATH", inst, true) || env_set("ANDROID_APK_FILE", staged_apk, true) || env_set("ANDROID_NATIVE_LIB_DIR", libdir, true) || env_set_table("ANDROID_SPLIT_APKS", text_get(&split_list), inst))
     goto done;
   /* `am start -n`: the component named here is launched instead of the manifest's launcher. */
   const char *forced_activity = getenv("LUNARIA_LAUNCH_ACTIVITY");
@@ -3273,11 +3619,12 @@ static int apk_prepare_inner(int *argc, const char ***argv)
   };
   for (size_t i = 0; i < sizeof metadata / sizeof metadata[0]; i++) {
     if (*metadata[i].value) {
-      if (env_set(metadata[i].key, metadata[i].value, true))
+         if (env_set_table(metadata[i].key, metadata[i].value, inst))
         goto done;
     } else
       luna_os_unsetenv(metadata[i].key);
   }
+   if (!service_host) register_return_links(text_get(&m->activity_filters), root);
   /* A component host has no launcher Activity. Its process was chosen by AMS. */
   if (service_host ? env_set("ANDROID_SERVICE_HOST", "1", true) : (luna_os_unsetenv("ANDROID_SERVICE_HOST"), 0))
     goto done;
@@ -3514,7 +3861,99 @@ int luna_apk_profile_new_name(char *out, size_t cap)
 
 /* Starts this launch over under `profile` (NULL: the same one).  Returns only
  * when it could not. */
-int luna_apk_restart(const char *profile)
+static int apk_restart_with(const char *profile, const char *archive_override);
+int luna_apk_restart(const char *profile) { return apk_restart_with(profile, NULL); }
+int luna_apk_restart_archive(const char *archive)
+{
+   return archive && *archive ? apk_restart_with(NULL, archive) : -1;
+}
+
+/* Package name of an .apk (binary manifest), an .xapk (manifest.json,
+ * "package_name") or an APKMirror .apkm (info.json, "pname").  An .apkm has
+ * no top-level manifest, so without info.json the Google button skipped the
+ * Play Store bundle Aloa downloaded (14-11). */
+static bool update_archive_package(const char *path, char *pkg, size_t cap)
+{
+   struct zip z;
+   if (zip_open(&z, path)) return false;
+   bool ok = false;
+   size_t n = 0;
+   const char *key = "\"package_name\"";
+   unsigned char *json = zip_memory(&z, "manifest.json", &n);
+   if (!json && !zip_find(&z, "AndroidManifest.xml") && (json = zip_memory(&z, "info.json", &n)))
+      key = "\"pname\"";
+   if (json) {
+      char *text = malloc(n + 1);
+      if (text) {
+         memcpy(text, json, n);
+         text[n] = '\0';
+         const char *k = strstr(text, key);
+         const char *q = k ? strchr(k + strlen(key), '"') : NULL;
+         const char *e = q ? strchr(q + 1, '"') : NULL;
+         if (e && (size_t)(e - q - 1) < cap) {
+            memcpy(pkg, q + 1, (size_t)(e - q - 1));
+            pkg[e - q - 1] = '\0';
+            ok = pkg[0] != '\0';
+         }
+         free(text);
+      }
+      free(json);
+   } else {
+      struct manifest m;
+      memset(&m, 0, sizeof m);
+      if (manifest_zip(&z, &m) == 0 && m.package[0]) {
+         snprintf(pkg, cap, "%s", m.package);
+         ok = true;
+      }
+      manifest_clear(&m);
+   }
+   zip_close(&z);
+   return ok;
+}
+
+/* A game asked for its store page to update itself.  There is no store
+ * here, so look for the update the user downloaded: the newest .apk / .xapk
+ * / .apks for the same package that is newer than the archive running now,
+ * in LUNARIA_UPDATE_DIR and the user's Downloads folder. */
+int luna_apk_find_update(const char *package, char *out, size_t cap)
+{
+   if (!package || !*package || !out || !cap) return -1;
+   out[0] = '\0';
+   const char *current = g_restart_argc > 1 ? g_restart_argv[g_restart_argc - 1] : NULL;
+   struct stat st;
+   time_t best = current && luna_file_stat_follow(current, &st) == 0 ? st.st_mtime : 0;
+   char dirs[2][APK_PATH];
+   int nd = 0;
+   const char *env = getenv("LUNARIA_UPDATE_DIR");
+   if (env && *env) snprintf(dirs[nd++], APK_PATH, "%s", env);
+#ifdef _WIN32
+   const char *home = getenv("USERPROFILE");
+#else
+   const char *home = getenv("HOME");
+#endif
+   if (home && *home) snprintf(dirs[nd++], APK_PATH, "%s/Downloads", home);
+   for (int d = 0; d < nd; ++d) {
+      luna_directory *dir = luna_directory_open(dirs[d]);
+      if (!dir) continue;
+      luna_directory_entry *ent;
+      while ((ent = luna_directory_read(dir))) {
+         const char *name = ent->d_name;
+         if (!suffix(name, ".apk") && !suffix(name, ".xapk") && !suffix(name, ".apks") && !suffix(name, ".apkm")) continue;
+         char path[APK_PATH], pkg[256];
+         snprintf(path, sizeof path, "%s/%s", dirs[d], name);
+         if (luna_file_stat_follow(path, &st) != 0 || st.st_mtime <= best) continue;
+         if (current && !strcmp(path, current)) continue;
+         if (!update_archive_package(path, pkg, sizeof pkg) || strcmp(pkg, package)) continue;
+         best = st.st_mtime;
+         snprintf(out, cap, "%s", path);
+      }
+      luna_directory_close(dir);
+   }
+   fprintf(stderr, "[update] %s: %s\n", package, out[0] ? out : "no newer file in Downloads");
+   return out[0] ? 0 : -1;
+}
+
+static int apk_restart_with(const char *profile, const char *archive_override)
 {
   char exe[APK_PATH];
   if (!g_restart_argv || !g_restart_environment || luna_os_executable_path(exe, sizeof exe)) return -1;
@@ -3535,17 +3974,29 @@ int luna_apk_restart(const char *profile)
   }
   /* --profile goes before the archive, which must stay last. */
   const char *archive = n > 1 ? args[n - 1] : NULL;
-  if (!archive) {
-    free(args);
-    return -1;
-  }
+   if (!archive) { free(args); return -1; }
+   if (archive_override) archive = archive_override;
   args[n - 1] = "--profile";
   args[n++] = profile;
   args[n++] = archive;
   args[n] = NULL;
-  fprintf(stderr, "[apk] restarting under profile %s\n", profile);
+   fprintf(stderr, "[apk] restarting under profile %s%s%s\n", profile,
+           archive_override ? " with " : "", archive_override ? archive_override : "");
   fflush(NULL);
 #ifdef _WIN32
+   /* The CRT joins argv with spaces and does not quote, so a path with a
+    * space in it (a Downloads file name, a data root) would split in two. */
+   for (int i = 0; i < n; ++i) {
+      if (!strchr(args[i], ' ') || args[i][0] == '"') continue;
+      size_t len = strlen(args[i]);
+      char *q = malloc(len + 3);
+      if (!q) continue;
+      q[0] = '"';
+      memcpy(q + 1, args[i], len);
+      q[len + 1] = '"';
+      q[len + 2] = '\0';
+      args[i] = q;   /* leaked on purpose: exec replaces the process */
+   }
   _execve(exe, args, (const char *const *)g_restart_environment);
 #else
   execve(exe, (char *const *)args, g_restart_environment);
@@ -3716,6 +4167,66 @@ int luna_apk_google_services_open(int setup, const char *profile)
 
 /* Starts over with no arguments: the screen a launch without an APK shows,
  * where another one can be chosen.  Returns only when it could not. */
+/* Newest downloaded archive of the first Google app (framework, then
+ * services, then Play Store) that has no system install under `root` yet. */
+static int google_find_download(const char *root, char *out, size_t cap, char *pkg_out, size_t pkg_cap)
+{
+   static const char *const order[] = {"com.google.android.gsf", "com.google.android.gms", "com.android.vending"};
+   char dirs[2][APK_PATH];
+   int nd = 0;
+   const char *env = getenv("LUNARIA_UPDATE_DIR");
+   if (env && *env) snprintf(dirs[nd++], APK_PATH, "%s", env);
+#ifdef _WIN32
+   const char *home = getenv("USERPROFILE");
+#else
+   const char *home = getenv("HOME");
+#endif
+   if (home && *home) snprintf(dirs[nd++], APK_PATH, "%s/Downloads", home);
+   for (size_t o = 0; o < sizeof order / sizeof order[0]; ++o) {
+      char have[APK_PATH];
+      if (!system_archive_path(root, order[o], have, sizeof have) && exists(have)) continue;
+      time_t best = 0;
+      out[0] = '\0';
+      for (int d = 0; d < nd; ++d) {
+         luna_directory *dir = luna_directory_open(dirs[d]);
+         if (!dir) continue;
+         luna_directory_entry *ent;
+         while ((ent = luna_directory_read(dir))) {
+            const char *name = ent->d_name;
+            if (!suffix(name, ".apk") && !suffix(name, ".xapk") && !suffix(name, ".apks") && !suffix(name, ".apkm")) continue;
+            char path[APK_PATH], pkg[256];
+            struct stat st;
+            snprintf(path, sizeof path, "%s/%s", dirs[d], name);
+            if (luna_file_stat_follow(path, &st) != 0 || st.st_mtime <= best) continue;
+            if (!update_archive_package(path, pkg, sizeof pkg) || strcmp(pkg, order[o])) continue;
+            best = st.st_mtime;
+            snprintf(out, cap, "%s", path);
+         }
+         luna_directory_close(dir);
+      }
+      if (out[0]) {
+         snprintf(pkg_out, pkg_cap, "%s", order[o]);
+         fprintf(stderr, "[apk] Google services: found %s in Downloads\n", out);
+         return 0;
+      }
+   }
+   return -1;
+}
+
+static int google_setup_restart(void)
+{
+   char exe[APK_PATH];
+   if (!g_restart_environment || luna_os_executable_path(exe, sizeof exe)) return -1;
+   const char *args[3] = { exe, "--google-services", NULL };
+   fflush(NULL);
+#ifdef _WIN32
+   _execve(exe, args, (const char *const *)g_restart_environment);
+#else
+   execve(exe, (char *const *)args, g_restart_environment);
+#endif
+   return -1;
+}
+
 int luna_apk_restart_launcher(void)
 {
   char exe[APK_PATH];
@@ -3733,9 +4244,26 @@ int luna_apk_restart_launcher(void)
 
 int luna_apk_prepare(int *argc, const char ***argv)
 {
+   if (*argc > 1 && deliver_url_command(*argc, *argv)) exit(0);
   int result = apk_prepare_inner(argc, argv);
   if (result == 0 && host_driver_defaults()) result = apk_error("cannot configure host driver");
   if (result == 0 && luna_launcher_cancelled()) result = apk_error("installation cancelled");
+   const bool back_to_launcher = (g_google_from_launcher || g_google_auto) && result == 1 && !luna_launcher_cancelled();
   luna_launcher_end(result == 0);
+   /* Guided setup: once this one really landed, go straight on to the next
+    * downloaded Google app. Requiring the install to exist stops a loop. */
+   if (back_to_launcher && g_google_auto) {
+      char next[APK_PATH], pkg[256], have[APK_PATH];
+      const char *root = env_value("LUNARIA_DATA_ROOT", ".");
+      if (!system_archive_path(root, g_google_auto_pkg, have, sizeof have) && exists(have) &&
+          !google_find_download(root, next, sizeof next, pkg, sizeof pkg)) {
+         fprintf(stderr, "[apk] Google services: next is %s\n", next);
+         if (google_setup_restart()) fprintf(stderr, "[apk] cannot continue Google services setup\n");
+      }
+   }
+   /* Installed (or picked nothing) from the launcher's Google services button:
+    * show the launcher again rather than closing on the person. */
+   if (back_to_launcher && luna_apk_restart_launcher())
+      fprintf(stderr, "[apk] cannot return to the launcher after Google services\n");
   return result;
 }

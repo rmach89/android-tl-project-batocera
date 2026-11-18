@@ -157,7 +157,24 @@ int main(int argc, char **argv) {
     for (long long k = 100; k < 100 + LUNA_HOST_FINGERS - 2; ++k) assert(luna_finger_slot(&fm, k, 0) >= 0);
     assert(luna_finger_slot(&fm, 999, 0) == -1);           /* an eleventh finger */
     /* Contact ids stay inside Android's 0..31 and clear of each other. */
-    assert(LUNA_LOOK_ID < LUNA_HOST_TOUCH_ID && LUNA_HOST_TOUCH_ID + LUNA_HOST_FINGERS - 1 <= 29);
+    assert(LUNA_LOOK_ID < LUNA_HOST_TOUCH_ID && LUNA_HOST_TOUCH_ID + LUNA_HOST_FINGERS - 1 <= 26);  /* 26-28: mouse look */
+  }
+  /* The keymap editor keeps controller bindings and the look line. */
+  {
+    const char *maps[] = { "keymaps/genshin.conf", "keymaps/crossworlds.conf" };
+    for (int k = 0; k < 2; ++k) {
+      luna_kedit e;
+      luna_keymap before, after;
+      assert(luna_keymap_load(&before, maps[k]) && luna_kedit_load(&e, maps[k]));
+      for (int i = 0; i < e.n; ++i) assert(luna_key_name(e.b[i].key));
+      assert(luna_kedit_save(&e, path));
+      luna_kedit_free(&e);
+      assert(luna_keymap_load(&after, path));
+      assert(after.count == before.count && after.look == before.look);
+    }
+    char bak[512];
+    snprintf(bak, sizeof bak, "%s.bak", path);
+    remove(bak);
   }
   puts("gamepad keymap tests passed");
   return 0;

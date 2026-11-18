@@ -190,7 +190,38 @@ static bool shared_system_apk(const char *guest_path, const char *host)
       stat(shared, &st) != 0 || st.st_size <= 22)
     return false;
   (void)unlink(host);
-  return luna_file_symlink(shared, host) == 0;
+#ifdef _WIN32
+   /* Hard link first on Windows.  With Developer Mode on, the symlink below
+    * succeeds, but the guest never resolved the real APK through it: no
+    * "installed APK is version" line and Google's library still said
+    * SERVICE_INVALID with Play services 26.44.32 installed (sourama's PC,
+    * 15-11).  Aloa's PC, without the symlink right, got the hard link and saw it. */
+   if (luna_file_link(shared, host) == 0) return true;
+#endif
+   if (luna_file_symlink(shared, host) == 0) return true;
+   /* Windows grants an unprivileged symlink only in Developer Mode.  Without
+    * it this failed silently and the app kept the 22-byte stub, so Google's
+    * own library read Play services as unsigned and said SERVICE_INVALID even
+    * after the person installed the real one (Aloa, LDoE, 14-11).  A hard link
+    * needs no privilege and the data root is one volume; copy as the last
+    * resort. */
+   if (luna_file_link(shared, host) == 0) {
+      fprintf(stderr, "[packages] %s: real system APK hard-linked (no symlink right)\n", guest_path);
+      return true;
+   }
+   FILE *in = fopen(shared, "rb"), *out = in ? fopen(host, "wb") : NULL;
+   bool ok = in && out;
+   static char buf[1 << 16];
+   size_t n;
+   while (ok && (n = fread(buf, 1, sizeof buf, in)) > 0)
+      ok = fwrite(buf, 1, n, out) == n;
+   if (in && ferror(in)) ok = false;
+   if (in) fclose(in);
+   if (out && fclose(out)) ok = false;
+   if (!ok) (void)unlink(host);
+   fprintf(stderr, "[packages] %s: real system APK %s\n", guest_path,
+           ok ? "copied (no symlink or hard link)" : "could not be linked or copied");
+   return ok;
 }
 
 /* A package's APK, as far as anything outside its own installer can tell, is a
@@ -321,6 +352,37 @@ static int row_exists(const char *name)
   return 0;
 }
 
+/* A row whose APK is a real one the user installed (Play services from the
+ * launcher's Google button) reports that APK's own version.  The table's
+ * number is only a placeholder for the 22-byte stub: Play services clients
+ * compare it against the minimum they were built for, and an old placeholder
+ * reads as "Google Play services out of date" (SERVICE_VERSION_UPDATE_REQUIRED)
+ * even with a current one installed. */
+static void ledger_real_version(struct ledger_row *row)
+{
+   char host[PATH_MAX];
+   struct stat st;
+   if ((size_t)snprintf(host, sizeof host, "%s%s", guest_root(), row->source_dir)
+       >= sizeof host)
+      return;
+   if (stat(host, &st) != 0 || st.st_size <= 22) return;
+   int32_t code = 0;
+   char name[160] = "";
+   const int got = arm_exec_apk_file_version(row->source_dir, &code, name, sizeof name);
+   if ((got & 1) && code > 0) row->record.version_code = code;
+   if ((got & 2) && name[0]) {
+      char *copy = strdup(name);
+      if (copy) {
+         free(row->version_name);
+         row->version_name = copy;
+         row->record.version_name = copy;
+      }
+   }
+   if (got)
+      fprintf(stderr, "[packages] %s: installed APK is version %s / %d\n",
+              row->name, row->record.version_name, row->record.version_code);
+}
+
 /* One ledger line:  <package> [uid] [flags] [sourceDir]
  *
  * flags is a comma-separated subset of {system, queryable, updated} or "-".
@@ -437,6 +499,7 @@ static void ledger_add_line(const char *line, size_t len)
   ++g_nrows;
 
   ledger_materialise(row->source_dir);
+   ledger_real_version(row);
 }
 
 static void ledger_add_text(const char *text)
@@ -688,7 +751,7 @@ int lunaria_android_package_install(const char *name, uint32_t uid, const char *
 
 static int holds_permission(const char *want)
 {
-  const char *list = getenv("ANDROID_REQUESTED_PERMISSIONS");
+   const char *list = luna_env_long("ANDROID_REQUESTED_PERMISSIONS");
   size_t n = strlen(want);
   if (!list) return 0;
   for (const char *p = list; *p;) {
@@ -741,9 +804,9 @@ int lunaria_android_package_visible(const struct lunaria_android_package *record
    * an activity.  Settings has a MAIN activity on Android; the framework and
    * provider packages do not become visible merely because MAIN was queried. */
   if (!strcmp(record->name, "com.android.settings") &&
-      csv_has(getenv("ANDROID_QUERY_ACTIONS"), "android.intent.action.MAIN"))
+       csv_has(luna_env_long("ANDROID_QUERY_ACTIONS"), "android.intent.action.MAIN"))
     return 1;
-  if (csv_has(getenv("ANDROID_QUERY_PACKAGES"), record->name)) return 1;
+   if (csv_has(luna_env_long("ANDROID_QUERY_PACKAGES"), record->name)) return 1;
   return 0;
 }
 

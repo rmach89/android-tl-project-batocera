@@ -2731,7 +2731,7 @@ static bool context_get_package_name(struct dvm *vm, dvm_ref self,
  * ANDROID_REQUESTED_PERMISSIONS, so answer from it. */
 static bool manifest_has_permission(const char *want)
 {
-  const char *list = getenv("ANDROID_REQUESTED_PERMISSIONS");
+   const char *list = luna_env_long("ANDROID_REQUESTED_PERMISSIONS");
   if (!want || !*want || !list) return false;
   const size_t n = strlen(want);
   for (const char *p = list; *p;) {
@@ -10244,6 +10244,71 @@ void dvm__activity_visible(struct dvm *vm, dvm_ref activity)
   act_reconcile_visibility(vm);
 }
 
+/* apk.c (luna_boot.h is not part of this unit). */
+int luna_apk_restart_archive(const char *archive);
+int luna_apk_find_update(const char *package, char *out, size_t cap);
+static bool toast_make_text(struct dvm *, dvm_ref, const union dvm_value *, int, union dvm_value *);
+static bool toast_show(struct dvm *, dvm_ref, const union dvm_value *, int, union dvm_value *);
+
+/* A long Toast from the emulator itself, over the game. */
+static void host_toast(struct dvm *vm, dvm_ref context, const char *msg)
+{
+   union dvm_value a[3] = { { .l = context }, { .l = dvm_new_string(vm, msg) }, { .i = 1 } };
+   union dvm_value t = { 0 }, ignored = { 0 };
+   if (a[1].l && toast_make_text(vm, 0, a, 3, &t) && t.l) (void)toast_show(vm, t.l, NULL, 0, &ignored);
+   if (dvm_exception(vm)) dvm_clear_exception(vm);
+}
+
+/* market://details?id=PKG or play.google.com/store/apps/details?id=PKG:
+ * a game sending the player to its store page, nearly always to update.
+ * There is no store here, so take the update from a file the player
+ * downloaded (see luna_apk_find_update) and start over on it. */
+static bool store_link_package(const char *url, char *pkg, size_t cap)
+{
+   if (strncmp(url, "market://", 9) &&
+       strncmp(url, "https://play.google.com/store/apps/details", 42) &&
+       strncmp(url, "http://play.google.com/store/apps/details", 41))
+      return false;
+   const char *id = strstr(url, "id=");
+   if (!id || (id[-1] != '?' && id[-1] != '&')) return false;
+   id += 3;
+   size_t n = strcspn(id, "&#");
+   if (!n || n >= cap) return false;
+   memcpy(pkg, id, n);
+   pkg[n] = '\0';
+   return true;
+}
+static void store_update(struct dvm *vm, dvm_ref context, const char *pkg)
+{
+   char file[4096];
+   if (luna_apk_find_update(pkg, file, sizeof file) == 0) {
+      /* Never on the first press: the player is told which file was found
+       * and confirms by pressing update again within two minutes. */
+      static char pending[4096];
+      static time_t pending_at;
+      const time_t now = time(NULL);
+      if (strcmp(pending, file) || now - pending_at > 120) {
+         snprintf(pending, sizeof pending, "%s", file);
+         pending_at = now;
+         const char *base = strrchr(file, '/');
+         char msg[700];
+         snprintf(msg, sizeof msg, "Update found: %s. Press update again to install it (your save stays), "
+                  "or ignore this to keep playing.", base ? base + 1 : file);
+         fprintf(stderr, "[update] found %s for %s, waiting for a second press\n", file, pkg);
+         host_toast(vm, context, msg);
+         return;
+      }
+      pending[0] = '\0';
+      fprintf(stderr, "[update] confirmed: installing %s over %s and restarting\n", file, pkg);
+      luna_apk_restart_archive(file);   /* returns only if it failed */
+      host_toast(vm, context, "Found the update file but could not restart with it. Open it from the Lunaria launcher.");
+      return;
+   }
+   host_toast(vm, context,
+              "No store here. Download the new .apk or .xapk of this game into your Downloads folder, "
+              "then press update again. Your save stays.");
+}
+
 static bool act_start_common(struct dvm *vm, dvm_ref self, dvm_ref intent,
                              bool from_activity, bool for_result,
                              int32_t request_code)
@@ -10354,6 +10419,29 @@ static bool act_start_common(struct dvm *vm, dvm_ref self, dvm_ref intent,
     union dvm_value act = { 0 };
     (void)dvm_get_field(vm, intent, "action", "Ljava/lang/String;", &act);
     const char *a = act.l ? dvm_string_utf8(vm, act.l) : NULL;
+      /* No Android browser here: a web link (login pages, "open website",
+       * Custom Tabs) goes to the desktop browser instead of failing. */
+      if (a && !strcmp(a, "android.intent.action.VIEW")) {
+         union dvm_value data = { 0 }, text = { 0 };
+         (void)dvm_get_field(vm, intent, "data", "Landroid/net/Uri;", &data);
+         if (data.l && am_vcall(vm, data.l, "toString", "()Ljava/lang/String;", NULL, 0, &text) && text.l) {
+            const char *url = dvm_string_utf8(vm, text.l);
+            char pkg[256];
+            if (url && store_link_package(url, pkg, sizeof pkg)) {
+               fprintf(stderr, "[activity] store link for %s: %.200s\n", pkg, url);
+               store_update(vm, self, pkg);
+               if (dvm_exception(vm)) dvm_clear_exception(vm);
+               return true;
+            }
+            if (url && (!strncmp(url, "http://", 7) || !strncmp(url, "https://", 8))) {
+               int rc = getenv("LUNARIA_NO_EXTERNAL_BROWSER") ? -1 : luna_os_open_url(url);
+               fprintf(stderr, "[activity] web link %s on the desktop browser: %.200s\n",
+                       rc == 0 ? "opened" : "NOT opened", url);
+               if (rc == 0) return true;
+            }
+         }
+         if (dvm_exception(vm)) dvm_clear_exception(vm);
+      }
     dvm__throw(vm, "android/content/ActivityNotFoundException",
                "No Activity found to handle Intent { %s%s }",
                a ? "act=" : "", a ? a : "");
@@ -19502,3 +19590,59 @@ static bool list_view_touch(struct dvm *vm,dvm_ref self,const union dvm_value *a
 static const struct rt_method rt_item_click_listener[]= {
   {"onItemClick","(Landroid/widget/AdapterView;Landroid/view/View;IJ)V",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},M_END
 };
+
+/* A login return link `lunaria --deliver-url` dropped in the data root (see
+ * register_return_links in apk.c): start it as a BROWSABLE VIEW intent from
+ * the top activity, the way a phone's browser hands it back to the game. */
+void dvm_deliver_inbox_url(struct dvm *vm)
+{
+   static uint64_t last;
+   const uint64_t now = dvm__now_ms();
+   if (now - last < 300) return;
+   last = now;
+   const char *root = getenv("LUNARIA_DATA_ROOT");
+   if (!root || !*root || !g_nacts) return;
+   char path[4096], url[8192];
+   if (snprintf(path, sizeof path, "%s/inbox-url.txt", root) >= (int)sizeof path) return;
+   FILE *f = fopen(path, "rb");
+   if (!f) return;
+   size_t n = fread(url, 1, sizeof url - 1, f);
+   fclose(f);
+   (void)remove(path);
+   url[n] = 0;
+   while (n && (url[n - 1] == '\n' || url[n - 1] == '\r' || url[n - 1] == ' ')) url[--n] = 0;
+   if (!n) return;
+   struct dvm_class *uc = dvm__class_by_desc(vm, "Landroid/net/Uri;");
+   struct dvm_class *ic = dvm__class_by_desc(vm, "Landroid/content/Intent;");
+   struct dvm_method *parse = uc ? dvm_find_method(vm, uc, "parse", "(Ljava/lang/String;)Landroid/net/Uri;") : NULL;
+   struct dvm_method *init = ic ? dvm_find_method(vm, ic, "<init>", "(Ljava/lang/String;Landroid/net/Uri;)V") : NULL;
+   union dvm_value text = { .l = dvm_new_string(vm, url) }, uri = { 0 }, ignored = { 0 };
+   bool ok = false;
+   if (parse && init && text.l) {
+      dvm_pin(vm, text.l);
+      if (dvm_call(vm, parse, 0, &text, 1, &uri) && uri.l) {
+         dvm_pin(vm, uri.l);
+         dvm_ref intent = dvm_new_object(vm, ic);
+         if (intent) {
+            dvm_pin(vm, intent);
+            union dvm_value a[2] = { { .l = dvm_new_string(vm, "android.intent.action.VIEW") }, uri };
+            union dvm_value cat = { .l = dvm_new_string(vm, "android.intent.category.BROWSABLE") };
+            union dvm_value flags = { .i = 0x20000000 | 0x04000000 };   /* SINGLE_TOP | CLEAR_TOP */
+            ok = a[0].l && cat.l && dvm_call(vm, init, intent, a, 2, &ignored) && !dvm_exception(vm) &&
+                 am_vcall(vm, intent, "addCategory", "(Ljava/lang/String;)Landroid/content/Intent;", &cat, 1, &ignored) &&
+                 am_vcall(vm, intent, "addFlags", "(I)Landroid/content/Intent;", &flags, 1, &ignored);
+            union dvm_value arg = { .l = intent };
+            if (ok) ok = am_vcall(vm, g_acts[g_nacts - 1].activity, "startActivity", "(Landroid/content/Intent;)V", &arg, 1, &ignored) &&
+                         !dvm_exception(vm);
+            dvm_unpin(vm, intent);
+         }
+         dvm_unpin(vm, uri.l);
+      }
+      dvm_unpin(vm, text.l);
+   }
+   if (dvm_exception(vm)) dvm_clear_exception(vm);
+   char scheme[64];
+   const char *colon = strchr(url, ':');
+   snprintf(scheme, sizeof scheme, "%.*s", colon ? (int)(colon - url) : 0, url);
+   fprintf(stderr, "[activity] return link %s://... %s\n", scheme, ok ? "handed to the game" : "NOT delivered");
+}
