@@ -1,0 +1,7 @@
+{
+  "name": "lunaria",
+  "keys": {
+    "exit": "pkill -x lunaria",
+    "screenshot": "KEY_F12"
+  }
+}

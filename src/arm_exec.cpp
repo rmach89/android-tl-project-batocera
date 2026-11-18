@@ -19130,6 +19130,68 @@ static void pad_describe(int jid, luna_gamepad_info *info) {
   snprintf(info->descriptor, sizeof info->descriptor, "lunaria-gamepad-%.24s", guid ? guid : "0");
 }
 
+/* Controller mappings beyond GLFW's built-in database, in SDL's
+ * gamecontrollerdb format: the SDL_GAMECONTROLLERCONFIG text and the file
+ * named by SDL_GAMECONTROLLERCONFIG_FILE, as SDL itself reads them.  Front
+ * ends such as Batocera describe each pad the player configured this way. */
+static void gamepad_load_mappings(void) {
+  int added = 0;
+  if (const char *path = getenv("SDL_GAMECONTROLLERCONFIG_FILE")) {
+    if (FILE *f = *path ? fopen(path, "rb") : nullptr) {
+      std::string text;
+      char chunk[4096];
+      size_t n;
+      while ((n = fread(chunk, 1, sizeof chunk, f)) > 0) text.append(chunk, n);
+      fclose(f);
+      if (!text.empty() && glfwUpdateGamepadMappings(text.c_str())) ++added;
+      else fprintf(stderr, "[input] gamepad mappings in %s were not accepted\n", path);
+    }
+  }
+  if (const char *text = getenv("SDL_GAMECONTROLLERCONFIG")) {
+    if (*text && glfwUpdateGamepadMappings(text)) ++added;
+    else if (*text) fprintf(stderr, "[input] SDL_GAMECONTROLLERCONFIG was not accepted\n");
+  }
+  if (added) fprintf(stderr, "[input] gamepad mappings loaded from the environment\n");
+}
+
+/* LUNARIA_EXIT_COMBO="BACK+START" (PAD_ names, with or without the PAD_
+ * prefix): pressing them together closes Lunaria, the way a console front
+ * end's Hotkey+Start leaves a game.  Off unless set. */
+static unsigned gamepad_exit_combo(void) {
+  static int parsed = 0;
+  static unsigned mask = 0;
+  if (parsed) return mask;
+  parsed = 1;
+  const char *spec = getenv("LUNARIA_EXIT_COMBO");
+  if (!spec || !*spec) return 0;
+  static const char *const names[LUNA_PAD_BUTTONS] = {
+    "A", "B", "X", "Y", "LB", "RB", "BACK", "START", "GUIDE", "L3", "R3",
+    "UP", "RIGHT", "DOWN", "LEFT", "LT", "RT"
+  };
+  std::string all(spec);
+  size_t at = 0;
+  while (at <= all.size()) {
+    size_t end = all.find('+', at);
+    if (end == std::string::npos) end = all.size();
+    std::string name = all.substr(at, end - at);
+    for (char &c : name) c = (char)toupper((unsigned char)c);
+    if (!name.compare(0, 4, "PAD_")) name.erase(0, 4);
+    if (name == "SELECT") name = "BACK";
+    if (name == "HOTKEY" || name == "HOME") name = "GUIDE";
+    int found = -1;
+    for (int b = 0; b < LUNA_PAD_BUTTONS; ++b)
+      if (name == names[b]) found = b;
+    if (found < 0) {
+      fprintf(stderr, "[input] LUNARIA_EXIT_COMBO: unknown button \"%s\"; combo off\n", name.c_str());
+      return mask = 0;
+    }
+    mask |= 1u << found;
+    at = end + 1;
+  }
+  fprintf(stderr, "[input] exit combo: %s\n", spec);
+  return mask;
+}
+
 static void gamepad_poll(void) {
   if (!g_glfw || !on_glfw_thread()) return;
   static int disabled = -1;
@@ -19137,6 +19199,7 @@ static void gamepad_poll(void) {
     const char *v = getenv("LUNARIA_GAMEPAD");
     disabled = v && (!strcmp(v, "off") || !strcmp(v, "0"));
     if (disabled) fprintf(stderr, "[input] gamepad: off\n");
+    else gamepad_load_mappings();
   }
   if (disabled) return;
 
@@ -19171,6 +19234,17 @@ static void gamepad_poll(void) {
     ly = st.axes[GLFW_GAMEPAD_AXIS_LEFT_Y];
     rx = st.axes[GLFW_GAMEPAD_AXIS_RIGHT_X];
     ry = st.axes[GLFW_GAMEPAD_AXIS_RIGHT_Y];
+  }
+
+  if (const unsigned combo = gamepad_exit_combo()) {
+    unsigned held = 0;
+    for (int b = 0; b < LUNA_PAD_BUTTONS; ++b) held |= now[b] ? 1u << b : 0u;
+    static bool quitting = false;
+    if ((held & combo) == combo && !quitting) {
+      quitting = true;
+      fprintf(stderr, "[input] exit combo pressed — closing\n");
+      arm_exec_request_quit();
+    }
   }
 
   const bool blocked = luna_ime_active() || luna_overlay_menu_showing();

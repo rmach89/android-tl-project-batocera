@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Lunaria
+Comment=Run Android apps and games
+Exec=/userdata/system/lunaria/app/lunaria
+Path=/userdata/system/lunaria/app
+Icon=applications-games
+Terminal=false
+Categories=Game;Emulator;

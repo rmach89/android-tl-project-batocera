@@ -1,0 +1,93 @@
+#!/bin/bash
+# Lunaria service for Batocera and HippOS.
+#
+# Installed as /userdata/system/services/lunaria and switched on or off in the
+# front end (Main menu > System settings > Services), or from a shell:
+#   batocera-services enable lunaria && batocera-services start lunaria
+#   hippos-services   enable lunaria && hippos-services   start lunaria
+#
+# Everything Lunaria needs lives in /userdata/system/lunaria.  "start" links
+# it into the places the system looks for it; "stop" removes those links (and
+# only links that point back into /userdata/system/lunaria), so turning the
+# service off hides the Android system without touching games or saves.
+# Links outside /userdata (the /usr ones) do not survive a reboot on
+# Batocera, which is why the service puts them back at every start.
+
+LUNARIA_HOME=/userdata/system/lunaria
+ES_DIR=/userdata/system/configs/emulationstation
+
+# target|link pairs.  A link whose directory cannot be written (a read-only
+# /usr) is skipped: the system works without it.
+links() {
+    echo "$LUNARIA_HOME/es_systems_android.cfg|$ES_DIR/es_systems_android.cfg"
+    echo "$LUNARIA_HOME/lunaria-launch.sh|/usr/bin/lunaria-launch"
+    echo "$LUNARIA_HOME/app/lunaria|/usr/bin/lunaria"
+    echo "$LUNARIA_HOME/lunaria.desktop|/usr/share/applications/lunaria.desktop"
+    echo "$LUNARIA_HOME/hotkeys-lunaria.json|/usr/share/hippos/hotkeys/contexts/lunaria.json"
+}
+
+log() { echo "[lunaria-service] $*"; }
+
+start() {
+    if [ ! -x "$LUNARIA_HOME/app/lunaria" ]; then
+        log "Lunaria is not installed in $LUNARIA_HOME/app"
+        return 1
+    fi
+    mkdir -p "$ES_DIR" /userdata/roms/android
+    links | while IFS='|' read -r target link; do
+        [ -e "$target" ] || continue
+        dir=$(dirname "$link")
+        case "$link" in
+            /userdata/*) mkdir -p "$dir" ;;
+            *) [ -d "$dir" ] || continue ;;   # not this distribution's path
+        esac
+        # Never replace a real file someone else put there.
+        if [ -e "$link" ] && [ ! -L "$link" ]; then
+            log "kept existing $link (not a link)"
+            continue
+        fi
+        if ln -sfn "$target" "$link" 2>/dev/null; then
+            log "linked $link -> $target"
+        elif [ "${link#/userdata/}" != "$link" ]; then
+            # A /userdata on a file system without symbolic links (exFAT):
+            # a copy does the same job.
+            cp -f "$target" "$link" && log "copied $target to $link"
+        else
+            log "skipped $link (read-only)"
+        fi
+    done
+    return 0
+}
+
+stop() {
+    links | while IFS='|' read -r target link; do
+        if [ -L "$link" ]; then
+            case "$(readlink "$link")" in
+                "$LUNARIA_HOME"/*) rm -f "$link" && log "removed $link" ;;
+            esac
+        elif [ "$link" = "$ES_DIR/es_systems_android.cfg" ] && [ -f "$link" ] &&
+             cmp -s "$link" "$LUNARIA_HOME/es_systems_android.cfg"; then
+            rm -f "$link" && log "removed $link"
+        fi
+    done
+    return 0
+}
+
+status() {
+    if [ -L "$ES_DIR/es_systems_android.cfg" ] || [ -f "$ES_DIR/es_systems_android.cfg" ]; then
+        echo "lunaria: started (Android system visible)"
+    else
+        echo "lunaria: stopped"
+    fi
+    links | while IFS='|' read -r target link; do
+        if [ -L "$link" ]; then echo "  $link -> $(readlink "$link")"; fi
+    done
+}
+
+case "${1:-}" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; start ;;
+    status)  status ;;
+    *)       echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac

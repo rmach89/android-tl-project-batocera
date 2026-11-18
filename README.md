@@ -515,6 +515,10 @@ Coordinates are 0–1 of screen width/height (radius against the shorter side). 
 
 **Record and replay:** **F9** (Record Input) saves touch input to `~/Documents/Lunaria <date>.rec`; **F10** (Play Recording) replays the latest, or set `LUNARIA_PLAY` (and `LUNARIA_PLAY_LOOP=1`). Positions are relative, so recordings work at any window size.
 
+## Batocera and HippOS
+
+An add-on puts an **Android (Lunaria)** system into EmulationStation on Batocera and HippOS, with real controller support, Hotkey+Start to quit, and a `lunaria` service that links it all in. See [batocera/README.md](batocera/README.md).
+
 ## Game controllers
 
 Plug in or pair a controller (Xbox, PlayStation, Switch Pro and others GLFW recognises). The log prints `[input] gamepad: <name> (vendor:product)` when one is found.
