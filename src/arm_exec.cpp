@@ -73180,6 +73180,22 @@ static void cb_lock_wait_reset(void)
 static void cb_signal_suspend_wait(ArmExecCtx &ctx, ArmSignalFrameState &frame)
 {
   (void)ctx;
+  /* A sleep filed by the SVC the signal is taken on the way out of
+   * (guest_sleep_ns) has not run yet.  Left in place, its completion writes
+   * the sleep's result into x0, which by then holds the handler's signal
+   * number: the guest's signal dispatcher indexed its table with 0 and
+   * returned without calling anything (Boehm GC's suspend handler never ran
+   * on a Java thread spinning in nanosleep, and the collector waited for it
+   * forever).  The signal ends the sleep instead, early, as it would on a
+   * device: the interrupted call returns what the SVC already answered.  A
+   * retrying primitive's backoff has its PC on the svc and simply runs
+   * again after the handler. */
+  if (g_cb_depth && !g_cb_lock_wait.from_slice &&
+      (g_cb_lock_wait.kind == CbLockWait::Sleep ||
+       g_cb_lock_wait.kind == CbLockWait::RetrySleep)) {
+    *cb_wait_slot() = {};
+    return;
+  }
   if (!g_cb_depth || g_cb_lock_wait.from_slice ||
       (g_cb_lock_wait.kind != CbLockWait::Futex &&
        g_cb_lock_wait.kind != CbLockWait::Sem)) return;
