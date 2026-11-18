@@ -1,3 +1,23 @@
 [submodule "src/luna-ui"]
 	path = src/luna-ui
 	url = https://github.com/Berry-OS/luna-ui.git
+[submodule "reference/android-compatibility-layer"]
+	path = reference/android-compatibility-layer
+	url = https://github.com/reveny/Android-Compatibility-Layer
+	shallow = true
+[submodule "reference/droidloom"]
+	path = reference/droidloom
+	url = https://github.com/denialwm/droidloom
+	shallow = true
+[submodule "reference/stubuika"]
+	path = reference/stubuika
+	url = https://github.com/flessan/stubuika
+	shallow = true
+[submodule "reference/androidrecomp"]
+	path = reference/androidrecomp
+	url = https://github.com/sp00nznet/androidrecomp
+	shallow = true
+[submodule "reference/pvz2-re"]
+	path = reference/pvz2-re
+	url = https://github.com/SrDicov/PvZ-2-RE
+	shallow = true
